@@ -1,0 +1,20 @@
+name: impact_as
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - ffmpeg
+  - pyqt=5.15
+  - numpy<2
+  - pyyaml
+  - pillow
+  - matplotlib
+  - pip:
+      - opencv-python>=4.8.0.76,<4.12
+      - torch
+      - torchvision
+      - ultralytics>=8.0.0
+      - mediapipe>=0.10.9

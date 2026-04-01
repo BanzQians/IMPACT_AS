@@ -3,6 +3,39 @@ import os
 import sys
 
 
+def _bootstrap_fontconfig_runtime() -> None:
+    if os.name == "nt":
+        return
+
+    config_candidates = [
+        os.path.join(sys.prefix, "etc", "fonts", "fonts.conf"),
+        "/etc/fonts/fonts.conf",
+    ]
+    config_path = str(os.environ.get("FONTCONFIG_FILE", "") or "").strip()
+    if not config_path:
+        for candidate in config_candidates:
+            if os.path.isfile(candidate):
+                config_path = candidate
+                os.environ["FONTCONFIG_FILE"] = candidate
+                break
+
+    config_dir = str(os.environ.get("FONTCONFIG_PATH", "") or "").strip()
+    if not config_dir:
+        dir_candidates = []
+        if config_path:
+            dir_candidates.append(os.path.dirname(config_path))
+        dir_candidates.extend(
+            [
+                os.path.join(sys.prefix, "etc", "fonts"),
+                "/etc/fonts",
+            ]
+        )
+        for candidate in dir_candidates:
+            if os.path.isdir(candidate):
+                os.environ["FONTCONFIG_PATH"] = candidate
+                break
+
+
 def _bootstrap_qt_runtime() -> None:
     """
     Force Qt to use the PyQt5-bundled runtime/plugins.
@@ -73,6 +106,7 @@ def _bootstrap_qt_runtime() -> None:
                 pass
 
 
+_bootstrap_fontconfig_runtime()
 _bootstrap_qt_runtime()
 
 from utils.feature_env import load_feature_env_defaults  # noqa: E402

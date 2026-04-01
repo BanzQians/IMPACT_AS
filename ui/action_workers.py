@@ -7,7 +7,7 @@ from utils.feature_env import load_feature_env_defaults
 from utils.optional_deps import (
     MissingOptionalDependency,
     format_missing_dependency_message,
-    import_optional_module,
+    import_optional_local_module,
 )
 
 
@@ -16,8 +16,9 @@ load_feature_env_defaults(repo_root=ACTION_REPO_ROOT)
 
 
 def load_feature_extractor_module():
-    return import_optional_module(
+    return import_optional_local_module(
         "tools.feature_extractors",
+        module_path=os.path.join(ACTION_REPO_ROOT, "tools", "feature_extractors.py"),
         feature_name="Feature extraction",
         install_hint=(
             "Install the optional feature-extraction dependencies first, "

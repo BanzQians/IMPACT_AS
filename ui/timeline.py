@@ -983,6 +983,7 @@ class CombinedTimelineRow(BaseTimelineRow):
         segment_cuts: Optional[List[int]] = None,
         editable: bool = False,
         show_extra_overlay: bool = True,
+        show_time_grid: bool = True,
         parent=None,
     ):
         super().__init__(
@@ -994,6 +995,7 @@ class CombinedTimelineRow(BaseTimelineRow):
         self.show_label_text = bool(show_label_text)
         self.editable = bool(editable)
         self.show_extra_overlay = bool(show_extra_overlay)
+        self.show_time_grid = bool(show_time_grid)
 
         self.setMouseTracking(True)
         self.setMinimumHeight(44)
@@ -1493,7 +1495,12 @@ class CombinedTimelineRow(BaseTimelineRow):
         end = start + span
         fps = max(1, self.get_fps())
 
-        self._draw_time_grid(p, start, end, fps)
+        if self.show_time_grid:
+            self._draw_time_grid(p, start, end, fps)
+        else:
+            gutter = self.get_gutter()
+            p.setPen(QPen(QColor(200, 200, 200)))
+            p.drawLine(gutter, 0, gutter, self.height())
         self._draw_gutter_title(p, self.title)
 
         # draw label runs
@@ -2656,6 +2663,7 @@ class TimelineArea(QWidget):
             show_label_text = getattr(self, "_combined_show_text", True)
             editable = getattr(self, "_combined_editable", False)
             show_extra_overlay = True
+            show_time_grid = True
             segment_cuts = getattr(self, "_segment_cuts", [])
             if isinstance(meta, dict):
                 row_height = meta.get("row_height")
@@ -2667,6 +2675,8 @@ class TimelineArea(QWidget):
                     editable = bool(meta["editable"])
                 if "show_extra_overlay" in meta:
                     show_extra_overlay = bool(meta["show_extra_overlay"])
+                if "show_time_grid" in meta:
+                    show_time_grid = bool(meta["show_time_grid"])
                 if "segment_cuts" in meta:
                     segment_cuts = list(meta["segment_cuts"] or [])
                 if "show_segment_cuts" in meta and not meta["show_segment_cuts"]:
@@ -2685,6 +2695,7 @@ class TimelineArea(QWidget):
                 segment_cuts=segment_cuts,
                 editable=editable,
                 show_extra_overlay=show_extra_overlay,
+                show_time_grid=show_time_grid,
             )
             if row_height is not None:
                 try:

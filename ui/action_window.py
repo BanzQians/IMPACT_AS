@@ -158,6 +158,7 @@ DEFAULT_ANOMALY_TYPES = [
 # Fine mode: tweak combined row heights for clearer grouping
 FINE_ACTION_ROW_HEIGHT = 44
 FINE_PHASE_ROW_HEIGHT = 30
+MANUAL_SEGMENT_ROW_HEIGHT = 28
 
 # Verb prefix helpers for label -> (verb, noun) inference
 KNOWN_VERB_PREFIXES = list(DEFAULT_VERB_PREFIXES)
@@ -4666,6 +4667,16 @@ class ActionWindow(FrameControlMixin, QWidget):
                     pass
 
     def enter_psr_mode(self):
+        if self.extra_mode:
+            try:
+                self.exit_extra_mode()
+            except Exception:
+                pass
+        if self.interaction_mode == "assisted":
+            try:
+                self._exit_assisted_mode()
+            except Exception:
+                pass
         self._on_psr_asr_asd_activated()
         self._set_primary_undo_shortcuts_enabled(False)
         self._apply_psr_controls(True)
@@ -4688,8 +4699,6 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _apply_psr_controls(self, is_psr: bool):
         widgets = [
             getattr(self, "btn_mag", None),
-            getattr(self, "btn_extra", None),
-            getattr(self, "btn_assisted", None),
             getattr(self, "lbl_interaction", None),
             getattr(self, "combo_interaction", None),
             getattr(self, "lbl_interaction_status", None),
@@ -4697,6 +4706,19 @@ class ActionWindow(FrameControlMixin, QWidget):
         for w in widgets:
             if w is not None:
                 w.setVisible(not is_psr)
+        for w in (
+            getattr(self, "btn_extra", None),
+            getattr(self, "btn_assisted", None),
+        ):
+            if w is not None:
+                w.setVisible(False)
+        if not is_psr:
+            try:
+                sb = self.ctrl_scroll.horizontalScrollBar()
+                if sb is not None:
+                    sb.setValue(0)
+            except Exception:
+                pass
         if getattr(self, "lbl_mode", None):
             self.lbl_mode.setVisible(not is_psr)
         if getattr(self, "combo_mode", None):
@@ -13701,7 +13723,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.extra_cuts = sorted(cuts)
         try:
             self.timeline.set_extra_cuts(self.extra_cuts)
-            self.timeline.set_segment_cuts(self.extra_cuts)
         except Exception:
             pass
         try:
@@ -13753,7 +13774,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.extra_last_frame = None
         try:
             self.timeline.set_extra_cuts(self.extra_cuts)
-            self.timeline.set_segment_cuts(self.extra_cuts)
         except Exception:
             pass
 
@@ -14143,7 +14163,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._set_status(
-            f"{EXTRA_LABEL_NAME} mode: auto-filling current span; click to add boundaries."
+            f"{EXTRA_LABEL_NAME} mode: filling the Interaction track only; click to add boundaries."
         )
         self._set_interaction_status("Manual Segmentation: active")
 
@@ -17000,6 +17020,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.timeline.set_row_sources(row_sources)
         combined_groups = None
         tail_groups = None
+        coarse_has_main_content = bool(getattr(self.store, "frame_to_label", None))
         if self.mode == "Fine":
             entity_names = [e.name for e in self.entities]
             for ename in sorted(self.entity_stores.keys()):
@@ -17065,32 +17086,46 @@ class ActionWindow(FrameControlMixin, QWidget):
             combined_groups = groups if groups else None
             tail_groups = phase_groups if phase_groups else None
         elif has_extra and extra_sources:
-            main_sources = [
-                (lb, st, prefix)
-                for (lb, st, prefix) in row_sources
-                if not is_extra_label(lb.name)
-            ]
-            coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
-            combined_groups = [
-                (
-                    "Timeline",
-                    main_sources,
+            manual_group_meta = {
+                "show_extra_overlay": False,
+                "editable": False,
+                "show_segment_cuts": False,
+            }
+            if coarse_has_main_content:
+                manual_group_meta.update(
                     {
-                        "show_extra_overlay": False,
-                        "segment_cuts": coarse_cuts,
-                        "show_segment_cuts": True,
-                    },
-                ),
-                (
-                    "Manual Segmentation",
-                    extra_sources,
+                        "show_time_grid": False,
+                        "row_height": MANUAL_SEGMENT_ROW_HEIGHT,
+                    }
+                )
+                main_sources = [
+                    (lb, st, prefix)
+                    for (lb, st, prefix) in row_sources
+                    if not is_extra_label(lb.name)
+                ]
+                coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
+                combined_groups = [
+                    (
+                        "Timeline",
+                        main_sources,
+                        {
+                            "show_extra_overlay": False,
+                            "segment_cuts": coarse_cuts,
+                            "show_segment_cuts": True,
+                        },
+                    ),
+                    ("Manual Segmentation", extra_sources, manual_group_meta),
+                ]
+            else:
+                manual_group_meta.update(
                     {
-                        "show_extra_overlay": True,
-                        "editable": False,
-                        "show_segment_cuts": False,
-                    },
-                ),
-            ]
+                        "show_time_grid": True,
+                        "row_height": FINE_ACTION_ROW_HEIGHT,
+                    }
+                )
+                combined_groups = [
+                    ("Manual Segmentation", extra_sources, manual_group_meta)
+                ]
         elif self.mode == "Coarse":
             coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
             combined_groups = [

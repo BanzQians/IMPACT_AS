@@ -163,113 +163,6 @@ class FrameTXTAdapter(AdapterBase):
         return {"frame_labels": frame_labels}
 
 
-class FACTAdapter(AdapterBase):
-    """Adapter for FACT output: {"segments": [...], "classes": [...]}"""
-
-    name = "FACT"
-
-    def detect(self, payload: Dict[str, Any]) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        if not isinstance(payload.get("segments"), list):
-            return False
-        if not isinstance(payload.get("classes"), list):
-            return False
-        segs = payload.get("segments") or []
-        if not segs:
-            return True
-        sample = segs[0]
-        return (
-            isinstance(sample, dict)
-            and "start_frame" in sample
-            and "end_frame" in sample
-        )
-
-    def import_to_canonical(
-        self, payload: Dict[str, Any], meta: Dict[str, Any]
-    ) -> Canonical:
-        """
-        payload: FACT json like:
-        {
-            "classes": ["c0","c1",...],
-            "segments": [
-                {"start_frame":0, "end_frame":149, "class_id":9, "class_name":"c9"},
-                ...
-            ]
-        }
-        """
-        can = to_canonical_template(meta)
-
-        classes = payload.get("classes", [])
-        segments = payload.get("segments", [])
-
-        can["categories"] = []
-        for cid, cname in enumerate(classes):
-            can["categories"].append(
-                {
-                    "id": cid,
-                    "name": str(cname),
-                }
-            )
-
-        id2name = {c["id"]: c["name"] for c in can["categories"]}
-
-        anns = []
-        for i, seg in enumerate(segments):
-            try:
-                s = int(seg["start_frame"])
-                e = int(seg["end_frame"])
-                cid = int(seg.get("class_id", 0))
-            except Exception:
-                continue
-
-            if cid not in id2name:
-                continue
-
-            anns.append(
-                {
-                    "id": f"ann_{i}",
-                    "category_id": cid,
-                    "start": {"value": s, "unit": "frame"},
-                    "end": {"value": e, "unit": "frame"},
-                    "attributes": {"source": "fact"},
-                }
-            )
-
-        can["annotations"] = anns
-        can["extras"]["raw_fact"] = payload
-        return can
-
-    def export_from_canonical(
-        self, canonical: Canonical, options: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        cats = sorted(canonical.get("categories", []), key=lambda c: c["id"])
-        classes = [c["name"] for c in cats]
-        id2idx = {c["id"]: idx for idx, c in enumerate(cats)}
-
-        segments = []
-        for ann in canonical.get("annotations", []):
-            cid = int(ann["category_id"])
-            idx = id2idx.get(cid, cid)
-            s = int(ann["start"]["value"])
-            e = int(ann["end"]["value"])
-            segments.append(
-                {
-                    "start_frame": s,
-                    "end_frame": e,
-                    "class_id": idx,
-                    "class_name": (
-                        classes[idx] if 0 <= idx < len(classes) else f"c{idx}"
-                    ),
-                }
-            )
-
-        return {
-            "classes": classes,
-            "segments": segments,
-        }
-
-
 class OurV1Adapter(AdapterBase):
     name = "OurV1"
 
@@ -391,6 +284,5 @@ ADAPTERS = {
     "Native": NativeAdapter(),
     "ActivityNet": ActivityNetAdapter(),
     "FrameTXT": FrameTXTAdapter(),
-    "FACT": FACTAdapter(),
     "OurV1": OurV1Adapter(),
 }

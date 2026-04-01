@@ -52,7 +52,7 @@ from ui.video_player import VideoPlayer
 from ui.label_panel import LabelPanel
 from ui.timeline import TimelineArea
 from ui.entities_panel import EntitiesPanel
-from ui.action_workers import FactBatchWorker
+from ui.action_workers import FeatureExtractWorker, load_feature_extractor_module
 from ui.action_view_widgets import (
     _NoWheelComboBox,
     _ViewDropPanel,
@@ -110,6 +110,7 @@ from core.psr_state import (
     build_state_sequence as psr_build_state_sequence,
     build_state_runs as psr_build_state_runs,
 )
+from core.label_text_bank import ensure_label_text_bank, load_label_text_bank_map
 from core.procedure_trace import analyze_trace_conflicts
 from core.action_corrections import CorrectionBuffer
 from core.audio_utils import (
@@ -162,6 +163,21 @@ FINE_PHASE_ROW_HEIGHT = 30
 KNOWN_VERB_PREFIXES = list(DEFAULT_VERB_PREFIXES)
 
 FEATURE_VIDEO_EXTS = (".avi", ".mp4", ".mov", ".mkv", ".m4v")
+COMMON_FEATURE_DIMS = {
+    64,
+    96,
+    128,
+    192,
+    256,
+    384,
+    512,
+    768,
+    1024,
+    1408,
+    1536,
+    2048,
+    4096,
+}
 
 # Fixed HAS component catalog used by PSR/ASR/ASD state inference.
 HAS_COMPONENT_CATALOG = [
@@ -272,6 +288,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self.current_annotation_path: Optional[str] = None
         self.currentFeatureDir: Optional[str] = None
+        self._last_feature_error_message: str = ""
+        self._label_text_bank_cache: Dict[Any, Dict[str, np.ndarray]] = {}
         self.extra_mode = False
         self.extra_label: Optional[LabelDef] = None
         self.extra_start_frame = 0
@@ -482,6 +500,13 @@ class ActionWindow(FrameControlMixin, QWidget):
                 [
                     "Import label map (TXT)...",
                     "Export label map (TXT)...",
+                ],
+            ),
+            (
+                "Features",
+                [
+                    "Features: Extract current video features...",
+                    "Features: Import external features...",
                 ],
             ),
             (
@@ -2820,7 +2845,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             arr = np.load(path, mmap_mode="r")
             if getattr(arr, "ndim", 0) != 2:
                 return 0
-            return int(arr.shape[0])
+            layout = self._feature_layout_for_array(features_dir, arr)
+            return int(arr.shape[1] if layout == "BDT" else arr.shape[0])
         except Exception:
             return 0
 
@@ -4184,6 +4210,279 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._set_status(f"{feature_name} failed to initialize.")
             return False
 
+    def _on_feat_progress(self, done: int, total: int):
+        dlg = getattr(self, "_feat_progress", None)
+        if not dlg:
+            return
+        if total and dlg.maximum() != total:
+            dlg.setRange(0, total)
+        if total:
+            dlg.setValue(min(done, total))
+            dlg.setLabelText(f"Extracting features... {done}/{total}")
+        else:
+            dlg.setRange(0, 0)
+            dlg.setLabelText(f"Extracting features... {done}")
+
+    def _ensure_feature_extractor_available(self, show_dialog: bool = True) -> bool:
+        try:
+            load_feature_extractor_module()
+            return True
+        except MissingOptionalDependency as ex:
+            if show_dialog:
+                QMessageBox.information(
+                    self,
+                    "Missing dependency",
+                    format_missing_dependency_message(ex),
+                )
+            self._set_status(
+                "Feature extraction is unavailable until the optional dependencies are installed."
+            )
+            return False
+        except Exception as ex:
+            if show_dialog:
+                QMessageBox.warning(
+                    self,
+                    "Feature extraction unavailable",
+                    f"Failed to initialize feature extraction:\n{ex}",
+                )
+            self._set_status("Feature extraction failed to initialize.")
+            return False
+
+    def _on_feat_progress_message(self, line: str):
+        text = str(line or "").strip()
+        if text:
+            self._set_status(text)
+        if "[FEATS][ERROR]" in text:
+            detail = text.split("[FEATS][ERROR]", 1)[-1].strip()
+            self._last_feature_error_message = detail or text
+
+    @staticmethod
+    def _normalize_feature_backbone_name(backbone: Any) -> str:
+        key = str(backbone or "").strip().lower().replace("-", "_")
+        if key in {
+            "i3d",
+            "i3d_inception",
+            "i3d_inception_rgb",
+            "i3d_rgb",
+            "i3d_r50",
+            "i3d_r50_legacy",
+            "i3d_legacy_r50",
+        }:
+            return "i3d"
+        if key in {"resnet", "resnet50"}:
+            return "resnet50"
+        if key in {"dinov2", "dinov2_vitb14", "dino", "dino_v2"}:
+            return "dinov2_vitb14"
+        if "i3d" in key:
+            return "i3d"
+        if "resnet" in key:
+            return "resnet50"
+        if "dino" in key:
+            return "dinov2_vitb14"
+        return "i3d"
+
+    def _current_i3d_target_dim(self) -> int:
+        try:
+            value = int(os.environ.get("I3D_TARGET_DIM", "1024") or 1024)
+        except Exception:
+            value = 1024
+        return max(64, int(value))
+
+    def _current_feature_backbone(self) -> str:
+        return self._normalize_feature_backbone_name(
+            os.environ.get("FEATURE_BACKBONE", "i3d")
+        )
+
+    def _current_feature_target_dim(self) -> int:
+        key = self._current_feature_backbone()
+        if key == "i3d":
+            return self._current_i3d_target_dim()
+        if key == "resnet50":
+            return 2048
+        return 768
+
+    def _feature_backbone_label(self, backbone: Optional[Any] = None) -> str:
+        key = self._normalize_feature_backbone_name(
+            backbone if backbone is not None else self._current_feature_backbone()
+        )
+        if key == "resnet50":
+            return "ResNet50"
+        if key == "dinov2_vitb14":
+            return "DINOv2 ViT-B/14"
+        target_dim = self._current_i3d_target_dim()
+        if target_dim == 1024:
+            return "I3D (Inception RGB 1024D)"
+        return f"I3D (Inception RGB -> {target_dim}D)"
+
+    def _start_feature_extraction(self, feat_dir: str, backbone: str = ""):
+        if not getattr(self, "video_path", None):
+            QMessageBox.warning(
+                self, "No video", "Load a video before extracting features."
+            )
+            return
+        if not self._ensure_feature_extractor_available(show_dialog=True):
+            return
+        self._last_feature_error_message = ""
+        feature_backbone = self._normalize_feature_backbone_name(
+            backbone or self._current_feature_backbone()
+        )
+        self._set_status(f"Extracting {self._feature_backbone_label(feature_backbone)} features...")
+        self._close_progress_dialog(getattr(self, "_feat_progress", None))
+        self._feat_progress = self._open_progress_dialog(
+            "Feature Extraction",
+            f"Extracting {self._feature_backbone_label(feature_backbone)} features...",
+            None,
+        )
+        self._feat_thread = QThread(self)
+        self._feat_worker = FeatureExtractWorker(
+            video_path=self.video_path,
+            features_dir=feat_dir,
+            batch_size=128,
+            frame_stride=1,
+            use_fp16=True,
+            backbone=feature_backbone,
+        )
+        self._feat_worker.moveToThread(self._feat_thread)
+        self._feat_thread.started.connect(self._feat_worker.run)
+        self._feat_worker.progress.connect(self._on_feat_progress_message)
+        self._feat_worker.progress_value.connect(self._on_feat_progress)
+        self._feat_worker.done.connect(self._on_feat_done)
+        self._feat_worker.done.connect(self._feat_thread.quit)
+        self._feat_thread.finished.connect(self._feat_worker.deleteLater)
+        self._feat_thread.start()
+
+    def _on_feat_done(self, feat_dir, ok: bool):
+        self._close_progress_dialog(getattr(self, "_feat_progress", None))
+        self._feat_progress = None
+        if not ok or not feat_dir:
+            detail = str(getattr(self, "_last_feature_error_message", "") or "").strip()
+            if detail:
+                self._set_status(f"Feature extraction failed: {detail}")
+                QMessageBox.warning(self, "Feature extraction failed", detail)
+            else:
+                self._set_status("Feature extraction failed.")
+            return
+        feat_dir = os.path.abspath(str(feat_dir))
+        self.currentFeatureDir = feat_dir
+        self._boundary_snap_cache = {}
+        self._segment_embedding_cache = {}
+        self._label_text_bank_cache = {}
+        self._set_status(f"Feature extraction finished. Using {feat_dir}")
+
+    def _extract_current_video_features(self):
+        if not getattr(self, "video_path", None):
+            QMessageBox.information(self, "Feature Extraction", "Load a video first.")
+            return
+        feat_dir = self._ensure_features_for_current_video()
+        if not feat_dir:
+            return
+        feat_path = os.path.join(feat_dir, "features.npy")
+        if os.path.isfile(feat_path):
+            ret = QMessageBox.question(
+                self,
+                "Overwrite features",
+                (
+                    f"Existing features were found in:\n{feat_dir}\n\n"
+                    f"Re-extract them with {self._feature_backbone_label()}?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ret != QMessageBox.Yes:
+                self.currentFeatureDir = feat_dir
+                self._set_status(f"Using existing features in {feat_dir}")
+                return
+        self._start_feature_extraction(feat_dir, backbone=self._current_feature_backbone())
+
+    def _import_external_features(self):
+        if not getattr(self, "video_path", None):
+            QMessageBox.information(self, "External Features", "Load a video first.")
+            return
+        if not self._ensure_feature_extractor_available(show_dialog=True):
+            return
+        source_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import External Features",
+            "",
+            "NumPy arrays (*.npy)",
+        )
+        if not source_path:
+            return
+        feat_dir = self._ensure_features_for_current_video()
+        if not feat_dir:
+            return
+        try:
+            feature_api = load_feature_extractor_module()
+            feats, meta = feature_api.load_external_features(
+                source_path,
+                target_dim=self._current_feature_target_dim(),
+            )
+            meta = dict(meta or {})
+            meta.setdefault("layout", "BTD")
+            meta.setdefault("feature_dim", int(feats.shape[1]) if feats.ndim == 2 else 0)
+            feature_api.save_features(feat_dir, feats, meta=meta)
+        except MissingOptionalDependency as ex:
+            QMessageBox.information(
+                self,
+                "Missing dependency",
+                format_missing_dependency_message(ex),
+            )
+            self._set_status("External feature import is unavailable until optional dependencies are installed.")
+            return
+        except Exception as ex:
+            QMessageBox.warning(
+                self,
+                "External Features",
+                f"Failed to import external features:\n{ex}",
+            )
+            self._set_status("External feature import failed.")
+            return
+        self.currentFeatureDir = feat_dir
+        self._boundary_snap_cache = {}
+        self._segment_embedding_cache = {}
+        self._label_text_bank_cache = {}
+        self._set_status(f"Imported external features into {feat_dir}")
+
+    def _load_feature_meta(self, features_dir: str) -> Dict[str, Any]:
+        cache = self._ensure_boundary_snap_cache(features_dir)
+        if "meta" in cache:
+            return cache.get("meta") or {}
+        meta = {}
+        meta_path = os.path.join(features_dir, "meta.json")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except Exception:
+                meta = {}
+        cache["meta"] = meta
+        return meta
+
+    def _feature_layout_for_array(self, features_dir: str, arr: np.ndarray) -> str:
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+            return "BTD"
+        meta = self._load_feature_meta(features_dir)
+        layout = str(meta.get("layout") or meta.get("features_layout") or "").strip().upper()
+        if layout in {"BTD", "BDT"}:
+            return layout
+        rows, cols = int(arr.shape[0]), int(arr.shape[1])
+        try:
+            dim = int(meta.get("feature_dim", 0) or 0)
+        except Exception:
+            dim = 0
+        if dim > 0:
+            if cols == dim and rows != dim:
+                return "BTD"
+            if rows == dim and cols != dim:
+                return "BDT"
+        if cols in COMMON_FEATURE_DIMS and rows not in COMMON_FEATURE_DIMS:
+            return "BTD"
+        if rows in COMMON_FEATURE_DIMS and cols not in COMMON_FEATURE_DIMS:
+            return "BDT"
+        return "BTD"
+
     def _count_videos_in_dir(self, video_dir: str) -> int:
         try:
             return len(
@@ -4195,51 +4494,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
         except Exception:
             return 0
-
-    def _on_fact_batch_progress(self, line: str):
-        self._set_status(line)
-        dlg = getattr(self, "_fact_batch_progress", None)
-        if not dlg:
-            return
-        m = re.search(r"\((\d+)/(\d+)\)", line)
-        if m:
-            current = int(m.group(1))
-            total = int(m.group(2))
-            self._fact_batch_current = current
-            self._fact_batch_total = total
-            done = int(getattr(self, "_fact_batch_done", 0) or 0)
-            if current > 1:
-                done = max(done, current - 1)
-                self._fact_batch_done = done
-        if line.startswith("[INFO] Found"):
-            m = re.search(r"Found\s+(\d+)", line)
-            if m:
-                self._fact_batch_total = int(m.group(1))
-        if line.startswith("[OK]") and "feats" in line:
-            self._fact_batch_done = int(getattr(self, "_fact_batch_done", 0)) + 1
-        if line.startswith("[WARN] no features extracted for"):
-            self._fact_batch_done = int(getattr(self, "_fact_batch_done", 0)) + 1
-        if line.startswith("[OK] FACT batch inference done"):
-            if getattr(self, "_fact_batch_total", None):
-                self._fact_batch_done = int(self._fact_batch_total)
-
-        total = int(getattr(self, "_fact_batch_total", 0) or 0)
-        done = int(getattr(self, "_fact_batch_done", 0) or 0)
-        current = int(getattr(self, "_fact_batch_current", 0) or 0)
-        if total > 0:
-            if dlg.maximum() != total:
-                dlg.setRange(0, total)
-            dlg.setValue(min(done, total))
-            label = f"FACT batch labeling... {min(done, total)}/{total}"
-            if current > 0 and done < total:
-                label += f" (processing {min(current, total)}/{total})"
-            dlg.setLabelText(label)
-        else:
-            dlg.setRange(0, 0)
-            label = "FACT batch labeling..."
-            if current > 0:
-                label += f" (processing {current})"
-            dlg.setLabelText(label)
 
     def _set_interaction_status(self, s: str):
         try:
@@ -4365,12 +4619,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         try:
             arr = np.load(feat_path, mmap_mode="r")
             if arr.ndim == 2:
-                h, w = arr.shape
-                if h == 2048 and w != 2048:
-                    return int(w)
-                if w == 2048 and h != 2048:
-                    return int(h)
-                return int(max(h, w))
+                layout = self._feature_layout_for_array(features_dir, arr)
+                return int(arr.shape[1] if layout == "BDT" else arr.shape[0])
         except Exception:
             return None
         return None
@@ -10931,7 +11181,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         for name in (
             "frame_logits.npy",
             "logits.npy",
-            "pred_fact_logits.npy",
         ):
             path = os.path.join(features_dir, name)
             if os.path.isfile(path):
@@ -10970,13 +11219,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                     cache["features"] = None
                 feat = cache.get("features")
                 if isinstance(feat, np.ndarray) and feat.ndim == 2:
-                    h, w = feat.shape
-                    if h == 2048 and w != 2048:
-                        cache["features_layout"] = "BDT"
-                    elif w == 2048 and h != 2048:
-                        cache["features_layout"] = "BTD"
-                    else:
-                        cache["features_layout"] = "BTD"
+                    cache["features_layout"] = self._feature_layout_for_array(
+                        features_dir, feat
+                    )
 
             feat = cache.get("features")
             if not isinstance(feat, np.ndarray) or feat.ndim != 2:
@@ -11593,12 +11838,124 @@ class ActionWindow(FrameControlMixin, QWidget):
             scores.append((label, score))
         return scores
 
+    def _current_text_bank_backend(self) -> str:
+        return str(os.environ.get("TEXT_BANK_BACKEND", "siglip2") or "siglip2").strip().lower()
+
+    def _current_text_bank_model_name(self) -> str:
+        return str(
+            os.environ.get("TEXT_BANK_MODEL")
+            or os.environ.get("SIGLIP2_TEXT_BANK_MODEL")
+            or "external/huggingface/google--siglip2-base-patch16-224"
+        ).strip()
+
+    def _current_text_bank_prompt_template(self) -> str:
+        return str(
+            os.environ.get("TEXT_BANK_PROMPT_TEMPLATE")
+            or "assembly action: {}"
+        ).strip() or "{}"
+
+    def _text_bank_weight(self) -> float:
+        raw = os.environ.get("TEXT_BANK_WEIGHT", "0.35")
+        try:
+            value = float(raw)
+        except Exception:
+            value = 0.35
+        return max(0.0, min(1.0, value))
+
+    def _label_text_bank_classes(self) -> List[str]:
+        names: List[str] = []
+        for lb in self.labels or []:
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name or is_extra_label(name) or name in names:
+                continue
+            names.append(name)
+        return names
+
+    def _label_text_bank_map(self, features_dir: str, feature_dim: int) -> Dict[str, np.ndarray]:
+        classes = self._label_text_bank_classes()
+        if not features_dir or not classes or int(feature_dim) <= 0:
+            return {}
+        key = (
+            os.path.abspath(features_dir),
+            tuple(classes),
+            int(feature_dim),
+            self._current_text_bank_backend(),
+            self._current_text_bank_model_name(),
+            self._current_text_bank_prompt_template(),
+        )
+        cached = self._label_text_bank_cache.get(key)
+        if isinstance(cached, dict):
+            return cached
+        mapping: Dict[str, np.ndarray] = {}
+        try:
+            ensure_label_text_bank(
+                features_dir,
+                classes,
+                int(feature_dim),
+                backend=self._current_text_bank_backend(),
+                model_name=self._current_text_bank_model_name(),
+                prompt_template=self._current_text_bank_prompt_template(),
+            )
+            mapping = load_label_text_bank_map(
+                features_dir,
+                classes,
+                int(feature_dim),
+            )
+        except Exception:
+            mapping = {}
+        self._label_text_bank_cache[key] = mapping
+        return mapping
+
+    def _text_prior_scores_for_embedding(
+        self, emb: np.ndarray
+    ) -> List[Tuple[str, float]]:
+        features_dir = self._resolve_features_dir_for_snap()
+        if not features_dir:
+            return []
+        vec = np.asarray(emb, dtype=np.float32)
+        if vec.ndim != 1 or vec.size <= 0:
+            return []
+        norm = float(np.linalg.norm(vec))
+        if norm > 0:
+            vec = vec / norm
+        text_map = self._label_text_bank_map(features_dir, int(vec.size))
+        scores: List[Tuple[str, float]] = []
+        for label, txt_vec in text_map.items():
+            arr = np.asarray(txt_vec, dtype=np.float32)
+            if arr.shape != vec.shape:
+                continue
+            score = float(np.dot(vec, arr))
+            scores.append((str(label), score))
+        return scores
+
+    def _semantic_scores_for_embedding(
+        self, emb: np.ndarray
+    ) -> List[Tuple[str, float]]:
+        proto_scores = dict(self._prototype_scores_for_embedding(emb))
+        text_scores = dict(self._text_prior_scores_for_embedding(emb))
+        if not proto_scores and not text_scores:
+            return []
+        text_weight = self._text_bank_weight() if text_scores else 0.0
+        proto_weight = 1.0 - text_weight if proto_scores else 0.0
+        if proto_scores and not text_scores:
+            proto_weight = 1.0
+        if text_scores and not proto_scores:
+            text_weight = 1.0
+        scores: List[Tuple[str, float]] = []
+        labels = set(proto_scores) | set(text_scores)
+        for label in labels:
+            score = 0.0
+            if label in proto_scores:
+                score += float(proto_weight) * float(proto_scores[label])
+            if label in text_scores:
+                score += float(text_weight) * float(text_scores[label])
+            scores.append((str(label), float(score)))
+        return scores
+
     def _embedding_topk_candidates(
         self, seg: dict, top_k: int
     ) -> Optional[List[Tuple[str, Optional[float]]]]:
         if not self._topk_enabled():
-            return None
-        if not self._label_prototypes:
             return None
         try:
             s = int(seg.get("start", 0))
@@ -11608,7 +11965,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         emb = self._segment_embedding_for_span(s, e)
         if emb is None:
             return None
-        scores = self._prototype_scores_for_embedding(emb)
+        scores = self._semantic_scores_for_embedding(emb)
         if not scores:
             return None
         scores.sort(key=lambda x: x[1], reverse=True)
@@ -11631,13 +11988,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 feat = None
             cache["features"] = feat
             if isinstance(feat, np.ndarray) and feat.ndim == 2:
-                h, w = feat.shape
-                if h == 2048 and w != 2048:
-                    cache["features_layout"] = "BDT"
-                elif w == 2048 and h != 2048:
-                    cache["features_layout"] = "BTD"
-                else:
-                    cache["features_layout"] = "BTD"
+                cache["features_layout"] = self._feature_layout_for_array(
+                    features_dir, feat
+                )
         if not isinstance(feat, np.ndarray) or feat.ndim != 2:
             return None
         layout = cache.get("features_layout", "BTD")
@@ -14037,7 +14390,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         return [(int(s), int(e)) for s, e in fragments if int(e) >= int(s)]
 
     def _apply_autolabel_predictions(
-        self, txt_path: str, json_path: Optional[str], model_name: str = "FACT"
+        self, txt_path: str, json_path: Optional[str], model_name: str = "Model"
     ):
         if not txt_path or not os.path.isfile(txt_path):
             QMessageBox.warning(
@@ -14254,9 +14607,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self.store.add(name, f)
             self.extra_store = AnnotationStore()
             self.extra_cuts = []
-            result_name = {
-                "FACT": "FACT labeling",
-            }.get(str(model_name or "").upper(), str(model_name or "Model"))
+            result_name = str(model_name or "Model")
             self._set_status(
                 f"Loaded {result_name} results from {os.path.basename(txt_path)}"
             )
@@ -14322,10 +14673,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._auto_boundary_candidates = sorted(set(int(x) for x in keep))
 
-    def _on_infer_done(self, txt_path: str, json_path: str, model_name: str = "FACT"):
-        run_name = {
-            "FACT": "FACT labeling",
-        }.get(str(model_name or "").upper(), f"{model_name} run")
+    def _on_infer_done(self, txt_path: str, json_path: str, model_name: str = "Model"):
+        run_name = f"{model_name} run"
         if not txt_path:
             log_hint = getattr(self, "_last_autolabel_log_path", "")
             if log_hint:
@@ -14334,138 +14683,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._set_status(f"{run_name} failed; check logs.")
             return
         self._apply_autolabel_predictions(txt_path, json_path, model_name=model_name)
-
-    def _on_fact_batch_done(self, ok: bool, output_dir: str):
-        self._close_progress_dialog(getattr(self, "_fact_batch_progress", None))
-        self._fact_batch_progress = None
-        if ok:
-            self._set_status(f"FACT batch labeling done. Outputs in {output_dir}")
-        else:
-            log_hint = os.path.join(output_dir, "pred_fact_batch.log")
-            if os.path.isfile(log_hint):
-                self._set_status(f"FACT batch labeling failed; see log: {log_hint}")
-            else:
-                self._set_status("FACT batch labeling failed.")
-
-    def on_click_fact_batch(self):
-        if not self._ensure_python_modules_available(
-            ("torch",),
-            feature_name="FACT batch labeling",
-            install_hint=(
-                "Install the optional FACT dependencies only if you need this workflow, "
-                "for example: pip install torch torchvision"
-            ),
-            unavailable_status=(
-                "FACT batch labeling is unavailable until the optional dependencies are installed."
-            ),
-        ):
-            return
-        video_dir = QFileDialog.getExistingDirectory(
-            self, "Select unlabeled video directory"
-        )
-        if not video_dir:
-            return
-        output_dir = QFileDialog.getExistingDirectory(
-            self, "Select output directory for FACT predictions"
-        )
-        if not output_dir:
-            return
-
-        default_fact_repo = os.path.abspath(
-            os.path.join(
-                self._root_dir,
-                "..",
-                "Action-Segmentation-Tool_yinqian",
-                "Action-Segmentation-Tool_v1.2",
-                "CVPR2024-FACT-main",
-            )
-        )
-        fact_repo = default_fact_repo if os.path.isdir(default_fact_repo) else ""
-        if not fact_repo:
-            fact_repo = QFileDialog.getExistingDirectory(self, "Select FACT repository")
-            if not fact_repo:
-                return
-
-        ckpt = os.path.join(fact_repo, "runs/learningcell_front/split1-weight.pth")
-        if not os.path.isfile(ckpt):
-            ckpt, _ = QFileDialog.getOpenFileName(
-                self, "Choose FACT checkpoint", fact_repo, "PyTorch Models (*.pth *.pt)"
-            )
-            if not ckpt:
-                return
-        fact_cfg = os.path.join(fact_repo, "fact/configs/learningcell_front.yaml")
-        if not os.path.isfile(fact_cfg):
-            fact_cfg, _ = QFileDialog.getOpenFileName(
-                self, "Choose FACT config", fact_repo, "YAML Files (*.yaml *.yml)"
-            )
-            if not fact_cfg:
-                return
-
-        class_txt = None
-        default_classes = os.path.join(
-            self._root_dir, "external", "learningcell_front", "mapping", "mapping.txt"
-        )
-        if os.path.isfile(default_classes):
-            class_txt = default_classes
-        else:
-            fallback = os.path.join(
-                self._root_dir, "external", "action_seg_ot", "class_names.txt"
-            )
-            if os.path.isfile(fallback):
-                class_txt = fallback
-        if not class_txt:
-            class_txt, _ = QFileDialog.getOpenFileName(
-                self, "Choose class mapping (TXT)", "", "Text Files (*.txt)"
-            )
-        if not class_txt:
-            QMessageBox.warning(
-                self,
-                "Missing mapping",
-                "Class mapping file is required for FACT batch inference.",
-            )
-            return
-
-        tool_path = os.path.join(self._root_dir, "tools", "fact_batch_infer.py")
-        if not os.path.isfile(tool_path):
-            QMessageBox.warning(
-                self, "Missing script", f"FACT batch script not found: {tool_path}"
-            )
-            return
-
-        self._set_status("Starting FACT batch labeling...")
-        total_videos = self._count_videos_in_dir(video_dir)
-        self._close_progress_dialog(getattr(self, "_fact_batch_progress", None))
-        label = "FACT batch labeling..."
-        if total_videos > 0:
-            label = f"FACT batch labeling... 0/{total_videos}"
-        self._fact_batch_progress = self._open_progress_dialog(
-            "FACT Batch Labeling",
-            label,
-            total_videos if total_videos > 0 else None,
-        )
-        self._fact_batch_done = 0
-        self._fact_batch_current = 0
-        self._fact_batch_total = total_videos if total_videos > 0 else None
-        log_path = os.path.join(output_dir, "pred_fact_batch.log")
-        self._last_autolabel_log_path = log_path
-        self._fact_batch_thread = QThread(self)
-        self._fact_batch_worker = FactBatchWorker(
-            video_dir,
-            output_dir,
-            fact_repo,
-            ckpt,
-            fact_cfg,
-            tool_path=tool_path,
-            class_names=class_txt,
-            log_path=log_path,
-        )
-        self._fact_batch_worker.moveToThread(self._fact_batch_thread)
-        self._fact_batch_thread.started.connect(self._fact_batch_worker.run)
-        self._fact_batch_worker.progress.connect(self._on_fact_batch_progress)
-        self._fact_batch_worker.done.connect(self._on_fact_batch_done)
-        self._fact_batch_worker.done.connect(self._fact_batch_thread.quit)
-        self._fact_batch_thread.finished.connect(self._fact_batch_worker.deleteLater)
-        self._fact_batch_thread.start()
 
     def _on_player_frame_advanced(self, frame: int):
         # update controls for active view
@@ -14648,6 +14865,12 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         elif text.startswith("Export label map"):
             self._export_label_map_txt()
+
+        elif text.startswith("Features: Extract current video features"):
+            self._extract_current_video_features()
+
+        elif text.startswith("Features: Import external features"):
+            self._import_external_features()
 
         elif text.startswith("Assembly State: Load Components"):
             self._load_psr_components()
@@ -15912,6 +16135,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._auto_boundary_source = ""
         self._boundary_snap_cache = {}
         self._segment_embedding_cache = {}
+        self._label_text_bank_cache = {}
         self._label_prototypes = {}
         self._label_proto_counts = {}
         self._knn_memory = []
@@ -17684,7 +17908,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._export_action_fine_json()
             return
 
-        include_extra = name not in ("FACT", "FrameTXT")
+        include_extra = name != "FrameTXT"
         canonical = self._build_canonical_from_store(include_extra=include_extra)
         try:
             out_obj = adapter.export_from_canonical(canonical, options=None)

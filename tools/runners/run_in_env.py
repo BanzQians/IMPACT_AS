@@ -4,8 +4,8 @@
 Run a Python script in a selected conda environment profile.
 
 Usage:
-  python tools/runners/run_in_env.py --profile current -- tools/fact_batch_infer.py --help
-  python tools/runners/run_in_env.py --profile mobileclip -- tools/mobileclip_infer.py --video xxx.mp4
+  python tools/runners/run_in_env.py --profile current -- tools/siglip2_text_bank.py --help
+  python tools/runners/run_in_env.py --profile siglip2 -- tools/siglip2_text_bank.py --help
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ PROFILE_DEFAULT_ENVS: Dict[str, str] = {
     "current": "current",
     "ui": "current",
     "mobileclip": "mobileclip",
+    "siglip2": "siglip2",
 }
 
 
@@ -86,6 +87,10 @@ def _resolve_env_name(profile: str, explicit_env: str) -> str:
         return str(os.environ.get("MOBILECLIP_CONDA_ENV") or "").strip()
     if key == "mobileclip" and os.environ.get("MOBILECLIP_CONDA_PREFIX"):
         return str(os.environ.get("MOBILECLIP_CONDA_PREFIX") or "").strip()
+    if key == "siglip2" and os.environ.get("SIGLIP2_CONDA_ENV"):
+        return str(os.environ.get("SIGLIP2_CONDA_ENV") or "").strip()
+    if key == "siglip2" and os.environ.get("SIGLIP2_CONDA_PREFIX"):
+        return str(os.environ.get("SIGLIP2_CONDA_PREFIX") or "").strip()
     if key in {"current", "ui"} and os.environ.get("OPENTAD_CONDA_ENV"):
         return str(os.environ.get("OPENTAD_CONDA_ENV") or "").strip()
     if key in {"current", "ui"} and os.environ.get("OPENTAD_CONDA_PREFIX"):
@@ -98,6 +103,10 @@ def _resolve_env_name(profile: str, explicit_env: str) -> str:
     # Common local layout fallback: /home/.../conda_envs/<name>
     home = os.path.expanduser("~")
     if key == "mobileclip":
+        cand = os.path.join(home, "IsaacDrive", "conda_envs", key)
+        if os.path.isdir(cand):
+            return cand
+    if key == "siglip2":
         cand = os.path.join(home, "IsaacDrive", "conda_envs", key)
         if os.path.isdir(cand):
             return cand
@@ -127,7 +136,7 @@ def _build_exec_cmd(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a script in a configured conda environment profile.")
-    ap.add_argument("--profile", default="current", help="Environment profile: current/ui/mobileclip/...")
+    ap.add_argument("--profile", default="current", help="Environment profile: current/ui/mobileclip/siglip2/...")
     ap.add_argument("--env-name", default="", help="Override conda env name directly.")
     ap.add_argument("--conda-exe", default=os.environ.get("CONDA_EXE", "conda"), help="conda executable path.")
     ap.add_argument("--python-bin", default="python", help="Python binary name inside target env.")

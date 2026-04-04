@@ -1,8 +1,18 @@
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QStackedLayout, QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QStackedWidget,
+    QSizePolicy,
+    QStyle,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from ui.action_window import ActionWindow
 from ui.psr_window import PSRWindow
+from ui.quick_start_dialog import QuickStartDialog
 from ui.task_host import TaskHost
 from utils.op_logger import OperationLogger
 from utils.shortcut_settings import load_logging_policy, save_logging_policy
@@ -49,24 +59,43 @@ class MainWindow(QWidget):
             "Action Segmentation",
             "Assembly State (PSR/ASR/ASD)",
         ]
+        self._quick_start_dialog = None
 
         root = QVBoxLayout(self)
-        self.view_stack = QStackedLayout()
-        root.addLayout(self.view_stack)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addStretch(1)
+        self.btn_quick_start = QToolButton(self)
+        self.btn_quick_start.setAutoRaise(True)
+        self.btn_quick_start.setIcon(
+            self.style().standardIcon(QStyle.SP_MessageBoxInformation)
+        )
+        self.btn_quick_start.setToolTip(
+            "Open the in-app guide with real screenshots of the current workflow."
+        )
+        self.btn_quick_start.setAccessibleName("Quick Start")
+        self.btn_quick_start.clicked.connect(self._open_quick_start_dialog)
+        top_bar.addWidget(self.btn_quick_start, 0)
+        root.addLayout(top_bar)
+        self.view_stack = QStackedWidget(self)
+        root.addWidget(self.view_stack, 1)
 
+        self.action_host = TaskHost()
         self.action_window = ActionWindow(
             logger=self.op_logger,
             on_switch_task=self._on_task_changed,
             tasks=self.task_items,
             on_shortcuts_updated=self._apply_shortcuts_everywhere,
             on_logging_policy_updated=self._set_logging_policy_everywhere,
+            parent=self.action_host,
         )
-        self.action_host = TaskHost(self)
         self.action_host.set_body(self.action_window)
         self.view_stack.addWidget(self.action_host)
 
         self.psr_window = PSRWindow(
-            self,
+            parent=None,
             on_activate=self.action_window._on_psr_asr_asd_activated,
             on_load_components=self.action_window._load_psr_components,
             on_save_components=self.action_window._save_psr_components,
@@ -153,6 +182,19 @@ class MainWindow(QWidget):
     def _sync_task_selectors(self, text: str) -> None:
         try:
             self.action_window.set_task(text)
+        except Exception:
+            pass
+
+    def _open_quick_start_dialog(self) -> None:
+        dlg = self._quick_start_dialog
+        if dlg is None:
+            dlg = QuickStartDialog(self)
+            dlg.destroyed.connect(lambda *_: setattr(self, "_quick_start_dialog", None))
+            self._quick_start_dialog = dlg
+        dlg.show()
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
         except Exception:
             pass
 

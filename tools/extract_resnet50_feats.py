@@ -94,12 +94,12 @@ def main():
     )
     parser.add_argument(
         "--src",
-        default=os.environ.get("DATA_SRC", "/cvhci/temp/qiany/test_videos_dataset"),
+        default=os.environ.get("DATA_SRC", "videos"),
         help="Directory containing source videos.",
     )
     parser.add_argument(
         "--out",
-        default=os.environ.get("DATA_OUT", "/cvhci/temp/qiany/custom_set_features"),
+        default=os.environ.get("DATA_OUT", "artifacts"),
         help="Output root; features will be saved under out/features",
     )
     parser.add_argument(

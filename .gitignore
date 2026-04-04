@@ -47,5 +47,7 @@ e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002.tar.gz
 core
 !core/
 core/*
-!core/label_text_bank.py
+!core/*.py
 core.*
+app.py.bak_*
+=4.8.0.76

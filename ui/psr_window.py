@@ -140,7 +140,8 @@ class PSRWindow(QWidget):
         min_width: int = 84,
         min_height: int = 34,
     ):
-        btn = QPushButton(text)
+        parent = getattr(self, "side_panel", None) or self
+        btn = QPushButton(text, parent)
         btn.setCheckable(bool(checkable))
         if tooltip:
             btn.setToolTip(tooltip)
@@ -244,7 +245,8 @@ class PSRWindow(QWidget):
     def _create_action_button(
         self, text: str, tooltip: str = "", *, visible: bool = True
     ):
-        btn = QPushButton(text)
+        parent = getattr(self, "side_panel", None) or self
+        btn = QPushButton(text, parent)
         if tooltip:
             btn.setToolTip(tooltip)
         btn.setVisible(bool(visible))

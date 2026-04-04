@@ -5,7 +5,7 @@ from PyQt5.QtGui import QDrag
 from PyQt5.QtWidgets import QApplication, QComboBox, QLabel, QWidget
 
 
-_VIEW_REORDER_MIME = "application/x-cvhci-view-index"
+_VIEW_REORDER_MIME = "application/x-impact-scribe-view-index"
 
 
 class _NoWheelComboBox(QComboBox):

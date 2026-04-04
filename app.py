@@ -86,6 +86,8 @@ def _bootstrap_qt_runtime() -> None:
     os.environ.pop("QT_PLUGIN_PATH", None)
     os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
     os.environ.pop("QT_QPA_FONTDIR", None)
+    if os.name != "nt":
+        os.environ.pop("LD_LIBRARY_PATH", None)
 
     if os.path.isdir(plugin_root):
         os.environ["QT_PLUGIN_PATH"] = plugin_root

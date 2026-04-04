@@ -120,70 +120,6 @@ SHORTCUT_DEFINITIONS: List[Dict[str, str]] = [
         "label": "Next review item",
         "default": "Right",
     },
-    # --- HOI ---
-    {
-        "id": "hoi.step_prev",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Step frame -1",
-        "default": "Left",
-    },
-    {
-        "id": "hoi.step_next",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Step frame +1",
-        "default": "Right",
-    },
-    {
-        "id": "hoi.seek_prev_second",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Seek -1 second",
-        "default": "Up",
-    },
-    {
-        "id": "hoi.seek_next_second",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Seek +1 second",
-        "default": "Down",
-    },
-    {
-        "id": "hoi.play_pause",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Play / Pause",
-        "default": "Space",
-    },
-    {
-        "id": "hoi.pause",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Pause",
-        "default": "K",
-    },
-    {
-        "id": "hoi.detect",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Detect current frame",
-        "default": "Ctrl+Shift+D",
-    },
-    {
-        "id": "hoi.undo",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Undo",
-        "default": "Ctrl+Z",
-    },
-    {
-        "id": "hoi.redo",
-        "section": "HandOI / HOI Detection",
-        "scope": "hoi",
-        "label": "Redo",
-        "default": "Ctrl+Y",
-    },
     # --- PSR ---
     {
         "id": "psr.undo",
@@ -245,10 +181,18 @@ SHORTCUT_DEFINITIONS: List[Dict[str, str]] = [
 
 
 def _shortcuts_dir() -> str:
-    base = os.environ.get("CVHCI_SETTINGS_DIR")
-    if base:
-        return os.path.abspath(base)
-    return os.path.join(os.path.expanduser("~"), ".cvhci_video_annotation_suite")
+    for env_key in ("IMPACT_SCRIBE_SETTINGS_DIR", "CVHCI_SETTINGS_DIR"):
+        base = str(os.environ.get(env_key, "") or "").strip()
+        if base:
+            return os.path.abspath(base)
+    home = os.path.expanduser("~")
+    current_dir = os.path.join(home, ".impact_scribe")
+    legacy_dir = os.path.join(home, ".cvhci_video_annotation_suite")
+    if os.path.isdir(current_dir):
+        return current_dir
+    if os.path.isdir(legacy_dir):
+        return legacy_dir
+    return current_dir
 
 
 def shortcuts_file_path() -> str:
@@ -482,7 +426,7 @@ def load_logging_policy(
 
 def save_shortcut_bindings(bindings: Dict[str, Any]) -> Tuple[bool, str]:
     payload = {
-        "schema": "cvhci.shortcut_bindings.v1",
+        "schema": "impact_scribe.shortcut_bindings.v1",
         "bindings": _normalize_bindings(bindings),
     }
     primary = shortcuts_file_path()
@@ -497,7 +441,7 @@ def save_shortcut_bindings(bindings: Dict[str, Any]) -> Tuple[bool, str]:
 
 def save_logging_policy(policy: Dict[str, Any]) -> Tuple[bool, str]:
     payload = {
-        "schema": "cvhci.logging_policy.v1",
+        "schema": "impact_scribe.logging_policy.v1",
         "logging": _normalize_logging_policy(policy),
     }
     primary = logging_policy_file_path()

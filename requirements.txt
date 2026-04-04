@@ -6,8 +6,13 @@ PyYAML>=6.0
 Pillow>=9.5.0
 matplotlib>=3.7.0
 
-# HOI detection extras (YOLO + MediaPipe)
-ultralytics>=8.0.0
-mediapipe>=0.10.9
+# Optional model/runtime dependencies used by feature extraction,
+# ASOT pre-labeling, and the local scribble refiner.
 torch>=2.0.0
 torchvision>=0.15.0
+
+# Optional ASOT pre-labeling dependencies.
+pytorch-lightning>=2.0.0
+wandb>=0.17.0
+scipy>=1.10.0
+scikit-learn>=1.3.0

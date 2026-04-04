@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple, Optional, Any, Set, Callable, Iterable
+from typing import List, Dict, Tuple, Optional, Any, Set, Callable, Iterable, Sequence
 from collections import Counter
 from bisect import bisect_left, bisect_right
 from PyQt5.QtWidgets import (
@@ -52,7 +52,11 @@ from ui.video_player import VideoPlayer
 from ui.label_panel import LabelPanel
 from ui.timeline import TimelineArea
 from ui.entities_panel import EntitiesPanel
-from ui.action_workers import FeatureExtractWorker, load_feature_extractor_module
+from ui.action_workers import (
+    ASOTInferWorker,
+    FeatureExtractWorker,
+    load_feature_extractor_module,
+)
 from ui.action_view_widgets import (
     _NoWheelComboBox,
     _ViewDropPanel,
@@ -113,6 +117,36 @@ from core.psr_state import (
 from core.label_text_bank import ensure_label_text_bank, load_label_text_bank_map
 from core.procedure_trace import analyze_trace_conflicts
 from core.action_corrections import CorrectionBuffer
+from core.temporal_scribble import (
+    ScribbleKind,
+    TemporalScribble,
+    TemporalScribbleSet,
+    build_scribble_channels,
+    resolve_scribble_kind,
+)
+from core.local_boundary_refiner import (
+    CheckpointLocalBoundaryRefiner,
+    HeuristicLocalBoundaryRefiner,
+    LocalRefinerInput,
+)
+from core.query_planner import (
+    QueryCandidate,
+    QueryCostModel,
+    QueryDecision,
+    QueryPlannerWeights,
+    QueryType,
+    QueryUtilityModel,
+    ProposalConfidenceCalibrator,
+    choose_query,
+    score_candidate,
+    summarize_correction_observation,
+)
+from core.structured_decode import (
+    ConfirmedWindow,
+    SoftConstraint,
+    count_anchor_violations,
+    decode_frame_labels_with_constraints,
+)
 from core.audio_utils import (
     probe_audio_stream,
     extract_wav_16k_mono_verbose,
@@ -158,27 +192,11 @@ DEFAULT_ANOMALY_TYPES = [
 # Fine mode: tweak combined row heights for clearer grouping
 FINE_ACTION_ROW_HEIGHT = 44
 FINE_PHASE_ROW_HEIGHT = 30
-MANUAL_SEGMENT_ROW_HEIGHT = 28
 
 # Verb prefix helpers for label -> (verb, noun) inference
 KNOWN_VERB_PREFIXES = list(DEFAULT_VERB_PREFIXES)
 
 FEATURE_VIDEO_EXTS = (".avi", ".mp4", ".mov", ".mkv", ".m4v")
-COMMON_FEATURE_DIMS = {
-    64,
-    96,
-    128,
-    192,
-    256,
-    384,
-    512,
-    768,
-    1024,
-    1408,
-    1536,
-    2048,
-    4096,
-}
 
 # Fixed HAS component catalog used by PSR/ASR/ASD state inference.
 HAS_COMPONENT_CATALOG = [
@@ -229,9 +247,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         on_shortcuts_updated=None,
         on_logging_policy_updated=None,
         on_oplog_updated=None,
+        parent=None,
     ):
-        super().__init__()
-        self._app_title = "CV:HCI Video Annotation Tools"
+        super().__init__(parent)
+        self._app_title = "IMPACT-Scribe"
         self._on_switch_task = on_switch_task
         self._on_shortcuts_updated = on_shortcuts_updated
         self._on_logging_policy_updated = on_logging_policy_updated
@@ -253,7 +272,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.extra_store = (
             AnnotationStore()
         )  # dedicated store for interaction/extra to avoid collisions
-        self.hoi_window = None
         self.validation_enabled = False
         self.validator_name: str = ""
         self.validation_modifications = []  # list of dict entries
@@ -290,6 +308,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.current_annotation_path: Optional[str] = None
         self.currentFeatureDir: Optional[str] = None
         self._last_feature_error_message: str = ""
+        self._last_autolabel_log_path: str = ""
+        self._pending_feature_task: str = ""
         self._label_text_bank_cache: Dict[Any, Dict[str, np.ndarray]] = {}
         self.extra_mode = False
         self.extra_label: Optional[LabelDef] = None
@@ -311,7 +331,32 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._hover_preview_timer.setInterval(40)
         self._hover_preview_timer.timeout.connect(self._flush_timeline_hover_preview)
         # interaction (manual + assisted)
-        self.interaction_mode: Optional[str] = None  # "manual" | "assisted"
+        self.interaction_mode: Optional[str] = None  # "manual" | "assisted" | "scribble"
+        self._scribble_mode_enabled = False
+        self._scribble_items = TemporalScribbleSet()
+        self._active_scribble_session_id: str = ""
+        self._scribble_session_counter: int = 0
+        self._scribble_local_refiner = HeuristicLocalBoundaryRefiner()
+        self._scribble_local_refiner_path: str = ""
+        self._scribble_local_refiner_error: str = ""
+        self._last_scribble_result: Optional[Dict[str, Any]] = None
+        self._query_planner_weights = QueryPlannerWeights(
+            uncertainty=1.0,
+            disagreement=0.85,
+            multiview=0.35,
+            state_conflict=0.95,
+            propagation_gain=0.75,
+            history=0.20,
+            learned_utility=0.45,
+            bias_boundary=0.18,
+            bias_label=0.03,
+            bias_state=0.10,
+            tau=0.35,
+        )
+        self._last_query_decision: Optional[QueryDecision] = None
+        self._query_cost_model = QueryCostModel()
+        self._query_utility_model = QueryUtilityModel()
+        self._proposal_confidence_calibrator = ProposalConfidenceCalibrator()
         self._interaction_cfg = {
             "boundary": {
                 "window_size": 10,
@@ -332,6 +377,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "phase_soft_radius": 8,
                     "hover_preview_multi": True,
                     "hover_preview_align": "absolute",
+                    "hover_preview_interval_ms": 110,
+                    "hover_preview_min_delta": 2,
                 },
                 "boundary_snap": {"enabled": True, "window_size": 15},
                 "segment_embedding": {"trim_ratio": 0.1},
@@ -342,14 +389,17 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._psr_model_specs = load_psr_model_registry()
         self._ensure_algo_cfg_defaults()
         self._boundary_snap_cache: Dict[str, Any] = {}
+        self._feature_meta_cache: Dict[str, Dict[str, Any]] = {}
         self._fine_prev_timeline_tooltip = None
         self._auto_boundary_candidates: List[int] = []
         self._auto_boundary_source: str = ""
         self._segment_embedding_cache: Dict[Tuple[int, int, str], np.ndarray] = {}
+        self._scribble_local_refiner = self._make_scribble_local_refiner()
         self._label_prototypes: Dict[str, np.ndarray] = {}
         self._label_proto_counts: Dict[str, int] = {}
         self._knn_memory: List[Tuple[np.ndarray, str]] = []
         self._forced_segment: Optional[Dict[str, Any]] = None
+        self._pending_label_review: Optional[Dict[str, Any]] = None
         self.assisted_points: List[dict] = []  # list of interaction points with status
         self.assisted_active_idx: int = -1
         self._assisted_review_done = False
@@ -437,11 +487,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.combo_task = QComboBox()
         items = self._task_items or [
             "Action Segmentation",
-            "HandOI / HOI Detection",
             "Assembly State (PSR/ASR/ASD)",
-            "Single-turn VQA",
-            "Multi-turn VQA",
-            "Video Captioning",
         ]
         self.combo_task.addItems(items)
         self.combo_task.currentTextChanged.connect(self._emit_task_changed)
@@ -508,6 +554,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 [
                     "Features: Extract current video features...",
                     "Features: Import external features...",
+                    "ASOT Pre-label current video...",
                 ],
             ),
             (
@@ -557,6 +604,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.btn_settings.setToolTip("Settings (Ctrl+,)")
         self.btn_settings.clicked.connect(self._open_settings_dialog)
         ctrl.addWidget(self.btn_settings)
+
+        ctrl.addSpacing(12)
+        self.btn_auto_label_asot = QPushButton("ASOT Pre-label")
+        self.btn_auto_label_asot.setToolTip(
+            "Run ASOT pre-labeling for the current video and load it as baseline action segments."
+        )
+        self.btn_auto_label_asot.clicked.connect(self.on_click_auto_label_asot)
+        ctrl.addWidget(self.btn_auto_label_asot)
 
         # Magnifier toggle
         ctrl.addSpacing(12)
@@ -608,6 +663,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.combo_interaction.addItems(
             [
                 "Interaction...",
+                "Boundary Scribble (toggle)",
                 "Manual Segmentation (toggle)",
                 "Exit Interaction",
             ]
@@ -617,9 +673,25 @@ class ActionWindow(FrameControlMixin, QWidget):
         ctrl.addWidget(self.combo_interaction)
         self._fit_combo_to_contents(self.combo_interaction, min_width=180)
         ctrl.addSpacing(6)
-        self.lbl_interaction_status = QLabel("Interaction: idle")
-        self.lbl_interaction_status.setStyleSheet("color: #667085;")
-        ctrl.addWidget(self.lbl_interaction_status)
+        self.btn_scribble_clear = QToolButton()
+        self._shape_btn(self.btn_scribble_clear)
+        self.btn_scribble_clear.setFixedWidth(self.btn_scribble_clear.fontMetrics().horizontalAdvance("Clear Scribbles") + 24)
+        self.btn_scribble_clear.setText("Clear Scribbles")
+        self.btn_scribble_clear.setToolTip(
+            "Clear the active view's current scribble episode and pending proposal."
+        )
+        self.btn_scribble_clear.clicked.connect(self._clear_active_scribble_episode)
+        ctrl.addWidget(self.btn_scribble_clear)
+        ctrl.addSpacing(6)
+        self.btn_query_suggest = QToolButton()
+        self._shape_btn(self.btn_query_suggest)
+        self.btn_query_suggest.setFixedWidth(self.btn_query_suggest.fontMetrics().horizontalAdvance("Suggest Query") + 24)
+        self.btn_query_suggest.setText("Suggest Query")
+        self.btn_query_suggest.setToolTip(
+            "Use the lightweight query planner to focus the next boundary, label, or state question."
+        )
+        self.btn_query_suggest.clicked.connect(self._suggest_next_query)
+        ctrl.addWidget(self.btn_query_suggest)
 
         ctrl.addStretch(1)
 
@@ -749,6 +821,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             on_rename=self._on_label_renamed,
             on_search_matches=self._on_label_search_matches,
             on_select_idx=self._on_label_selected,
+            parent=self,
         )
         self._sync_label_panel_verb_hints(refresh=False)
 
@@ -779,6 +852,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.store,
             get_frame_count=self._get_frame_count,
             get_fps=self._get_fps,
+            parent=self,
         )
         try:
             self.timeline.set_combined_editable(True)
@@ -791,6 +865,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self.timeline.labelClicked.connect(self._on_timeline_label_clicked)
         self.timeline.segmentSelected.connect(self._on_timeline_segment_selected)
+        self.timeline.scribbleEditedDetailed.connect(
+            self._on_timeline_scribble_edited_payload
+        )
+        self.timeline.scribbleActivated.connect(self._on_timeline_scribble_activated)
+        self.timeline.scribbleProposalAdjusted.connect(
+            self._on_timeline_scribble_proposal_adjusted
+        )
+        self.timeline.scribbleRemoved.connect(self._on_timeline_scribble_removed)
         self.timeline.gapPrevRequested.connect(lambda: self._goto_gap(-1))
         self.timeline.gapNextRequested.connect(lambda: self._goto_gap(+1))
         try:
@@ -798,6 +880,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._apply_timeline_snap_settings(refresh=False)
+        self._update_scribble_proposal_ui()
 
         # EntitiesPanel
         self.entities_panel = EntitiesPanel(
@@ -807,6 +890,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             on_rename=self._on_entity_renamed,
             on_applicability_changed=self._on_entity_applicability_changed,
             on_visibility_changed=self._on_entity_visibility_changed,
+            parent=self,
         )
 
         # Phase panel (Fine mode)
@@ -915,8 +999,123 @@ class ActionWindow(FrameControlMixin, QWidget):
         left_scroll.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Expanding)
         self.left_scroll = left_scroll
 
+        self.query_decision_card = QFrame(self)
+        self.query_decision_card.setObjectName("queryDecisionCard")
+        self.query_decision_card.setMaximumWidth(420)
+        self.query_decision_card.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Fixed
+        )
+        self.query_decision_card.setStyleSheet(
+            """
+            QFrame#queryDecisionCard {
+                background: rgba(252, 252, 253, 242);
+                border: 1px solid #d0d5dd;
+                border-radius: 12px;
+            }
+            QLabel#queryDecisionTitle {
+                color: #1d2939;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QLabel#queryDecisionInfo {
+                color: #101828;
+                font-size: 14px;
+                font-weight: 600;
+            }
+            QLabel#queryDecisionMeta {
+                color: #667085;
+                font-size: 11px;
+            }
+            QPushButton#queryAcceptButton {
+                background: #175cd3;
+                color: white;
+                border: 1px solid #175cd3;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton#queryAcceptButton:hover {
+                background: #1849a9;
+                border-color: #1849a9;
+            }
+            QPushButton#queryAcceptButton:disabled {
+                background: #d0d5dd;
+                border-color: #d0d5dd;
+                color: #98a2b3;
+            }
+            QPushButton#queryRejectButton {
+                background: #f8fafc;
+                color: #344054;
+                border: 1px solid #d0d5dd;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton#queryRejectButton:hover {
+                background: #eef2f6;
+            }
+            QPushButton#queryRejectButton:disabled {
+                color: #98a2b3;
+                background: #f8fafc;
+            }
+            """
+        )
+        query_card_layout = QVBoxLayout(self.query_decision_card)
+        query_card_layout.setContentsMargins(12, 10, 12, 10)
+        query_card_layout.setSpacing(3)
+        self.lbl_query_decision_title = QLabel("Suggestion Pending")
+        self.lbl_query_decision_title.setObjectName("queryDecisionTitle")
+        query_card_layout.addWidget(self.lbl_query_decision_title)
+        self.lbl_query_decision_info = QLabel(
+            "Draw a boundary scribble or ask for a suggestion."
+        )
+        self.lbl_query_decision_info.setObjectName("queryDecisionInfo")
+        self.lbl_query_decision_info.setWordWrap(True)
+        query_card_layout.addWidget(self.lbl_query_decision_info)
+        self.lbl_query_decision_meta = QLabel(
+            "Accept or reject the current suggestion near the timeline."
+        )
+        self.lbl_query_decision_meta.setObjectName("queryDecisionMeta")
+        self.lbl_query_decision_meta.setWordWrap(True)
+        query_card_layout.addWidget(self.lbl_query_decision_meta)
+        query_card_buttons = QHBoxLayout()
+        query_card_buttons.setContentsMargins(0, 4, 0, 0)
+        query_card_buttons.setSpacing(8)
+        self.btn_scribble_accept = QPushButton("Accept Proposal")
+        self.btn_scribble_accept.setObjectName("queryAcceptButton")
+        self.btn_scribble_accept.setToolTip(
+            "Accept the current interaction suggestion and write it back to the timeline."
+        )
+        self.btn_scribble_accept.clicked.connect(
+            self._accept_current_interaction_suggestion
+        )
+        self.btn_scribble_accept.setEnabled(False)
+        query_card_buttons.addWidget(self.btn_scribble_accept)
+        self.btn_query_reject = QPushButton("Reject Suggestion")
+        self.btn_query_reject.setObjectName("queryRejectButton")
+        self.btn_query_reject.setToolTip(
+            "Reject the current label or boundary suggestion without applying it."
+        )
+        self.btn_query_reject.clicked.connect(
+            self._reject_current_interaction_suggestion
+        )
+        self.btn_query_reject.setEnabled(False)
+        query_card_buttons.addWidget(self.btn_query_reject)
+        query_card_buttons.addStretch(1)
+        query_card_layout.addLayout(query_card_buttons)
+        self.query_decision_card.hide()
+
+        self.timeline_right_panel = QWidget(self)
+        timeline_right_layout = QVBoxLayout(self.timeline_right_panel)
+        timeline_right_layout.setContentsMargins(0, 0, 0, 0)
+        timeline_right_layout.setSpacing(0)
+        timeline_right_layout.addWidget(self.timeline, 1)
+        self.query_decision_card.setParent(self.timeline_right_panel)
+        self.query_decision_card.raise_()
+        self.timeline_right_panel.installEventFilter(self)
+
         splitter_ann.addWidget(left_scroll)
-        splitter_ann.addWidget(self.timeline)
+        splitter_ann.addWidget(self.timeline_right_panel)
 
         splitter_ann.setStretchFactor(0, 0)
         splitter_ann.setStretchFactor(1, 1)
@@ -944,6 +1143,63 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         root.addWidget(splitter_main, 1)
         QTimer.singleShot(0, self._init_main_splitter_sizes)
+
+        self.query_footer_card = QFrame(self)
+        self.query_footer_card.setObjectName("queryFooterCard")
+        self.query_footer_card.setStyleSheet(
+            """
+            QFrame#queryFooterCard {
+                background: #f8fafc;
+                border: 1px solid #d0d5dd;
+                border-radius: 10px;
+            }
+            QLabel#queryFooterKicker {
+                color: #344054;
+                background: #e2e8f0;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#queryFooterMain {
+                color: #101828;
+                font-size: 15px;
+                font-weight: 700;
+            }
+            QLabel#queryFooterSub {
+                color: #344054;
+                background: #eef2ff;
+                border: 1px solid #c7d7fe;
+                border-radius: 10px;
+                padding: 4px 10px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            """
+        )
+        query_footer_layout = QHBoxLayout(self.query_footer_card)
+        query_footer_layout.setContentsMargins(12, 8, 12, 8)
+        query_footer_layout.setSpacing(10)
+        self.lbl_query_footer_kicker = QLabel("NEXT SUGGESTION")
+        self.lbl_query_footer_kicker.setObjectName("queryFooterKicker")
+        query_footer_layout.addWidget(self.lbl_query_footer_kicker)
+        self.lbl_query_hint = QLabel(
+            "No suggestion yet. Use Suggest Query when a baseline is ready."
+        )
+        self.lbl_query_hint.setObjectName("queryFooterMain")
+        self.lbl_query_hint.setWordWrap(False)
+        self.lbl_query_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        query_footer_layout.addWidget(self.lbl_query_hint, 1)
+        self.lbl_interaction_status = QLabel("Interaction: idle")
+        self.lbl_interaction_status.setObjectName("queryFooterSub")
+        self.lbl_interaction_status.setWordWrap(False)
+        self.lbl_interaction_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        query_footer_layout.addWidget(self.lbl_interaction_status)
+        root.addWidget(self.query_footer_card)
+        self._update_query_hint_ui()
+        self._update_scribble_proposal_ui()
+        QTimer.singleShot(0, self._position_query_decision_card)
 
         # status
         self.lbl_status = QLabel("Ready. Choose 'Load Video...' from the dropdown.")
@@ -2785,10 +3041,552 @@ class ActionWindow(FrameControlMixin, QWidget):
             meta_update = {}
         meta_update["persisted"] = False
         summary = self._correction_buffer.commit(records=records, meta_update=meta_update)
+        self._on_correction_session_finalized(summary)
         return summary
 
     def _discard_correction_session(self, reason: str = "") -> None:
-        self._correction_buffer.discard(reason=reason)
+        summary = self._correction_buffer.discard(reason=reason)
+        self._on_correction_session_finalized(summary)
+
+    def _query_learning_cfg(self) -> Dict[str, Any]:
+        self._ensure_algo_cfg_defaults()
+        cfg = getattr(self, "_algo_cfg", {})
+        section = cfg.get("query_learning", {})
+        return dict(section) if isinstance(section, dict) else {}
+
+    def _structured_decode_cfg(self) -> Dict[str, Any]:
+        self._ensure_algo_cfg_defaults()
+        cfg = getattr(self, "_algo_cfg", {})
+        section = cfg.get("structured_decode", {})
+        return dict(section) if isinstance(section, dict) else {}
+
+    def _query_learning_enabled(self) -> bool:
+        return bool(self._query_learning_cfg().get("enabled", True))
+
+    def _second_correction_radius(self) -> int:
+        cfg = self._query_learning_cfg()
+        return self._cfg_int(cfg.get("second_correction_radius", 20), 20, lo=1, hi=240)
+
+    def _calibrate_scribble_confidence(self, raw_confidence: Any) -> float:
+        raw = self._cfg_float(raw_confidence, 0.0, lo=0.0, hi=1.0)
+        if not self._query_learning_enabled():
+            return float(raw)
+        return float(self._proposal_confidence_calibrator.calibrate(raw))
+
+    def _recent_second_correction_flag(self, summary: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(summary, dict):
+            return False
+        obs = summarize_correction_observation(summary)
+        if not obs or bool(obs.get("proposal_feedback")):
+            return False
+        history = list(getattr(self._correction_buffer, "history", []) or [])
+        if len(history) <= 1:
+            return False
+        radius = self._second_correction_radius()
+        start = int(obs.get("start_frame", 0) or 0)
+        end = int(obs.get("end_frame", start) or start)
+        mid = int((start + end) * 0.5)
+        same_type_seen = 0
+        for prev in reversed(history[:-1]):
+            prev_obs = summarize_correction_observation(prev)
+            if not prev_obs or bool(prev_obs.get("proposal_feedback")):
+                continue
+            if prev_obs.get("query_type") != obs.get("query_type"):
+                continue
+            same_type_seen += 1
+            prev_start = int(prev_obs.get("start_frame", 0) or 0)
+            prev_end = int(prev_obs.get("end_frame", prev_start) or prev_start)
+            prev_mid = int((prev_start + prev_end) * 0.5)
+            if not (end < prev_start or start > prev_end):
+                return True
+            if abs(mid - prev_mid) <= radius:
+                return True
+            if same_type_seen >= 12:
+                break
+        return False
+
+    def _replay_correction_summary_into_learning(
+        self, summary: Optional[Dict[str, Any]]
+    ) -> None:
+        if not self._query_learning_enabled() or not isinstance(summary, dict):
+            return
+        self._query_cost_model.update_from_summary(summary)
+        self._query_utility_model.update_from_summary(summary)
+        self._proposal_confidence_calibrator.update_from_summary(summary)
+
+    def _rebuild_query_learning_models_from_history(self) -> None:
+        self._query_cost_model = QueryCostModel()
+        self._query_utility_model = QueryUtilityModel()
+        self._proposal_confidence_calibrator = ProposalConfidenceCalibrator()
+        if not self._query_learning_enabled():
+            return
+        for item in list(getattr(self._correction_buffer, "history", []) or []):
+            if not isinstance(item, dict):
+                continue
+            self._replay_correction_summary_into_learning(item)
+
+    def _on_correction_session_finalized(
+        self, summary: Optional[Dict[str, Any]]
+    ) -> None:
+        if not isinstance(summary, dict):
+            return
+        meta = summary.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+            summary["meta"] = meta
+        if "second_correction" not in meta:
+            meta["second_correction"] = bool(self._recent_second_correction_flag(summary))
+        self._replay_correction_summary_into_learning(summary)
+
+    def _record_scribble_proposal_feedback(
+        self,
+        proposal: Optional[Dict[str, Any]],
+        *,
+        accepted: bool,
+        reason: str = "",
+        changed: bool = False,
+    ) -> None:
+        if not self._query_learning_cfg().get("proposal_feedback_enabled", True):
+            return
+        if not isinstance(proposal, dict):
+            return
+        try:
+            raw_conf = proposal.get("raw_confidence", proposal.get("confidence"))
+            raw_conf = None if raw_conf is None else float(raw_conf)
+        except Exception:
+            raw_conf = None
+        if raw_conf is None:
+            return
+        try:
+            start = int(proposal.get("window_start", proposal.get("boundary_frame", 0)) or 0)
+        except Exception:
+            start = 0
+        try:
+            end = int(proposal.get("window_end", start) or start)
+        except Exception:
+            end = start
+        if end < start:
+            start, end = end, start
+        summary = self._correction_buffer.record_event(
+            "scribble_proposal_feedback",
+            meta={
+                "query_type": str(QueryType.BOUNDARY_SCRIBBLE.value),
+                "point_type": "proposal_feedback",
+                "proposal_feedback": True,
+                "accepted": bool(accepted),
+                "view": (
+                    self._effective_view_name(
+                        self.views[self.active_view_idx], idx=self.active_view_idx
+                    )
+                    if self.views and 0 <= self.active_view_idx < len(self.views)
+                    else ""
+                ),
+                "view_idx": int(self.active_view_idx),
+                "feedback_start": int(start),
+                "feedback_end": int(end),
+                "boundary_frame": (
+                    None
+                    if proposal.get("boundary_frame") is None
+                    else int(proposal.get("boundary_frame"))
+                ),
+                "raw_confidence": float(raw_conf),
+                "calibrated_confidence": float(
+                    self._cfg_float(
+                        proposal.get("confidence", raw_conf), raw_conf, lo=0.0, hi=1.0
+                    )
+                ),
+                "left_label": str(proposal.get("left_label", "") or ""),
+                "right_label": str(proposal.get("right_label", "") or ""),
+            },
+            changed=bool(changed),
+            reason=str(reason or "").strip(),
+        )
+        self._on_correction_session_finalized(summary)
+
+    def _record_label_review_feedback(
+        self,
+        review: Optional[Dict[str, Any]],
+        *,
+        accepted: bool,
+        reason: str = "",
+        changed: bool = False,
+        chosen_label: str = "",
+    ) -> None:
+        if not self._query_learning_cfg().get("proposal_feedback_enabled", True):
+            return
+        if not isinstance(review, dict):
+            return
+        try:
+            start = int(review.get("start_frame", 0) or 0)
+        except Exception:
+            start = 0
+        try:
+            end = int(review.get("end_frame", start) or start)
+        except Exception:
+            end = start
+        if end < start:
+            start, end = end, start
+        summary = self._correction_buffer.record_event(
+            "label_review_feedback",
+            meta={
+                "query_type": str(QueryType.LABEL_REVIEW.value),
+                "point_type": "proposal_feedback",
+                "proposal_feedback": True,
+                "accepted": bool(accepted),
+                "view": (
+                    self._effective_view_name(
+                        self.views[self.active_view_idx], idx=self.active_view_idx
+                    )
+                    if self.views and 0 <= self.active_view_idx < len(self.views)
+                    else ""
+                ),
+                "view_idx": int(self.active_view_idx),
+                "query_id": str(review.get("query_id", "") or ""),
+                "feedback_start": int(start),
+                "feedback_end": int(end),
+                "current_label": str(review.get("current_label", "") or ""),
+                "suggested_label": str(review.get("suggested_label", "") or ""),
+                "chosen_label": str(chosen_label or ""),
+                "source": str(review.get("source", "") or ""),
+            },
+            changed=bool(changed),
+            reason=str(reason or "").strip(),
+        )
+        self._on_correction_session_finalized(summary)
+
+    def _clear_pending_label_review(
+        self,
+        *,
+        clear_forced_segment: bool = True,
+        clear_candidate_priority: bool = True,
+        update_ui: bool = True,
+    ) -> None:
+        self._pending_label_review = None
+        if clear_forced_segment:
+            self._forced_segment = None
+        if clear_candidate_priority:
+            try:
+                self.panel.clear_candidate_priority()
+            except Exception:
+                pass
+        if update_ui:
+            self._update_scribble_proposal_ui()
+
+    def _clear_pending_boundary_query_hint(self, *, update_ui: bool = True) -> None:
+        proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        if proposal and bool(proposal.get("query_hint")):
+            self._last_scribble_result = None
+            if not isinstance(self._scribble_items, TemporalScribbleSet) or not self._scribble_items.items:
+                self._active_scribble_session_id = ""
+            self._store_active_view_scribble_state()
+        if update_ui:
+            self._update_scribble_proposal_ui()
+
+    def _boundary_query_hint_payload_from_decision(
+        self, decision: Optional[QueryDecision]
+    ) -> Optional[Dict[str, Any]]:
+        if (
+            not isinstance(decision, QueryDecision)
+            or decision.query_type != QueryType.BOUNDARY_SCRIBBLE
+        ):
+            return None
+        cand = decision.candidate
+        focus_frame = int(
+            cand.payload.get(
+                "boundary_frame", (int(cand.start_frame) + int(cand.end_frame)) // 2
+            )
+            or 0
+        )
+        return {
+            "query_hint": True,
+            "query_id": str(cand.query_id or ""),
+            "session_id": f"query_hint:{str(cand.query_id or '')}",
+            "boundary_frame": int(focus_frame),
+            "window_start": int(cand.start_frame),
+            "window_end": int(cand.end_frame),
+            "left_label": str(cand.payload.get("left_label", "") or ""),
+            "right_label": str(cand.payload.get("right_label", "") or ""),
+            "confidence": float(cand.payload.get("query_score", decision.utility) or 0.0),
+            "raw_confidence": float(cand.payload.get("query_score", decision.utility) or 0.0),
+            "scribble_count": 0,
+        }
+
+    def _label_review_payload_from_decision(
+        self, decision: Optional[QueryDecision]
+    ) -> Optional[Dict[str, Any]]:
+        if (
+            not isinstance(decision, QueryDecision)
+            or decision.query_type != QueryType.LABEL_REVIEW
+        ):
+            return None
+        cand = decision.candidate
+        current_label = str(cand.payload.get("current_label", "") or "").strip()
+        ranked: List[Tuple[str, Optional[float]]] = []
+        seen: Set[str] = set()
+        for raw in list(cand.payload.get("candidates") or []):
+            if isinstance(raw, dict):
+                name = raw.get("name") or raw.get("label")
+                score = raw.get("score")
+            elif isinstance(raw, (list, tuple)) and raw:
+                name = raw[0]
+                score = raw[1] if len(raw) > 1 else None
+            else:
+                continue
+            name_txt = str(name or "").strip()
+            if not name_txt or name_txt == current_label or name_txt in seen:
+                continue
+            seen.add(name_txt)
+            ranked.append((name_txt, score))
+        suggested_label = (
+            str(ranked[0][0] or "").strip()
+            if ranked
+            else str(cand.payload.get("suggested_label", "") or "").strip()
+        )
+        if not suggested_label or suggested_label == current_label:
+            return None
+        return {
+            "query_id": str(cand.query_id or ""),
+            "start_frame": int(cand.start_frame),
+            "end_frame": int(cand.end_frame),
+            "current_label": current_label,
+            "suggested_label": suggested_label,
+            "candidates": list(ranked[:3]),
+            "source": str(cand.payload.get("source", "") or ""),
+            "utility": float(decision.utility),
+        }
+
+    def _pending_label_review_matches_span(self, start: Any, end: Any) -> bool:
+        if not isinstance(self._pending_label_review, dict):
+            return False
+        try:
+            start_i = int(start)
+            end_i = int(end)
+        except Exception:
+            return False
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        try:
+            pending_start = int(self._pending_label_review.get("start_frame", -1))
+            pending_end = int(self._pending_label_review.get("end_frame", -1))
+        except Exception:
+            return False
+        return int(start_i) == int(pending_start) and int(end_i) == int(pending_end)
+
+    def _activate_label_review_decision(
+        self, decision: QueryDecision
+    ) -> Optional[Dict[str, Any]]:
+        review = self._label_review_payload_from_decision(decision)
+        if review is None:
+            return None
+        existing = (
+            dict(self._pending_label_review)
+            if isinstance(self._pending_label_review, dict)
+            else None
+        )
+        if existing and str(existing.get("query_id") or "") != str(review.get("query_id") or ""):
+            self._record_label_review_feedback(
+                existing,
+                accepted=False,
+                reason="superseded",
+                changed=False,
+            )
+        try:
+            self._on_timeline_segment_selected(
+                int(review["start_frame"]),
+                int(review["end_frame"]),
+                str(review.get("current_label", "") or ""),
+            )
+        except Exception:
+            pass
+        self._forced_segment = {
+            "start": int(review["start_frame"]),
+            "end": int(review["end_frame"]),
+            "label": str(review.get("current_label", "") or ""),
+        }
+        try:
+            self.panel.set_candidate_priority(list(review.get("candidates") or []))
+        except Exception:
+            pass
+        self._pending_label_review = review
+        self._update_scribble_proposal_ui()
+        return review
+
+    def _apply_label_review_choice(
+        self,
+        label_name: str,
+        *,
+        review: Optional[Dict[str, Any]] = None,
+        accepted_suggestion: bool,
+        reason: str,
+    ) -> bool:
+        payload = dict(review or self._pending_label_review or {})
+        if not payload:
+            self._set_status("No pending label review suggestion to apply.")
+            self._update_scribble_proposal_ui()
+            return False
+        target_label = str(label_name or "").strip()
+        current_label = str(payload.get("current_label", "") or "").strip()
+        suggested_label = str(payload.get("suggested_label", "") or "").strip()
+        if not target_label:
+            self._set_status("The selected label review suggestion is empty.")
+            self._update_scribble_proposal_ui()
+            return False
+        if target_label == current_label:
+            self._record_label_review_feedback(
+                payload,
+                accepted=False,
+                reason="kept_current_label",
+                changed=False,
+                chosen_label=target_label,
+            )
+            self._clear_pending_label_review()
+            self._refresh_query_planner_hint()
+            self._set_status(
+                f"Kept label {current_label or '?'} at F{int(payload.get('start_frame', 0))}-{int(payload.get('end_frame', 0))}."
+            )
+            self._set_interaction_status("Label Review: kept current label")
+            return False
+        start = int(payload.get("start_frame", 0) or 0)
+        end = int(payload.get("end_frame", start) or start)
+        if end < start:
+            start, end = end, start
+        self._begin_correction_session(
+            "label_review",
+            query_type=str(QueryType.LABEL_REVIEW.value),
+            query_id=str(payload.get("query_id", "") or ""),
+            start=int(start),
+            end=int(end),
+            current_label=str(current_label),
+            suggested_label=str(suggested_label),
+            source=str(payload.get("source", "") or ""),
+        )
+        targets = self._target_entity_stores(target_label)
+        if self.mode == "Fine" and not targets:
+            QMessageBox.information(
+                self,
+                "Choose entity",
+                "Select an entity row or enable one entity for this label before editing.",
+            )
+            self._discard_correction_session("missing_entity")
+            self._update_scribble_proposal_ui()
+            return False
+        if targets:
+            for _ename, st in targets:
+                self._apply_label_range(st, start, end, target_label)
+        else:
+            self._apply_label_range(self.store, start, end, target_label)
+        self._dirty = True
+        self._on_store_changed()
+        self._note_correction_step()
+        self._commit_correction_session(
+            query_type=str(QueryType.LABEL_REVIEW.value),
+            point_type=(
+                "label_review_accept"
+                if bool(accepted_suggestion)
+                else "label_review_override"
+            ),
+            query_id=str(payload.get("query_id", "") or ""),
+            feedback_start=int(start),
+            feedback_end=int(end),
+            current_label=str(current_label),
+            suggested_label=str(suggested_label),
+            chosen_label=str(target_label),
+            source=str(payload.get("source", "") or ""),
+            accepted=bool(accepted_suggestion),
+        )
+        self._record_label_review_feedback(
+            payload,
+            accepted=bool(accepted_suggestion),
+            reason=str(reason or ""),
+            changed=True,
+            chosen_label=target_label,
+        )
+        self._clear_pending_label_review()
+        self._refresh_query_planner_hint()
+        if accepted_suggestion:
+            self._set_status(
+                f"Accepted label review at F{start}-{end}: {current_label or '?'} -> {target_label}"
+            )
+            self._set_interaction_status(
+                f"Label Review accepted: {current_label or '?'} -> {target_label}"
+            )
+        else:
+            self._set_status(
+                f"Applied label review override at F{start}-{end}: {current_label or '?'} -> {target_label}"
+            )
+            self._set_interaction_status(
+                f"Label Review override: {current_label or '?'} -> {target_label}"
+            )
+        return True
+
+    def _accept_pending_label_review(self) -> bool:
+        review = (
+            dict(self._pending_label_review)
+            if isinstance(self._pending_label_review, dict)
+            else None
+        )
+        if not review:
+            self._set_status("No pending label review suggestion to accept.")
+            self._update_scribble_proposal_ui()
+            return False
+        return self._apply_label_review_choice(
+            str(review.get("suggested_label", "") or "").strip(),
+            review=review,
+            accepted_suggestion=True,
+            reason="accepted",
+        )
+
+    def _accept_current_interaction_suggestion(self) -> bool:
+        if isinstance(self._pending_label_review, dict):
+            return self._accept_pending_label_review()
+        return self._accept_last_scribble_proposal()
+
+    def _reject_current_interaction_suggestion(self) -> bool:
+        review = (
+            dict(self._pending_label_review)
+            if isinstance(self._pending_label_review, dict)
+            else None
+        )
+        if review:
+            start = int(review.get("start_frame", 0) or 0)
+            end = int(review.get("end_frame", start) or start)
+            if end < start:
+                start, end = end, start
+            self._record_label_review_feedback(
+                review,
+                accepted=False,
+                reason="rejected",
+                changed=False,
+            )
+            current_label = str(review.get("current_label", "") or "") or "?"
+            suggested_label = str(review.get("suggested_label", "") or "") or "?"
+            self._clear_pending_label_review()
+            self._refresh_query_planner_hint()
+            self._set_status(
+                f"Rejected label suggestion at F{start}-{end}: {current_label} -> {suggested_label}"
+            )
+            self._set_interaction_status("Label Review rejected")
+            return True
+        proposal = dict(self._last_scribble_result or {})
+        if proposal.get("boundary_frame") is not None:
+            frame_i = int(proposal.get("boundary_frame") or 0)
+            self._record_scribble_proposal_feedback(
+                proposal,
+                accepted=False,
+                reason="rejected",
+                changed=False,
+            )
+            self._clear_active_scribble_episode()
+            self._set_status(f"Rejected scribble proposal at F{frame_i}.")
+            self._set_interaction_status("Boundary Scribble rejected")
+            return True
+        self._set_status("No pending query suggestion to reject.")
+        self._update_scribble_proposal_ui()
+        return False
 
     def _current_query_policy_snapshot(self) -> Dict[str, Any]:
         cfg = self._assisted_cfg()
@@ -2846,8 +3644,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             arr = np.load(path, mmap_mode="r")
             if getattr(arr, "ndim", 0) != 2:
                 return 0
-            layout = self._feature_layout_for_array(features_dir, arr)
-            return int(arr.shape[1] if layout == "BDT" else arr.shape[0])
+            return int(arr.shape[0])
         except Exception:
             return 0
 
@@ -3250,12 +4047,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         if total <= 0:
             return None
         views = self.views[:total]
+        split_parent = getattr(self, "video_grid_inner", None) or self
 
         # helper to create splitter with given widgets vertically
         def vert_split(widgets):
             if len(widgets) == 1:
                 return widgets[0]
-            sp = QSplitter(Qt.Vertical)
+            sp = QSplitter(Qt.Vertical, split_parent)
             for w in widgets:
                 sp.addWidget(w)
             for i in range(len(widgets)):
@@ -3267,7 +4065,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         if total == 1:
             return panels[0]
         if total == 2:
-            sp = QSplitter(Qt.Horizontal)
+            sp = QSplitter(Qt.Horizontal, split_parent)
             sp.addWidget(panels[0])
             sp.addWidget(panels[1])
             sp.setStretchFactor(0, 1)
@@ -3281,7 +4079,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             if total == 4:
                 right_widgets.append(panels[3])
             right = vert_split(right_widgets) if right_widgets else None
-            sp = QSplitter(Qt.Horizontal)
+            sp = QSplitter(Qt.Horizontal, split_parent)
             sp.addWidget(left)
             if right:
                 sp.addWidget(right)
@@ -3292,7 +4090,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         left = vert_split([panels[0], panels[1]])
         mid = vert_split([panels[2], panels[3]])
         right = panels[4]
-        sp = QSplitter(Qt.Horizontal)
+        sp = QSplitter(Qt.Horizontal, split_parent)
         sp.addWidget(left)
         sp.addWidget(mid)
         sp.addWidget(right)
@@ -3560,6 +4358,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             "psr_state": self._psr_empty_view_state(),
             "trim_cuts": self._empty_trim_state(),
             "baseline_trim_cuts": self._empty_trim_state(),
+            "scribble_items": TemporalScribbleSet(),
+            "scribble_proposal": None,
+            "active_scribble_session_id": "",
+            "query_decision": None,
             "dirty": False,
         }
         self.views = [view]
@@ -3669,6 +4471,7 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _set_primary_view(self, idx: int):
         if not (0 <= idx < len(self.views)):
             return
+        self._store_active_view_scribble_state()
         self._psr_store_active_view_state()
         self._hover_preview_pending_frame = None
         self._hover_preview_last_targets = {}
@@ -3730,6 +4533,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._apply_magnifier_state()
         self._sync_controls_with_primary()
         self._rebuild_timeline_sources()
+        self._load_active_view_scribble_state()
+        self._refresh_query_planner_hint()
         self._apply_sync_edit_masks()
         self._update_view_highlight()
         try:
@@ -4084,6 +4889,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             "psr_state": base_psr_state,
             "trim_cuts": new_trim,
             "baseline_trim_cuts": new_baseline_trim,
+            "scribble_items": TemporalScribbleSet(),
+            "scribble_proposal": None,
+            "active_scribble_session_id": "",
+            "query_decision": None,
             "dirty": False,
             "stretch": 1,
         }
@@ -4114,7 +4923,11 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.btn_validation,
             self.btn_extra,
             self.btn_assisted,
+            getattr(self, "btn_scribble_accept", None),
+            getattr(self, "btn_query_reject", None),
             getattr(self, "combo_interaction", None),
+            getattr(self, "btn_scribble_clear", None),
+            getattr(self, "btn_query_suggest", None),
         ):
             if w is None:
                 continue
@@ -4211,6 +5024,1098 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._set_status(f"{feature_name} failed to initialize.")
             return False
 
+    def _count_videos_in_dir(self, video_dir: str) -> int:
+        try:
+            return len(
+                [
+                    name
+                    for name in os.listdir(video_dir)
+                    if name.lower().endswith(FEATURE_VIDEO_EXTS)
+                ]
+            )
+        except Exception:
+            return 0
+
+    def _set_interaction_status(self, s: str):
+        try:
+            self.lbl_interaction_status.setText(s)
+        except Exception:
+            pass
+
+    def _ensure_view_scribble_state(self, view: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(view, dict):
+            return
+        items = view.get("scribble_items")
+        if not isinstance(items, TemporalScribbleSet):
+            restored = TemporalScribbleSet()
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, TemporalScribble):
+                        restored.add(item)
+            view["scribble_items"] = restored
+        proposal = view.get("scribble_proposal")
+        if proposal is not None and not isinstance(proposal, dict):
+            view["scribble_proposal"] = None
+        elif "scribble_proposal" not in view:
+            view["scribble_proposal"] = None
+        decision = view.get("query_decision")
+        if decision is not None and not isinstance(decision, QueryDecision):
+            view["query_decision"] = None
+        elif "query_decision" not in view:
+            view["query_decision"] = None
+        active_session_id = view.get("active_scribble_session_id")
+        if active_session_id is None:
+            view["active_scribble_session_id"] = ""
+        else:
+            view["active_scribble_session_id"] = str(active_session_id or "")
+
+    def _store_active_view_scribble_state(self) -> None:
+        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
+            return
+        view = self.views[self.active_view_idx]
+        self._ensure_view_scribble_state(view)
+        view["scribble_items"] = (
+            self._scribble_items
+            if isinstance(self._scribble_items, TemporalScribbleSet)
+            else TemporalScribbleSet()
+        )
+        view["scribble_proposal"] = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        view["query_decision"] = (
+            self._last_query_decision
+            if isinstance(self._last_query_decision, QueryDecision)
+            else None
+        )
+        view["active_scribble_session_id"] = str(
+            getattr(self, "_active_scribble_session_id", "") or ""
+        )
+
+    def _load_active_view_scribble_state(self) -> None:
+        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
+            self._scribble_items = TemporalScribbleSet()
+            self._last_scribble_result = None
+            self._last_query_decision = None
+            self._active_scribble_session_id = ""
+            self._clear_pending_label_review()
+            self._update_scribble_proposal_ui()
+            self._update_query_hint_ui()
+            return
+        view = self.views[self.active_view_idx]
+        self._ensure_view_scribble_state(view)
+        self._scribble_items = view.get("scribble_items") or TemporalScribbleSet()
+        proposal = view.get("scribble_proposal")
+        self._last_scribble_result = dict(proposal) if isinstance(proposal, dict) else None
+        decision = view.get("query_decision")
+        self._last_query_decision = (
+            decision if isinstance(decision, QueryDecision) else None
+        )
+        self._active_scribble_session_id = str(
+            view.get("active_scribble_session_id", "") or ""
+        )
+        self._clear_pending_label_review()
+        self._scribble_session_counter = max(
+            int(getattr(self, "_scribble_session_counter", 0) or 0),
+            self._max_loaded_scribble_session_counter(self._scribble_items),
+        )
+        try:
+            if getattr(self, "timeline", None) is not None:
+                self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._update_query_hint_ui()
+
+    def _query_history_prior(self, query_type: QueryType) -> float:
+        rows = list(getattr(self, "_confirmed_correction_records", []) or [])
+        if not rows:
+            return 0.0
+        total = 0
+        matches = 0
+        for item in rows[-24:]:
+            if not isinstance(item, dict):
+                continue
+            point_type = str(item.get("point_type") or item.get("type") or "").lower()
+            mapped = None
+            if "state" in point_type or "trace" in point_type:
+                mapped = QueryType.STATE_REPAIR
+            elif "label" in point_type:
+                mapped = QueryType.LABEL_REVIEW
+            elif "boundary" in point_type or "scribble" in point_type:
+                mapped = QueryType.BOUNDARY_SCRIBBLE
+            if mapped is None:
+                continue
+            total += 1
+            if mapped == query_type:
+                matches += 1
+        if total <= 0:
+            return 0.0
+        return float(matches) / float(total)
+
+    def _query_summary_matches_active_view(self, summary: Dict[str, Any]) -> bool:
+        meta = summary.get("meta") or {}
+        if not isinstance(meta, dict):
+            return True
+        raw_view_idx = meta.get("view_idx")
+        if raw_view_idx in (None, ""):
+            return True
+        try:
+            return int(raw_view_idx) == int(self.active_view_idx)
+        except Exception:
+            return True
+
+    def _query_summary_counts_as_handled(
+        self,
+        summary: Dict[str, Any],
+        obs: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not isinstance(summary, dict) or not isinstance(obs, dict):
+            return False
+        reason = str(summary.get("reason", "") or "").strip().lower()
+        if reason == "superseded":
+            return False
+        if bool(obs.get("changed")) or bool(obs.get("accepted")):
+            return True
+        if reason in {
+            "rejected",
+            "kept_current_label",
+            "manual_override",
+            "accept_noop",
+            "accepted_manual_choice",
+        }:
+            return True
+        point_type = str(obs.get("point_type", "") or "").strip().lower()
+        return "override" in point_type or "reject" in point_type
+
+    def _recent_handled_query_summaries(
+        self, limit: int = 48
+    ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        history = list(getattr(self._correction_buffer, "history", []) or [])
+        if not history:
+            return []
+        rows: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for summary in reversed(history[-max(1, int(limit)):]):
+            if not isinstance(summary, dict):
+                continue
+            if not self._query_summary_matches_active_view(summary):
+                continue
+            obs = summarize_correction_observation(summary)
+            if not isinstance(obs, dict):
+                continue
+            if not self._query_summary_counts_as_handled(summary, obs):
+                continue
+            rows.append((summary, obs))
+        return rows
+
+    def _query_type_run_length(self, query_type: QueryType, limit: int = 8) -> int:
+        run = 0
+        for _summary, obs in self._recent_handled_query_summaries(limit=limit):
+            if obs.get("query_type") != query_type:
+                break
+            run += 1
+        return run
+
+    def _span_overlap_ratio(
+        self,
+        start_a: int,
+        end_a: int,
+        start_b: int,
+        end_b: int,
+    ) -> float:
+        a0, a1 = sorted((int(start_a), int(end_a)))
+        b0, b1 = sorted((int(start_b), int(end_b)))
+        overlap = max(0, min(a1, b1) - max(a0, b0) + 1)
+        if overlap <= 0:
+            return 0.0
+        len_a = max(1, a1 - a0 + 1)
+        len_b = max(1, b1 - b0 + 1)
+        return float(overlap) / float(max(1, min(len_a, len_b)))
+
+    def _query_candidate_recently_handled(self, candidate: QueryCandidate) -> bool:
+        if not isinstance(candidate, QueryCandidate):
+            return False
+        query_id = str(candidate.query_id or "").strip()
+        start = int(candidate.start_frame)
+        end = int(candidate.end_frame)
+        if end < start:
+            start, end = end, start
+        boundary_frame = candidate.payload.get("boundary_frame")
+        try:
+            boundary_frame_i = (
+                None if boundary_frame is None else int(boundary_frame)
+            )
+        except Exception:
+            boundary_frame_i = None
+        for summary, obs in self._recent_handled_query_summaries(limit=48):
+            if obs.get("query_type") != candidate.query_type:
+                continue
+            meta = summary.get("meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            prev_query_id = str(meta.get("query_id", "") or "").strip()
+            if query_id and prev_query_id and query_id == prev_query_id:
+                return True
+            prev_start = int(obs.get("start_frame", 0) or 0)
+            prev_end = int(obs.get("end_frame", prev_start) or prev_start)
+            if candidate.query_type == QueryType.BOUNDARY_SCRIBBLE:
+                prev_boundary = meta.get("boundary_frame", obs.get("start_frame"))
+                try:
+                    prev_boundary_i = (
+                        None if prev_boundary is None else int(prev_boundary)
+                    )
+                except Exception:
+                    prev_boundary_i = None
+                if (
+                    boundary_frame_i is not None
+                    and prev_boundary_i is not None
+                    and abs(int(boundary_frame_i) - int(prev_boundary_i)) <= 4
+                ):
+                    return True
+            if self._span_overlap_ratio(start, end, prev_start, prev_end) >= 0.65:
+                return True
+        return False
+
+    def _maybe_diversify_query_decision(
+        self,
+        candidates: Sequence[QueryCandidate],
+        decision: Optional[QueryDecision],
+    ) -> Optional[QueryDecision]:
+        if not isinstance(decision, QueryDecision) or not candidates:
+            return decision
+        recent_rows = self._recent_handled_query_summaries(limit=8)
+        if not recent_rows:
+            return decision
+        recent_type = recent_rows[0][1].get("query_type")
+        if recent_type != decision.query_type:
+            return decision
+        alt_candidates = [
+            item for item in candidates if item.query_type != decision.query_type
+        ]
+        if not alt_candidates:
+            return decision
+        alt_best = max(
+            alt_candidates,
+            key=lambda item: (
+                score_candidate(item, self._query_planner_weights),
+                -int(item.start_frame),
+                str(item.query_id),
+            ),
+        )
+        alt_score = float(score_candidate(alt_best, self._query_planner_weights))
+        current_score = float(decision.utility)
+        recent_run = self._query_type_run_length(decision.query_type, limit=6)
+        if alt_score >= max(0.85 * current_score, current_score - 0.18):
+            return QueryDecision(
+                query_type=alt_best.query_type,
+                candidate=alt_best,
+                utility=alt_score,
+            )
+        if recent_run >= 2 and alt_score >= max(0.55, 0.70 * current_score):
+            return QueryDecision(
+                query_type=alt_best.query_type,
+                candidate=alt_best,
+                utility=alt_score,
+            )
+        return decision
+
+    def _maybe_prefer_boundary_query(
+        self,
+        candidates: Sequence[QueryCandidate],
+        decision: Optional[QueryDecision],
+    ) -> Optional[QueryDecision]:
+        if not isinstance(decision, QueryDecision) or not candidates:
+            return decision
+        if decision.query_type == QueryType.BOUNDARY_SCRIBBLE:
+            return decision
+        boundary_candidates = [
+            item for item in candidates if item.query_type == QueryType.BOUNDARY_SCRIBBLE
+        ]
+        if not boundary_candidates:
+            return decision
+        best_boundary = max(
+            boundary_candidates,
+            key=lambda item: (
+                score_candidate(item, self._query_planner_weights),
+                -int(item.start_frame),
+                str(item.query_id),
+            ),
+        )
+        boundary_score = float(score_candidate(best_boundary, self._query_planner_weights))
+        current_score = float(decision.utility)
+        recent_rows = self._recent_handled_query_summaries(limit=6)
+        recent_label_run = self._query_type_run_length(QueryType.LABEL_REVIEW, limit=6)
+        if recent_label_run <= 0:
+            return decision
+        if recent_label_run >= 1 and boundary_score >= max(0.56, current_score - 0.18):
+            return QueryDecision(
+                query_type=QueryType.BOUNDARY_SCRIBBLE,
+                candidate=best_boundary,
+                utility=boundary_score,
+            )
+        if recent_label_run >= 2 and boundary_score >= max(0.42, 0.72 * current_score):
+            return QueryDecision(
+                query_type=QueryType.BOUNDARY_SCRIBBLE,
+                candidate=best_boundary,
+                utility=boundary_score,
+            )
+        return decision
+
+    def _query_multiview_disagreement(self, start: int, end: int, *labels: str) -> float:
+        target = {str(label).strip() for label in labels if str(label).strip()}
+        if not target or not self._multiview_sync_active():
+            return 0.0
+        sample_frames = sorted({int(start), int((start + end) * 0.5), int(end)})
+        values: List[float] = []
+        for idx in self._effective_sync_edit_indices():
+            if int(idx) == int(self.active_view_idx):
+                continue
+            if not (0 <= int(idx) < len(self.views)):
+                continue
+            other_store = self.views[int(idx)].get("store")
+            if other_store is None:
+                continue
+            for frame in sample_frames:
+                other_label = str(other_store.label_at(int(frame)) or "").strip()
+                if not other_label:
+                    continue
+                values.append(0.0 if other_label in target else 1.0)
+        if not values:
+            return 0.0
+        return float(sum(values) / max(1, len(values)))
+
+    def _apply_query_learning_to_candidate(
+        self, candidate: QueryCandidate
+    ) -> QueryCandidate:
+        if not isinstance(candidate, QueryCandidate):
+            return candidate
+        base_cost = self._cfg_float(candidate.estimated_cost, 0.6, lo=0.05, hi=4.0)
+        if self._query_learning_enabled():
+            candidate.estimated_cost = float(
+                self._query_cost_model.predict(candidate, fallback=base_cost)
+            )
+            candidate.score_terms["learned_utility"] = float(
+                self._query_utility_model.predict(candidate)
+            )
+        else:
+            candidate.estimated_cost = float(base_cost)
+            candidate.score_terms["learned_utility"] = 0.0
+        candidate.payload.setdefault("default_estimated_cost", float(base_cost))
+        candidate.payload["estimated_cost"] = float(candidate.estimated_cost)
+        return candidate
+
+    def _build_query_candidates(self) -> List[QueryCandidate]:
+        if not self._is_action_task() or self._is_psr_task() or not self.views:
+            return []
+        if not (0 <= self.active_view_idx < len(self.views)):
+            return []
+        view = self.views[self.active_view_idx]
+        frame_count = max(1, int(self._get_frame_count() or 1))
+        view_start = int(view.get("start", 0) or 0)
+        view_end = int(view.get("end", frame_count - 1) or (frame_count - 1))
+        window_radius = max(
+            6, int(self._algo_cfg.get("boundary_snap", {}).get("window_size", 15) or 15)
+        )
+        segments = self._segments_from_store_for_interaction()
+        candidates: List[QueryCandidate] = []
+
+        for idx in range(max(0, len(segments) - 1)):
+            left = dict(segments[idx] or {})
+            right = dict(segments[idx + 1] or {})
+            boundary_frame = int(right.get("start", left.get("end", 0)) or 0)
+            query_score, terms = self._boundary_query_score(
+                frame=boundary_frame,
+                left_label=str(left.get("label", "") or ""),
+                right_label=str(right.get("label", "") or ""),
+                raw_score=self._boundary_energy_at_frame(boundary_frame),
+            )
+            start = max(view_start, int(boundary_frame - window_radius))
+            end = min(view_end, int(boundary_frame + window_radius))
+            if query_score < self._assisted_query_threshold("boundary"):
+                continue
+            left_len = max(0, int(left.get("end", start)) - int(left.get("start", start)) + 1)
+            right_len = max(
+                0, int(right.get("end", end)) - int(right.get("start", end)) + 1
+            )
+            candidate = QueryCandidate(
+                query_id=f"boundary:{idx}:{boundary_frame}",
+                query_type=QueryType.BOUNDARY_SCRIBBLE,
+                start_frame=int(start),
+                end_frame=int(end),
+                score_terms={
+                    "uncertainty": float(terms.get("uncertainty", query_score) or 0.0),
+                    "disagreement": float(terms.get("confusion", 0.0) or 0.0),
+                    "multiview": self._query_multiview_disagreement(
+                        start,
+                        end,
+                        str(left.get("label", "") or ""),
+                        str(right.get("label", "") or ""),
+                    ),
+                    "state_conflict": 0.0,
+                    "propagation_gain": float(
+                        min(1.0, (left_len + right_len) / max(8.0, frame_count * 0.08))
+                    ),
+                    "history": self._query_history_prior(
+                        QueryType.BOUNDARY_SCRIBBLE
+                    ),
+                },
+                estimated_cost=0.55,
+                payload={
+                    "boundary_frame": int(boundary_frame),
+                    "left_label": str(left.get("label", "") or ""),
+                    "right_label": str(right.get("label", "") or ""),
+                    "query_score": float(query_score),
+                },
+            )
+            if self._query_candidate_recently_handled(candidate):
+                continue
+            candidates.append(candidate)
+
+        for idx, seg in enumerate(segments):
+            current_label = str(seg.get("label", "") or "").strip()
+            span_start = int(seg.get("start", 0) or 0)
+            span_end = int(seg.get("end", span_start) or span_start)
+            label_candidates, source = self._label_candidates_with_source(seg)
+            query_score, terms = self._label_query_score(
+                seg, label_candidates, source=source
+            )
+            if query_score < self._assisted_query_threshold("label"):
+                continue
+            actionable_candidates: List[Tuple[str, Optional[float]]] = []
+            seen_labels: Set[str] = set()
+            for cand_name, cand_score in label_candidates:
+                name_txt = str(cand_name or "").strip()
+                if not name_txt or name_txt == current_label or name_txt in seen_labels:
+                    continue
+                seen_labels.add(name_txt)
+                actionable_candidates.append((name_txt, cand_score))
+            top_label = (
+                str(actionable_candidates[0][0] or "").strip()
+                if actionable_candidates
+                else ""
+            )
+            if not top_label:
+                continue
+            span_len = max(0, span_end - span_start + 1)
+            candidate = QueryCandidate(
+                query_id=f"label:{idx}:{span_start}-{span_end}",
+                query_type=QueryType.LABEL_REVIEW,
+                start_frame=int(span_start),
+                end_frame=int(span_end),
+                score_terms={
+                    "uncertainty": float(terms.get("uncertainty", query_score) or 0.0),
+                    "disagreement": float(terms.get("disagreement", 0.0) or 0.0),
+                    "multiview": self._query_multiview_disagreement(
+                        span_start,
+                        span_end,
+                        current_label,
+                        top_label,
+                    ),
+                    "state_conflict": 0.0,
+                    "propagation_gain": float(
+                        min(1.0, span_len / max(8.0, frame_count * 0.12))
+                    ),
+                    "history": self._query_history_prior(QueryType.LABEL_REVIEW),
+                },
+                estimated_cost=0.40 if len(label_candidates) <= 3 else 0.55,
+                payload={
+                    "current_label": current_label,
+                    "suggested_label": top_label,
+                    "candidates": list(actionable_candidates[:3]),
+                    "source": str(source or ""),
+                    "query_score": float(query_score),
+                },
+            )
+            if self._query_candidate_recently_handled(candidate):
+                continue
+            candidates.append(candidate)
+
+        for idx, conflict in enumerate(self._psr_trace_conflicts or []):
+            repair = conflict.get("repair") or {}
+            if str(repair.get("kind") or "") != "state_patch":
+                continue
+            start = int(repair.get("start", conflict.get("start", 0)) or 0)
+            end = int(repair.get("end", conflict.get("end", start)) or start)
+            if end < start:
+                start, end = end, start
+            severity = max(0.0, min(1.0, float(conflict.get("severity", 0) or 0.0) / 3.0))
+            candidates.append(
+                QueryCandidate(
+                    query_id=f"state:{idx}:{start}-{end}",
+                    query_type=QueryType.STATE_REPAIR,
+                    start_frame=int(start),
+                    end_frame=int(end),
+                    score_terms={
+                        "uncertainty": 0.0,
+                        "disagreement": 0.0,
+                        "multiview": 0.0,
+                        "state_conflict": float(severity),
+                        "propagation_gain": float(
+                            max(
+                                severity,
+                                min(1.0, (int(end) - int(start) + 1) / max(8.0, frame_count * 0.15)),
+                            )
+                        ),
+                        "history": self._query_history_prior(QueryType.STATE_REPAIR),
+                    },
+                    estimated_cost=0.85,
+                    payload={
+                        "reason": str(conflict.get("reason") or ""),
+                        "component": conflict.get("component_name")
+                        or self._psr_component_name(conflict.get("component_id")),
+                        "conflict_type": str(conflict.get("conflict_type") or ""),
+                    },
+                )
+            )
+        return [self._apply_query_learning_to_candidate(item) for item in candidates]
+
+    def _update_query_hint_ui(self) -> None:
+        label = getattr(self, "lbl_query_hint", None)
+        if label is None:
+            return
+        footer = getattr(self, "query_footer_card", None)
+        kicker = getattr(self, "lbl_query_footer_kicker", None)
+        decision = self._last_query_decision
+        text = "No suggestion yet. Use Suggest Query when a baseline is ready."
+        tooltip = "Use Suggest Query to compute the next lightweight interaction target."
+        kicker_text = "NEXT SUGGESTION"
+        if isinstance(decision, QueryDecision):
+            cand = decision.candidate
+            s = int(cand.start_frame)
+            e = int(cand.end_frame)
+            if decision.query_type == QueryType.BOUNDARY_SCRIBBLE:
+                boundary = int(cand.payload.get("boundary_frame", (s + e) // 2) or 0)
+                left = str(cand.payload.get("left_label", "") or "?")
+                right = str(cand.payload.get("right_label", "") or "?")
+                text = f"Boundary around F{boundary}: {left} | {right}"
+                kicker_text = "BOUNDARY SUGGESTION"
+            elif decision.query_type == QueryType.LABEL_REVIEW:
+                current = str(cand.payload.get("current_label", "") or "?")
+                suggested = str(cand.payload.get("suggested_label", "") or "?")
+                text = f"Label review: {current} -> {suggested} @ F{s}-{e}"
+                kicker_text = "LABEL SUGGESTION"
+            else:
+                component = str(cand.payload.get("component") or "state")
+                text = f"State repair for {component} @ F{s}-{e}"
+                kicker_text = "STATE REPAIR"
+            tooltip = (
+                f"{cand.query_type.value} [{s}-{e}] utility {float(decision.utility):.2f}"
+            )
+        try:
+            if footer is not None:
+                footer.setVisible(self._is_action_task() and not self._is_psr_task())
+                footer.setToolTip(tooltip)
+            if kicker is not None:
+                kicker.setText(kicker_text)
+            label.setText(text)
+            label.setToolTip(tooltip)
+        except Exception:
+            pass
+
+    def _position_query_decision_card(self) -> None:
+        card = getattr(self, "query_decision_card", None)
+        host = getattr(self, "timeline_right_panel", None)
+        if card is None or host is None:
+            return
+        if not card.isVisible():
+            return
+        try:
+            host_rect = host.contentsRect()
+            max_width = max(280, host_rect.width() - 24)
+            target_width = min(int(card.maximumWidth()), int(max_width))
+            card_width = max(280, min(int(card.sizeHint().width()), target_width))
+            card.resize(card_width, card.sizeHint().height())
+            x = max(12, host_rect.left() + (host_rect.width() - card.width()) // 2)
+            y = max(12, host_rect.top() + 12)
+            card.move(int(x), int(y))
+            card.raise_()
+        except Exception:
+            pass
+
+    def _refresh_query_planner_hint(self) -> Optional[QueryDecision]:
+        decision = None
+        if self._is_action_task() and not self._is_psr_task():
+            candidates = self._build_query_candidates()
+            decision = choose_query(candidates, self._query_planner_weights)
+            decision = self._maybe_prefer_boundary_query(candidates, decision)
+            decision = self._maybe_diversify_query_decision(candidates, decision)
+        self._last_query_decision = decision
+        if self.views and (0 <= self.active_view_idx < len(self.views)):
+            self._ensure_view_scribble_state(self.views[self.active_view_idx])
+            self.views[self.active_view_idx]["query_decision"] = decision
+        self._update_query_hint_ui()
+        return decision
+
+    def _boundary_query_decision(self) -> Optional[QueryDecision]:
+        if not self._is_action_task() or self._is_psr_task():
+            return None
+        candidates = [
+            cand
+            for cand in self._build_query_candidates()
+            if cand.query_type == QueryType.BOUNDARY_SCRIBBLE
+        ]
+        if not candidates:
+            return None
+        weights = self._query_planner_weights
+        best = max(
+            candidates,
+            key=lambda item: (
+                score_candidate(item, weights),
+                -int(item.start_frame),
+                str(item.query_id),
+            ),
+        )
+        return QueryDecision(
+            query_type=QueryType.BOUNDARY_SCRIBBLE,
+            candidate=best,
+            utility=score_candidate(best, weights),
+        )
+
+    def _focus_query_decision(
+        self, decision: QueryDecision, *, status_prefix: str = "Suggested"
+    ) -> bool:
+        if not isinstance(decision, QueryDecision):
+            return False
+        existing_label_review = (
+            dict(self._pending_label_review)
+            if isinstance(self._pending_label_review, dict)
+            else None
+        )
+        if existing_label_review:
+            same_review = bool(
+                decision.query_type == QueryType.LABEL_REVIEW
+                and str(existing_label_review.get("query_id") or "")
+                == str(decision.candidate.query_id or "")
+            )
+            if not same_review:
+                self._record_label_review_feedback(
+                    existing_label_review,
+                    accepted=False,
+                    reason="superseded",
+                    changed=False,
+                )
+                self._clear_pending_label_review()
+        cand = decision.candidate
+        focus_frame = int(
+            cand.payload.get(
+                "boundary_frame", (cand.start_frame + cand.end_frame) // 2
+            )
+            or 0
+        )
+        focus_frame = max(int(cand.start_frame), min(int(cand.end_frame), focus_frame))
+        try:
+            self.player.pause()
+        except Exception:
+            pass
+        try:
+            self.player.seek(int(focus_frame), preview_only=False)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "timeline", None) is not None:
+                self.timeline.set_current_frame(int(focus_frame), follow=True)
+                if hasattr(self.timeline, "center_on_frame"):
+                    self.timeline.center_on_frame(int(focus_frame))
+        except Exception:
+            pass
+        prefix = str(status_prefix or "Suggested").strip()
+        if decision.query_type == QueryType.BOUNDARY_SCRIBBLE:
+            proposal = self._boundary_query_hint_payload_from_decision(decision)
+            if proposal is not None:
+                self._last_scribble_result = proposal
+                self._active_scribble_session_id = str(
+                    proposal.get("session_id", "") or ""
+                )
+                self._store_active_view_scribble_state()
+                self._update_scribble_proposal_ui()
+            try:
+                self.timeline.flash_boundary_marker(int(focus_frame))
+            except Exception:
+                pass
+            if self.interaction_mode != "scribble" and not self.extra_mode:
+                self.enter_scribble_mode()
+            self._set_status(
+                f"{prefix} boundary scribble around F{cand.start_frame}-{cand.end_frame}."
+            )
+            self._set_interaction_status(
+                f"{prefix}: boundary scribble near F{focus_frame}"
+            )
+        elif decision.query_type == QueryType.LABEL_REVIEW:
+            self._clear_pending_boundary_query_hint(update_ui=False)
+            review = self._activate_label_review_decision(decision)
+            if review is None:
+                self._set_status("Suggested label review has no actionable alternative label.")
+                self._set_interaction_status("Interaction: idle")
+                self._update_scribble_proposal_ui()
+                return False
+            current = str(review.get("current_label", "") or "?")
+            suggested = str(review.get("suggested_label", "") or "?")
+            self._set_status(
+                f"{prefix} label review at F{cand.start_frame}-{cand.end_frame}: {current} -> {suggested}"
+            )
+            self._set_interaction_status(
+                f"{prefix}: label review {current} -> {suggested} near F{focus_frame}"
+            )
+        else:
+            self._clear_pending_boundary_query_hint(update_ui=False)
+            component = str(cand.payload.get("component") or "state")
+            self._set_status(
+                f"{prefix} state repair for {component} at F{cand.start_frame}-{cand.end_frame}"
+            )
+            self._set_interaction_status(f"{prefix}: state repair near F{focus_frame}")
+        return True
+
+    def _should_reuse_active_uncertain_session(
+        self,
+        scribble: TemporalScribble,
+        active_items: List[TemporalScribble],
+        proposal: Optional[Dict[str, Any]],
+    ) -> bool:
+        # Repeated passes near the current boundary should stay in one refinement
+        # session instead of spawning a new marker each time.
+        if scribble.kind != ScribbleKind.UNCERTAIN:
+            return False
+        if not active_items:
+            return False
+        new_s = int(scribble.start_frame)
+        new_e = int(scribble.end_frame)
+        if new_e < new_s:
+            new_s, new_e = new_e, new_s
+        session_s = min(int(item.start_frame) for item in active_items)
+        session_e = max(int(item.end_frame) for item in active_items)
+        window_s = session_s
+        window_e = session_e
+        boundary_i = int(round((session_s + session_e) / 2.0))
+        if isinstance(proposal, dict):
+            try:
+                if proposal.get("window_start") is not None:
+                    window_s = int(proposal.get("window_start"))
+                if proposal.get("window_end") is not None:
+                    window_e = int(proposal.get("window_end"))
+                if proposal.get("boundary_frame") is not None:
+                    boundary_i = int(proposal.get("boundary_frame"))
+            except Exception:
+                pass
+        base_span = max(1, max(window_e - window_s + 1, session_e - session_s + 1))
+        margin = max(8, min(24, int(round(base_span * 0.5))))
+        if not (new_e < (window_s - margin) or new_s > (window_e + margin)):
+            return True
+        new_mid = int(round((new_s + new_e) * 0.5))
+        return abs(int(new_mid) - int(boundary_i)) <= max(10, margin)
+
+    def _infer_followup_scribble_kind(
+        self,
+        scribble: TemporalScribble,
+        proposal: Optional[Dict[str, Any]],
+        *,
+        reuse_active: bool,
+    ) -> ScribbleKind:
+        # Users only draw one freehand stroke type. When they keep refining the
+        # same proposal, infer side support from which side of the boundary they
+        # reinforce instead of exposing extra brush modes in the UI.
+        if not reuse_active:
+            return resolve_scribble_kind(scribble.kind)
+        boundary_i = None
+        try:
+            if isinstance(proposal, dict) and proposal.get("boundary_frame") is not None:
+                boundary_i = int(proposal.get("boundary_frame"))
+        except Exception:
+            boundary_i = None
+        if boundary_i is None:
+            return ScribbleKind.UNCERTAIN
+        start_i = int(scribble.start_frame)
+        end_i = int(scribble.end_frame)
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        width = max(1, end_i - start_i + 1)
+        margin = max(1, min(4, int(round(width * 0.2))))
+        if end_i <= int(boundary_i) - int(margin):
+            return ScribbleKind.LEFT
+        if start_i >= int(boundary_i) + int(margin):
+            return ScribbleKind.RIGHT
+        return ScribbleKind.UNCERTAIN
+
+    def _on_timeline_scribble_proposal_adjusted(self, payload: object) -> None:
+        # Keep boundary nudging lightweight: drag the proposed line, then accept.
+        if not self._scribble_mode_enabled or self._is_psr_task():
+            return
+        if not isinstance(payload, dict):
+            return
+        proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else {}
+        )
+        if not proposal:
+            return
+        try:
+            boundary_i = int(payload.get("boundary_frame"))
+        except Exception:
+            return
+        window_start = proposal.get("window_start")
+        window_end = proposal.get("window_end")
+        try:
+            if window_start is not None:
+                boundary_i = max(boundary_i, int(window_start))
+            if window_end is not None:
+                boundary_i = min(boundary_i, int(window_end))
+        except Exception:
+            pass
+        proposal["boundary_frame"] = int(boundary_i)
+        proposal["manual_boundary_adjusted"] = True
+        if payload.get("finalized") is not None:
+            proposal["manual_boundary_adjust_finalized"] = bool(
+                payload.get("finalized")
+            )
+        self._last_scribble_result = proposal
+        self._store_active_view_scribble_state()
+        self._update_scribble_proposal_ui()
+        try:
+            self._log(
+                "scribble_proposal_adjust",
+                boundary_frame=int(boundary_i),
+                finalized=bool(payload.get("finalized")),
+                session_id=str(proposal.get("session_id") or ""),
+            )
+        except Exception:
+            pass
+        if bool(payload.get("finalized")):
+            self._set_status(f"Adjusted proposal boundary to F{int(boundary_i)}.")
+            self._set_interaction_status(
+                f"Boundary Scribble: adjusted to F{int(boundary_i)}"
+            )
+
+    def _clear_active_scribble_episode(self) -> None:
+        if not isinstance(self._scribble_items, TemporalScribbleSet):
+            self._scribble_items = TemporalScribbleSet()
+        active_session = str(getattr(self, "_active_scribble_session_id", "") or "")
+        if active_session:
+            kept = []
+            for item in list(self._scribble_items.items):
+                meta = dict(getattr(item, "meta", {}) or {})
+                if str(meta.get("session_id") or "") == active_session and not bool(
+                    meta.get("accepted", False)
+                ):
+                    continue
+                kept.append(item)
+            self._scribble_items.items = kept
+        else:
+            self._scribble_items.clear()
+        self._active_scribble_session_id = ""
+        self._last_scribble_result = None
+        self._store_active_view_scribble_state()
+        try:
+            if getattr(self, "timeline", None) is not None:
+                self.timeline.set_scribble_items(self._scribble_items.items)
+                self.timeline.clear_scribble_proposal()
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._refresh_query_planner_hint()
+        self._set_status("Cleared the current scribble episode.")
+        if self.interaction_mode == "scribble":
+            self._set_interaction_status("Boundary Scribble: draw boundary")
+
+    def _suggest_next_query(self) -> bool:
+        decision = self._refresh_query_planner_hint()
+        if not isinstance(decision, QueryDecision):
+            self._set_status("No lightweight query suggestion is available yet.")
+            return False
+        return self._focus_query_decision(decision, status_prefix="Suggested")
+
+    def _update_query_decision_card(
+        self,
+        proposal: Optional[Dict[str, Any]],
+        pending_label_review: Optional[Dict[str, Any]],
+    ) -> None:
+        card = getattr(self, "query_decision_card", None)
+        if card is None:
+            return
+        if not self._is_action_task() or self._is_psr_task():
+            card.hide()
+            return
+        title = ""
+        info = ""
+        meta = ""
+        show = False
+        if pending_label_review and pending_label_review.get("suggested_label"):
+            start = int(pending_label_review.get("start_frame", 0) or 0)
+            end = int(pending_label_review.get("end_frame", start) or start)
+            current = str(pending_label_review.get("current_label", "") or "?")
+            suggested = str(pending_label_review.get("suggested_label", "") or "?")
+            title = "Label Review"
+            info = f"{current} -> {suggested} @ F{start}-{end}"
+            meta = (
+                "Use Accept to apply the suggestion, Reject to dismiss it, "
+                "or click another label in the panel to override."
+            )
+            show = True
+        elif proposal and proposal.get("boundary_frame") is not None:
+            frame = int(proposal.get("boundary_frame") or 0)
+            conf = float(proposal.get("confidence", 0.0) or 0.0)
+            left = str(proposal.get("left_label", "") or "?")
+            right = str(proposal.get("right_label", "") or "?")
+            title = "Boundary Suggestion" if proposal.get("query_hint") else "Boundary Proposal"
+            info = f"F{frame} · {left} | {right}"
+            if proposal.get("query_hint"):
+                meta = (
+                    "Accept to apply this boundary directly, Reject to skip it, "
+                    "or draw a scribble on the timeline to refine it first."
+                )
+            else:
+                meta = (
+                    f"Confidence {conf:.2f}. Drag the proposed boundary on the timeline "
+                    "if you want to nudge it before accepting."
+                )
+            show = True
+        if show:
+            try:
+                self.lbl_query_decision_title.setText(title)
+                self.lbl_query_decision_info.setText(info)
+                self.lbl_query_decision_meta.setText(meta)
+                card.show()
+                self._position_query_decision_card()
+            except Exception:
+                pass
+        else:
+            card.hide()
+
+    def _update_scribble_proposal_ui(self) -> None:
+        proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        pending_label_review = (
+            dict(self._pending_label_review)
+            if isinstance(self._pending_label_review, dict)
+            else None
+        )
+        try:
+            if getattr(self, "timeline", None) is not None:
+                if proposal:
+                    self.timeline.set_scribble_proposal(proposal)
+                else:
+                    self.timeline.clear_scribble_proposal()
+        except Exception:
+            pass
+        self._update_query_decision_card(proposal, pending_label_review)
+        btn = getattr(self, "btn_scribble_accept", None)
+        if btn is None:
+            return
+        can_accept_scribble = bool(
+            proposal
+            and proposal.get("boundary_frame") is not None
+            and self._is_action_task()
+            and not self._is_psr_task()
+            and not self.extra_mode
+            and self.interaction_mode != "assisted"
+        )
+        can_accept_label_review = bool(
+            pending_label_review
+            and pending_label_review.get("suggested_label")
+            and self._is_action_task()
+            and not self._is_psr_task()
+        )
+        enabled = bool(can_accept_scribble or can_accept_label_review)
+        try:
+            btn.setEnabled(enabled)
+            btn.setVisible(self._is_action_task() and not self._is_psr_task())
+            if can_accept_scribble and proposal and proposal.get("boundary_frame") is not None:
+                frame = int(proposal.get("boundary_frame"))
+                conf = float(proposal.get("confidence", 0.0) or 0.0)
+                if proposal.get("query_hint"):
+                    btn.setToolTip(
+                        f"Accept the suggested boundary at frame {frame} and apply it to the timeline."
+                    )
+                else:
+                    btn.setToolTip(
+                        f"Accept the latest boundary scribble proposal at frame {frame} (confidence {conf:.2f})."
+                    )
+            elif can_accept_label_review and pending_label_review:
+                start = int(pending_label_review.get("start_frame", 0) or 0)
+                end = int(pending_label_review.get("end_frame", start) or start)
+                current = str(pending_label_review.get("current_label", "") or "?")
+                suggested = str(pending_label_review.get("suggested_label", "") or "?")
+                btn.setToolTip(
+                    f"Accept the suggested label review at F{start}-{end}: {current} -> {suggested}."
+                )
+            else:
+                btn.setToolTip(
+                    "Accept the current interaction suggestion and write it back to the timeline."
+                )
+        except Exception:
+            pass
+        reject_btn = getattr(self, "btn_query_reject", None)
+        if reject_btn is not None:
+            reject_enabled = bool(
+                (proposal and proposal.get("boundary_frame") is not None)
+                or (pending_label_review and pending_label_review.get("suggested_label"))
+            )
+            try:
+                reject_btn.setEnabled(reject_enabled)
+                reject_btn.setVisible(self._is_action_task() and not self._is_psr_task())
+                if pending_label_review and pending_label_review.get("suggested_label"):
+                    current = str(pending_label_review.get("current_label", "") or "?")
+                    suggested = str(
+                        pending_label_review.get("suggested_label", "") or "?"
+                    )
+                    reject_btn.setToolTip(
+                        f"Reject the current label review suggestion {current} -> {suggested}."
+                    )
+                elif proposal and proposal.get("boundary_frame") is not None:
+                    frame = int(proposal.get("boundary_frame") or 0)
+                    if proposal.get("query_hint"):
+                        reject_btn.setToolTip(
+                            f"Reject the suggested boundary at frame {frame} and move on."
+                        )
+                    else:
+                        reject_btn.setToolTip(
+                            f"Reject the current boundary scribble proposal at frame {frame}."
+                        )
+                else:
+                    reject_btn.setToolTip(
+                        "Reject the current label or boundary suggestion without applying it."
+                    )
+            except Exception:
+                pass
+
+    def _get_frame_count(self) -> int:
+        return self.player.frame_count
+
+    def _get_fps(self) -> int:
+        return max(1, self.player.frame_rate or 30)
+
+    def _view_idx_by_name(self, name: str) -> int:
+        for i, vw in enumerate(self.views):
+            if vw.get("name") == name:
+                return i
+        return -1
+
+    def _default_features_dir_for_video(self) -> Optional[str]:
+        if not getattr(self, "video_path", None):
+            return None
+        base = os.path.splitext(os.path.basename(self.video_path))[0]
+        return os.path.join(os.path.dirname(self.video_path), f"{base}_features")
+
+    def _ensure_features_for_current_video(self) -> Optional[str]:
+        """
+        Ensure features.npy exists for the currently loaded video.
+        Returns the features directory path or None on failure.
+        """
+        feat_dir = self._default_features_dir_for_video()
+        if not feat_dir:
+            return None
+        os.makedirs(feat_dir, exist_ok=True)
+        feat_path = os.path.join(feat_dir, "features.npy")
+        if os.path.isfile(feat_path):
+            return feat_dir
+        # Defer extraction to a background worker; caller will start the thread.
+        return feat_dir
+
+    # ── Feature extraction / import ───────────────────────────────────────
+
     def _on_feat_progress(self, done: int, total: int):
         dlg = getattr(self, "_feat_progress", None)
         if not dlg:
@@ -4261,13 +6166,8 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _normalize_feature_backbone_name(backbone: Any) -> str:
         key = str(backbone or "").strip().lower().replace("-", "_")
         if key in {
-            "i3d",
-            "i3d_inception",
-            "i3d_inception_rgb",
-            "i3d_rgb",
-            "i3d_r50",
-            "i3d_r50_legacy",
-            "i3d_legacy_r50",
+            "i3d", "i3d_inception", "i3d_inception_rgb", "i3d_rgb",
+            "i3d_r50", "i3d_r50_legacy", "i3d_legacy_r50",
         }:
             return "i3d"
         if key in {"resnet", "resnet50"}:
@@ -4315,6 +6215,38 @@ class ActionWindow(FrameControlMixin, QWidget):
             return "I3D (Inception RGB 1024D)"
         return f"I3D (Inception RGB -> {target_dim}D)"
 
+    def _current_min_action_segment_frames(self) -> int:
+        try:
+            value = int(getattr(self, "_min_action_segment_frames", 15) or 15)
+        except Exception:
+            value = 15
+        return max(1, int(value))
+
+    def _default_asot_ckpt(self) -> str:
+        search_dirs = [
+            os.path.join(self._root_dir, "external", "action_seg_ot", "lightning_logs"),
+            os.path.join(self._root_dir, "external", "action_seg_ot", "weights"),
+            os.path.join(self._root_dir, "external", "action_seg_ot", "wandb"),
+        ]
+        patterns = ("*.ckpt", "*.pth", "*.pt")
+        newest = ""
+        newest_mtime = -1.0
+        for search_dir in search_dirs:
+            if not os.path.isdir(search_dir):
+                continue
+            for pattern in patterns:
+                for path in glob.glob(
+                    os.path.join(search_dir, "**", pattern), recursive=True
+                ):
+                    try:
+                        mtime = float(os.path.getmtime(path))
+                    except Exception:
+                        continue
+                    if mtime > newest_mtime:
+                        newest_mtime = mtime
+                        newest = path
+        return newest if newest and os.path.isfile(newest) else ""
+
     def _start_feature_extraction(self, feat_dir: str, backbone: str = ""):
         if not getattr(self, "video_path", None):
             QMessageBox.warning(
@@ -4355,6 +6287,8 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _on_feat_done(self, feat_dir, ok: bool):
         self._close_progress_dialog(getattr(self, "_feat_progress", None))
         self._feat_progress = None
+        pending_task = str(getattr(self, "_pending_feature_task", "") or "").strip().lower()
+        self._pending_feature_task = ""
         if not ok or not feat_dir:
             detail = str(getattr(self, "_last_feature_error_message", "") or "").strip()
             if detail:
@@ -4369,6 +6303,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._segment_embedding_cache = {}
         self._label_text_bank_cache = {}
         self._set_status(f"Feature extraction finished. Using {feat_dir}")
+        if pending_task == "asot pre-labeling":
+            self._set_status("Feature extraction finished. Starting ASOT pre-labeling...")
+            QTimer.singleShot(0, self.on_click_auto_label_asot)
 
     def _extract_current_video_features(self):
         if not getattr(self, "video_path", None):
@@ -4444,96 +6381,125 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._label_text_bank_cache = {}
         self._set_status(f"Imported external features into {feat_dir}")
 
+    def _prepare_missing_features_for_task(self, feat_dir: str, task_name: str) -> str:
+        current_label = self._feature_backbone_label(self._current_feature_backbone())
+        options = [
+            f"Extract with {current_label}",
+            "Import external features...",
+        ]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Feature Source",
+            f"No features found for this video.\nChoose how to prepare features for {task_name}:",
+            options,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            self._set_status("Feature preparation cancelled.")
+            return "cancel"
+        if str(choice).startswith("Import external"):
+            self._import_external_features()
+            current_dir = os.path.abspath(
+                str(getattr(self, "currentFeatureDir", "") or "").strip()
+            )
+            feat_path = os.path.join(current_dir, "features.npy")
+            return "ready" if current_dir and os.path.isfile(feat_path) else "cancel"
+        self._pending_feature_task = str(task_name or "").strip().lower()
+        self._start_feature_extraction(
+            feat_dir,
+            backbone=self._current_feature_backbone(),
+        )
+        return "pending"
+
+    # ── Feature meta / layout ──────────────────────────────────────────
+
     def _load_feature_meta(self, features_dir: str) -> Dict[str, Any]:
-        cache = self._ensure_boundary_snap_cache(features_dir)
-        if "meta" in cache:
-            return cache.get("meta") or {}
-        meta = {}
-        meta_path = os.path.join(features_dir, "meta.json")
+        path = os.path.abspath(str(features_dir or "").strip())
+        if not path:
+            return {}
+        cache = getattr(self, "_feature_meta_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._feature_meta_cache = cache
+        if path in cache:
+            meta = cache.get(path)
+            return dict(meta) if isinstance(meta, dict) else {}
+        meta_path = os.path.join(path, "meta.json")
+        data: Dict[str, Any] = {}
         if os.path.isfile(meta_path):
             try:
                 with open(meta_path, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    meta = loaded
+                    obj = json.load(f)
+                if isinstance(obj, dict):
+                    data = dict(obj)
             except Exception:
-                meta = {}
-        cache["meta"] = meta
-        return meta
+                data = {}
+        cache[path] = dict(data)
+        return dict(data)
 
-    def _feature_layout_for_array(self, features_dir: str, arr: np.ndarray) -> str:
-        if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+    def _infer_feature_layout(
+        self, feat: np.ndarray, meta: Optional[Dict[str, Any]] = None
+    ) -> str:
+        if not isinstance(feat, np.ndarray) or feat.ndim != 2:
             return "BTD"
-        meta = self._load_feature_meta(features_dir)
-        layout = str(meta.get("layout") or meta.get("features_layout") or "").strip().upper()
-        if layout in {"BTD", "BDT"}:
-            return layout
-        rows, cols = int(arr.shape[0]), int(arr.shape[1])
-        try:
-            dim = int(meta.get("feature_dim", 0) or 0)
-        except Exception:
-            dim = 0
-        if dim > 0:
-            if cols == dim and rows != dim:
-                return "BTD"
-            if rows == dim and cols != dim:
+        if isinstance(meta, dict) and isinstance(meta.get("feature_dim"), (int, float)):
+            dim = int(meta.get("feature_dim"))
+            if feat.shape[0] == dim and feat.shape[1] != dim:
                 return "BDT"
-        if cols in COMMON_FEATURE_DIMS and rows not in COMMON_FEATURE_DIMS:
-            return "BTD"
-        if rows in COMMON_FEATURE_DIMS and cols not in COMMON_FEATURE_DIMS:
+            if feat.shape[1] == dim and feat.shape[0] != dim:
+                return "BTD"
+        typical_dims = {128, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096}
+        if feat.shape[0] in typical_dims and feat.shape[1] not in typical_dims:
             return "BDT"
+        if feat.shape[1] in typical_dims and feat.shape[0] not in typical_dims:
+            return "BTD"
         return "BTD"
 
-    def _count_videos_in_dir(self, video_dir: str) -> int:
+    def _nearest_feature_indices(
+        self, frame_map: Sequence[int], frames: np.ndarray
+    ) -> np.ndarray:
+        rows = frame_map if frame_map is not None else []
+        fmap = np.asarray(list(rows), dtype=np.int64).reshape(-1)
+        targets = np.asarray(frames, dtype=np.int64).reshape(-1)
+        if fmap.size <= 0 or targets.size <= 0:
+            return np.zeros((targets.size,), dtype=np.int64)
+        idx = np.searchsorted(fmap, targets, side="left")
+        idx = np.clip(idx, 0, fmap.size - 1)
+        prev_idx = np.clip(idx - 1, 0, fmap.size - 1)
+        prev_dist = np.abs(fmap[prev_idx] - targets)
+        next_dist = np.abs(fmap[idx] - targets)
+        return np.where(prev_dist <= next_dist, prev_idx, idx).astype(np.int64)
+
+    def _feature_window_matrix(self, start: int, end: int) -> Optional[np.ndarray]:
         try:
-            return len(
-                [
-                    name
-                    for name in os.listdir(video_dir)
-                    if name.lower().endswith(FEATURE_VIDEO_EXTS)
-                ]
-            )
+            s = int(start)
+            e = int(end)
         except Exception:
-            return 0
-
-    def _set_interaction_status(self, s: str):
+            return None
+        if e < s:
+            s, e = e, s
+        series = self._get_feature_series_for_embedding()
+        if not series:
+            return None
+        frame_map = series.get("frame_map") or []
+        feat = series.get("data")
+        layout = str(series.get("layout", "BTD") or "BTD")
+        if not frame_map or not isinstance(feat, np.ndarray) or feat.ndim != 2:
+            return None
+        frames = np.arange(s, e + 1, dtype=np.int64)
+        nearest = self._nearest_feature_indices(frame_map, frames)
         try:
-            self.lbl_interaction_status.setText(s)
+            if layout == "BDT":
+                win_feat = feat[:, nearest].T
+            else:
+                win_feat = feat[nearest]
         except Exception:
-            pass
-
-    def _get_frame_count(self) -> int:
-        return self.player.frame_count
-
-    def _get_fps(self) -> int:
-        return max(1, self.player.frame_rate or 30)
-
-    def _view_idx_by_name(self, name: str) -> int:
-        for i, vw in enumerate(self.views):
-            if vw.get("name") == name:
-                return i
-        return -1
-
-    def _default_features_dir_for_video(self) -> Optional[str]:
-        if not getattr(self, "video_path", None):
             return None
-        base = os.path.splitext(os.path.basename(self.video_path))[0]
-        return os.path.join(os.path.dirname(self.video_path), f"{base}_features")
-
-    def _ensure_features_for_current_video(self) -> Optional[str]:
-        """
-        Ensure features.npy exists for the currently loaded video.
-        Returns the features directory path or None on failure.
-        """
-        feat_dir = self._default_features_dir_for_video()
-        if not feat_dir:
+        arr = np.asarray(win_feat, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] != len(frames):
             return None
-        os.makedirs(feat_dir, exist_ok=True)
-        feat_path = os.path.join(feat_dir, "features.npy")
-        if os.path.isfile(feat_path):
-            return feat_dir
-        # Defer extraction to a background worker; caller will start the thread.
-        return feat_dir
+        return arr
 
     def _current_label_bank_source_path(self) -> str:
         path = os.path.abspath(
@@ -4620,13 +6586,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         try:
             arr = np.load(feat_path, mmap_mode="r")
             if arr.ndim == 2:
-                layout = self._feature_layout_for_array(features_dir, arr)
+                layout = self._infer_feature_layout(np.asarray(arr), meta)
                 return int(arr.shape[1] if layout == "BDT" else arr.shape[0])
         except Exception:
             return None
         return None
 
     def _emit_task_changed(self, text: str):
+        self._update_scribble_proposal_ui()
         if callable(self._on_switch_task):
             self._on_switch_task(text)
 
@@ -4639,6 +6606,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.combo_task.blockSignals(False)
         except Exception:
             pass
+        self._update_scribble_proposal_ui()
 
     def set_psr_panel(self, panel):
         self.psr_embedded = panel
@@ -4667,16 +6635,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                     pass
 
     def enter_psr_mode(self):
-        if self.extra_mode:
-            try:
-                self.exit_extra_mode()
-            except Exception:
-                pass
-        if self.interaction_mode == "assisted":
-            try:
-                self._exit_assisted_mode()
-            except Exception:
-                pass
         self._on_psr_asr_asd_activated()
         self._set_primary_undo_shortcuts_enabled(False)
         self._apply_psr_controls(True)
@@ -4697,28 +6655,29 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._update_gap_indicator()
 
     def _apply_psr_controls(self, is_psr: bool):
+        if is_psr and self.interaction_mode == "scribble":
+            self.exit_scribble_mode()
+        if is_psr:
+            self._last_scribble_result = None
         widgets = [
+            getattr(self, "btn_auto_label_asot", None),
             getattr(self, "btn_mag", None),
+            getattr(self, "btn_extra", None),
+            getattr(self, "btn_assisted", None),
+            getattr(self, "query_decision_card", None),
+            getattr(self, "query_footer_card", None),
+            getattr(self, "btn_scribble_accept", None),
+            getattr(self, "btn_query_reject", None),
             getattr(self, "lbl_interaction", None),
             getattr(self, "combo_interaction", None),
+            getattr(self, "btn_scribble_clear", None),
+            getattr(self, "btn_query_suggest", None),
+            getattr(self, "lbl_query_hint", None),
             getattr(self, "lbl_interaction_status", None),
         ]
         for w in widgets:
             if w is not None:
                 w.setVisible(not is_psr)
-        for w in (
-            getattr(self, "btn_extra", None),
-            getattr(self, "btn_assisted", None),
-        ):
-            if w is not None:
-                w.setVisible(False)
-        if not is_psr:
-            try:
-                sb = self.ctrl_scroll.horizontalScrollBar()
-                if sb is not None:
-                    sb.setValue(0)
-            except Exception:
-                pass
         if getattr(self, "lbl_mode", None):
             self.lbl_mode.setVisible(not is_psr)
         if getattr(self, "combo_mode", None):
@@ -4732,6 +6691,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._apply_psr_left_panel(is_psr)
         self._apply_psr_timeline(is_psr)
         self._update_phase_panel_visibility()
+        self._update_scribble_proposal_ui()
 
     def _apply_psr_action_dropdown(self, is_psr: bool) -> None:
         combo = getattr(self, "combo_actions", None)
@@ -11011,6 +12971,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         timeline_cfg.setdefault("phase_soft_radius", 8)
         timeline_cfg.setdefault("hover_preview_multi", True)
         timeline_cfg.setdefault("hover_preview_align", "absolute")
+        timeline_cfg.setdefault("hover_preview_interval_ms", 110)
+        timeline_cfg.setdefault("hover_preview_min_delta", 2)
 
         boundary_cfg = cfg.setdefault("boundary_snap", {})
         if not isinstance(boundary_cfg, dict):
@@ -11062,6 +13024,88 @@ class ActionWindow(FrameControlMixin, QWidget):
         psr_cfg.setdefault("episode_resume_gap_sec", 4.0)
         psr_cfg.setdefault("model_type", self._psr_default_model_type())
 
+        scribble_cfg = cfg.setdefault("scribble_local_refiner", {})
+        if not isinstance(scribble_cfg, dict):
+            scribble_cfg = {}
+            cfg["scribble_local_refiner"] = scribble_cfg
+        scribble_cfg.setdefault("checkpoint", "")
+        scribble_cfg.setdefault("device", "auto")
+        scribble_cfg.setdefault("prefer_checkpoint", True)
+
+        decode_cfg = cfg.setdefault("structured_decode", {})
+        if not isinstance(decode_cfg, dict):
+            decode_cfg = {}
+            cfg["structured_decode"] = decode_cfg
+        decode_cfg.setdefault("transition_penalty", 0.55)
+        decode_cfg.setdefault("stay_bonus", 0.05)
+        decode_cfg.setdefault("current_label_score", 1.0)
+        decode_cfg.setdefault("alternate_label_score", 0.16)
+        decode_cfg.setdefault("anchor_boost", 0.55)
+
+        learning_cfg = cfg.setdefault("query_learning", {})
+        if not isinstance(learning_cfg, dict):
+            learning_cfg = {}
+            cfg["query_learning"] = learning_cfg
+        learning_cfg.setdefault("enabled", True)
+        learning_cfg.setdefault("second_correction_radius", 20)
+        learning_cfg.setdefault("proposal_feedback_enabled", True)
+
+    def _scribble_local_refiner_cfg(self) -> Dict[str, Any]:
+        self._ensure_algo_cfg_defaults()
+        cfg = getattr(self, "_algo_cfg", {})
+        section = cfg.get("scribble_local_refiner", {})
+        return dict(section) if isinstance(section, dict) else {}
+
+    def _resolve_scribble_local_refiner_checkpoint(self) -> str:
+        cfg = self._scribble_local_refiner_cfg()
+        if not bool(cfg.get("prefer_checkpoint", True)):
+            return ""
+        candidates: List[str] = []
+        for raw in (
+            cfg.get("checkpoint"),
+            os.environ.get("IMPACT_SCRIBE_LOCAL_REFINER_CKPT"),
+            os.environ.get("IMPACT_SCRIBE_LOCAL_REFINER"),
+        ):
+            path = os.path.abspath(os.path.expanduser(str(raw or "").strip()))
+            if path:
+                candidates.append(path)
+
+        features_dir = self._resolve_features_dir_for_snap()
+        if features_dir:
+            patterns = (
+                os.path.join(features_dir, "*local_refiner*.pt"),
+                os.path.join(features_dir, "*local_refiner*.pth"),
+            )
+            for pattern in patterns:
+                for match in sorted(glob.glob(pattern)):
+                    candidates.append(os.path.abspath(match))
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+        return ""
+
+    def _make_scribble_local_refiner(self):
+        checkpoint_path = self._resolve_scribble_local_refiner_checkpoint()
+        self._scribble_local_refiner_path = str(checkpoint_path or "")
+        self._scribble_local_refiner_error = ""
+        if checkpoint_path:
+            refiner = CheckpointLocalBoundaryRefiner(
+                checkpoint_path,
+                device=str(self._scribble_local_refiner_cfg().get("device", "auto") or "auto"),
+                fallback=HeuristicLocalBoundaryRefiner(),
+            )
+            if refiner.ready:
+                return refiner
+            self._scribble_local_refiner_error = str(refiner.load_error or "")
+            return refiner
+        return HeuristicLocalBoundaryRefiner()
+
+    def _ensure_scribble_local_refiner_ready(self) -> None:
+        checkpoint_path = self._resolve_scribble_local_refiner_checkpoint()
+        if str(checkpoint_path or "") != str(getattr(self, "_scribble_local_refiner_path", "") or ""):
+            self._scribble_local_refiner = self._make_scribble_local_refiner()
+
     def _timeline_snap_cfg(self) -> Dict[str, int]:
         self._ensure_algo_cfg_defaults()
         cfg = {}
@@ -11112,12 +13156,23 @@ class ActionWindow(FrameControlMixin, QWidget):
         return {
             "enabled_multi": bool(cfg.get("hover_preview_multi", True)),
             "align": align,
+            "interval_ms": self._cfg_int(
+                cfg.get("hover_preview_interval_ms", 110), 110, lo=20, hi=500
+            ),
+            "min_delta": self._cfg_int(
+                cfg.get("hover_preview_min_delta", 2), 2, lo=0, hi=30
+            ),
         }
 
     def _apply_timeline_snap_settings(self, refresh: bool = False) -> None:
         if not getattr(self, "timeline", None):
             return
         cfg = self._timeline_snap_cfg()
+        hover_cfg = self._timeline_hover_preview_cfg()
+        try:
+            self._hover_preview_timer.setInterval(int(hover_cfg.get("interval_ms", 110)))
+        except Exception:
+            pass
         try:
             self.timeline.set_snap_tuning(
                 current_frame_radius=cfg.get("playhead_radius"),
@@ -11241,8 +13296,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                     cache["features"] = None
                 feat = cache.get("features")
                 if isinstance(feat, np.ndarray) and feat.ndim == 2:
-                    cache["features_layout"] = self._feature_layout_for_array(
-                        features_dir, feat
+                    cache["features_layout"] = self._infer_feature_layout(
+                        np.asarray(feat), self._load_feature_meta(features_dir)
                     )
 
             feat = cache.get("features")
@@ -11309,6 +13364,80 @@ class ActionWindow(FrameControlMixin, QWidget):
             if abs(frame_map[prev] - frame) <= abs(frame_map[idx] - frame):
                 idx = prev
         return self._boundary_energy_at(series, idx)
+
+    def _boundary_energy_stats(self, series: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        if not isinstance(series, dict):
+            return None
+        features_dir = str(series.get("features_dir", "") or "")
+        cache = self._ensure_boundary_snap_cache(features_dir) if features_dir else {}
+        stats_key = (
+            str(series.get("source", "") or ""),
+            int(series.get("length", 0) or 0),
+        )
+        cached_key = cache.get("energy_stats_key")
+        cached_stats = cache.get("energy_stats")
+        if cached_key == stats_key and isinstance(cached_stats, dict):
+            return dict(cached_stats)
+        data_len = int(series.get("length", 0) or 0)
+        if data_len <= 1:
+            return None
+        sample_cap = min(512, max(1, data_len - 1))
+        step = max(1, int(np.ceil(float(max(1, data_len - 1)) / float(sample_cap))))
+        values: List[float] = []
+        for idx in range(1, data_len, step):
+            energy = self._boundary_energy_at(series, int(idx))
+            try:
+                val = float(energy) if energy is not None else float("nan")
+            except Exception:
+                val = float("nan")
+            if not np.isfinite(val) or val < 0.0:
+                continue
+            values.append(val)
+        if not values:
+            return None
+        arr = np.asarray(values, dtype=np.float32)
+        try:
+            p10, p25, p50, p75, p90 = np.percentile(arr, [10, 25, 50, 75, 90]).tolist()
+        except Exception:
+            return None
+        stats = {
+            "p10": float(p10),
+            "p25": float(p25),
+            "p50": float(p50),
+            "p75": float(p75),
+            "p90": float(p90),
+        }
+        if isinstance(cache, dict):
+            cache["energy_stats_key"] = stats_key
+            cache["energy_stats"] = dict(stats)
+        return stats
+
+    def _normalize_boundary_energy_value(
+        self,
+        raw_energy: Optional[float],
+        series: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        try:
+            val = float(raw_energy) if raw_energy is not None else float("nan")
+        except Exception:
+            val = float("nan")
+        if not np.isfinite(val) or val < 0.0:
+            return 0.45 if bool(getattr(self, "_has_auto_segments", False)) else 0.0
+        stats = self._boundary_energy_stats(series)
+        if not isinstance(stats, dict):
+            return max(0.0, min(1.0, float(val)))
+        lo = float(stats.get("p10", 0.0) or 0.0)
+        hi = float(stats.get("p90", lo) or lo)
+        mid = float(stats.get("p50", lo) or lo)
+        if hi <= lo + 1e-6:
+            scale = max(1e-6, float(stats.get("p75", hi) or hi or 1.0))
+            return max(0.0, min(1.0, float(val) / scale))
+        linear = max(0.0, min(1.0, float(val - lo) / float(hi - lo)))
+        if float(val) <= mid:
+            return linear
+        upper = max(1e-6, float(hi - mid))
+        peak = max(0.0, min(1.0, float(val - mid) / upper))
+        return max(linear, 0.45 + 0.55 * peak)
 
     def _boundary_review_score_at_frame(self, frame: int) -> Optional[float]:
         series = self._get_boundary_series()
@@ -11683,19 +13812,23 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
 
     def _normalize_boundary_energy_for_query(self, frame: int) -> float:
+        series = self._get_boundary_series()
         energy = self._boundary_energy_at_frame(int(frame))
-        if energy is None:
-            return 0.0
-        val = float(max(0.0, energy))
-        return max(0.0, min(1.0, val))
+        return self._normalize_boundary_energy_value(energy, series)
 
-    def _boundary_uncertainty_query_score(self, raw_score: Optional[float]) -> float:
-        if raw_score is None:
-            return 0.45
-        try:
-            val = float(raw_score)
-        except Exception:
-            return 0.0
+    def _boundary_uncertainty_query_score(
+        self,
+        raw_score: Optional[float],
+        normalized_energy: Optional[float] = None,
+    ) -> float:
+        if normalized_energy is None:
+            val = self._normalize_boundary_energy_value(raw_score, self._get_boundary_series())
+        else:
+            try:
+                val = float(normalized_energy)
+            except Exception:
+                val = 0.0
+        val = max(0.0, min(1.0, float(val)))
         lo, hi = self._interaction_cfg["boundary"].get("uncertainty_range", (0.4, 0.55))
         try:
             lo_f = float(lo)
@@ -11706,7 +13839,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             lo_f, hi_f = hi_f, lo_f
         center = (lo_f + hi_f) * 0.5
         radius = max(0.05, abs(hi_f - lo_f) * 0.5)
-        score = 1.0 - abs(val - center) / radius
+        bell = 1.0 - abs(val - center) / radius
+        score = max(0.75 * val, 0.55 * max(0.0, bell) + 0.25 * val)
         return max(0.0, min(1.0, float(score)))
 
     def _boundary_query_score(
@@ -11718,9 +13852,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         raw_score: Optional[float],
     ) -> Tuple[float, Dict[str, float]]:
         cfg = self._assisted_cfg()
-        uncertainty = self._boundary_uncertainty_query_score(raw_score)
-        confusion = self._boundary_confusion_query_score(left_label, right_label)
         energy = self._normalize_boundary_energy_for_query(frame)
+        uncertainty = self._boundary_uncertainty_query_score(
+            raw_score,
+            normalized_energy=energy,
+        )
+        confusion = self._boundary_confusion_query_score(left_label, right_label)
         merge_bonus = 1.0 if str(left_label or "").strip() == str(right_label or "").strip() and str(left_label or "").strip() else 0.0
         utility = self._boundary_training_utility_score(left_label, right_label)
         wu = self._cfg_float(cfg.get("boundary_uncertainty_weight", 0.55), 0.55, lo=0.0, hi=1.0)
@@ -11979,6 +14116,8 @@ class ActionWindow(FrameControlMixin, QWidget):
     ) -> Optional[List[Tuple[str, Optional[float]]]]:
         if not self._topk_enabled():
             return None
+        if not self._label_prototypes:
+            return None
         try:
             s = int(seg.get("start", 0))
             e = int(seg.get("end", s))
@@ -12010,8 +14149,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 feat = None
             cache["features"] = feat
             if isinstance(feat, np.ndarray) and feat.ndim == 2:
-                cache["features_layout"] = self._feature_layout_for_array(
-                    features_dir, feat
+                cache["features_layout"] = self._infer_feature_layout(
+                    np.asarray(feat), self._load_feature_meta(features_dir)
                 )
         if not isinstance(feat, np.ndarray) or feat.ndim != 2:
             return None
@@ -13592,6 +15731,17 @@ class ActionWindow(FrameControlMixin, QWidget):
                 pass
 
     def _enter_assisted_mode(self):
+        if self.interaction_mode == "scribble":
+            QMessageBox.information(
+                self,
+                "Interaction",
+                "Exit Boundary Scribble mode before starting Assisted Review.",
+            )
+            try:
+                self.btn_assisted.setChecked(False)
+            except Exception:
+                pass
+            return
         if self.extra_mode:
             QMessageBox.information(
                 self,
@@ -13628,6 +15778,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             return
         self.interaction_mode = "assisted"
         self._assisted_review_done = False
+        self._update_scribble_proposal_ui()
         try:
             self.btn_extra.setEnabled(False)
         except Exception:
@@ -13705,12 +15856,1207 @@ class ActionWindow(FrameControlMixin, QWidget):
                 except Exception:
                     pass
         self._set_interaction_status("Interaction: idle")
+        self._update_scribble_proposal_ui()
 
     def on_assisted_clicked(self):
         if self.btn_assisted.isChecked():
             self._enter_assisted_mode()
         else:
             self._exit_assisted_mode()
+
+    # ----- Scribble interaction helpers -----
+    def _scribble_window_bounds(self, start: int, end: int) -> Tuple[int, int]:
+        try:
+            start_i = int(start)
+            end_i = int(end)
+        except Exception:
+            start_i = end_i = int(getattr(self.player, "current_frame", 0) or 0)
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        if self.views:
+            view = self.views[self.active_view_idx]
+            lo = int(view.get("start", 0))
+            hi = int(view.get("end", lo))
+        else:
+            lo = int(getattr(self.player, "crop_start", 0) or 0)
+            hi = int(getattr(self.player, "crop_end", lo) or lo)
+        width = max(1, end_i - start_i + 1)
+        pad = max(6, min(48, width))
+        return max(lo, start_i - pad), min(hi, end_i + pad)
+
+    def _segment_for_frame_in_interaction(
+        self, segments: List[dict], frame: int
+    ) -> Optional[dict]:
+        try:
+            frame_i = int(frame)
+        except Exception:
+            return None
+        for seg in segments or []:
+            try:
+                start = int(seg.get("start", 0))
+                end = int(seg.get("end", start))
+            except Exception:
+                continue
+            if start <= frame_i <= end:
+                return dict(seg)
+        return None
+
+    def _boundary_energy_window(self, start: int, end: int) -> np.ndarray:
+        values = []
+        for frame in range(int(start), int(end) + 1):
+            val = self._boundary_energy_at_frame(frame)
+            try:
+                score = float(val) if val is not None else 0.0
+            except Exception:
+                score = 0.0
+            if not np.isfinite(score) or score < 0.0:
+                score = 0.0
+            values.append(score)
+        return np.asarray(values, dtype=np.float32)
+
+    def _run_scribble_local_refiner(
+        self, scribbles: List[TemporalScribble]
+    ) -> Optional[Dict[str, Any]]:
+        if not scribbles:
+            return None
+        self._ensure_scribble_local_refiner_ready()
+        focus = [
+            item for item in scribbles if item.kind == ScribbleKind.UNCERTAIN
+        ] or list(scribbles)
+        focus_start = min(int(item.start_frame) for item in focus)
+        focus_end = max(int(item.end_frame) for item in focus)
+        window_start, window_end = self._scribble_window_bounds(focus_start, focus_end)
+        if window_end < window_start:
+            return None
+        channels = build_scribble_channels(window_start, window_end, scribbles)
+        boundary_energy = self._boundary_energy_window(window_start, window_end)
+        window_features = self._feature_window_matrix(window_start, window_end)
+        segments = self._segments_from_store_for_interaction()
+        left_seg = self._segment_for_frame_in_interaction(
+            segments, max(window_start, focus_start - 1)
+        )
+        right_seg = self._segment_for_frame_in_interaction(
+            segments, min(window_end, focus_end + 1)
+        )
+        left_candidates = (
+            self._label_candidates_for_segment(left_seg) if left_seg is not None else []
+        )
+        right_candidates = (
+            self._label_candidates_for_segment(right_seg)
+            if right_seg is not None
+            else []
+        )
+        result = self._scribble_local_refiner.refine(
+            LocalRefinerInput(
+                window_start=window_start,
+                window_end=window_end,
+                boundary_energy=boundary_energy,
+                scribble_channels=channels,
+                left_candidates=left_candidates,
+                right_candidates=right_candidates,
+                window_features=window_features,
+                metadata={
+                    "view_idx": int(self.active_view_idx),
+                    "kinds": sorted({str(item.kind.value) for item in scribbles}),
+                    "scribble_count": int(len(scribbles)),
+                    "refiner_checkpoint": str(
+                        getattr(self, "_scribble_local_refiner_path", "") or ""
+                    ),
+                    "refiner_error": str(
+                        getattr(self, "_scribble_local_refiner_error", "") or ""
+                    ),
+                },
+            )
+        )
+        raw_confidence = self._cfg_float(result.confidence, 0.0, lo=0.0, hi=1.0)
+        calibrated_confidence = self._calibrate_scribble_confidence(raw_confidence)
+        return {
+            "window_start": int(window_start),
+            "window_end": int(window_end),
+            "boundary_frame": (
+                None if result.boundary_frame is None else int(result.boundary_frame)
+            ),
+            "raw_confidence": float(raw_confidence),
+            "confidence": float(calibrated_confidence),
+            "left_label": str(result.left_label or ""),
+            "right_label": str(result.right_label or ""),
+            "extras": dict(result.extras or {}),
+            "scribble_count": int(len(scribbles)),
+            "kinds": sorted({str(item.kind.value) for item in scribbles}),
+        }
+
+    def _active_scribble_row(self):
+        row = getattr(self.timeline, "_active_combined_row", None)
+        if row is not None:
+            return row
+        rows = getattr(self.timeline, "_combined_rows", []) or []
+        return rows[0] if rows else None
+
+    def _count_state_conflicts_in_span(self, start: int, end: int) -> int:
+        s = int(start)
+        e = int(end)
+        if e < s:
+            s, e = e, s
+        count = 0
+        for conflict in self._psr_trace_conflicts or []:
+            repair = conflict.get("repair") or {}
+            if str(repair.get("kind") or "") != "state_patch":
+                continue
+            try:
+                cs = int(repair.get("start", conflict.get("start", 0)) or 0)
+                ce = int(repair.get("end", conflict.get("end", cs)) or cs)
+            except Exception:
+                continue
+            if ce < cs:
+                cs, ce = ce, cs
+            if ce < s or cs > e:
+                continue
+            count += 1
+        return int(count)
+
+    def _decode_label_vocabulary(
+        self,
+        view: Dict[str, Any],
+        descriptor: Dict[str, Any],
+        start: int,
+        end: int,
+        *extra_labels: str,
+    ) -> List[str]:
+        labels = set()
+        st = self._store_for_view_descriptor(view, descriptor)
+        if st is not None:
+            for frame, label in dict(getattr(st, "frame_to_label", {}) or {}).items():
+                try:
+                    frame_i = int(frame)
+                except Exception:
+                    continue
+                if int(start) <= frame_i <= int(end) and str(label or "").strip():
+                    labels.add(str(label))
+        if self._multiview_sync_active():
+            for idx in self._effective_sync_edit_indices():
+                if not (0 <= int(idx) < len(self.views)):
+                    continue
+                other = self._store_for_view_descriptor(self.views[int(idx)], descriptor)
+                if other is None:
+                    continue
+                for frame, label in dict(getattr(other, "frame_to_label", {}) or {}).items():
+                    try:
+                        frame_i = int(frame)
+                    except Exception:
+                        continue
+                    if int(start) <= frame_i <= int(end) and str(label or "").strip():
+                        labels.add(str(label))
+        for raw in extra_labels:
+            label = str(raw or "").strip()
+            if label:
+                labels.add(label)
+        for lb in self.labels:
+            name = str(getattr(lb, "name", "") or "").strip()
+            if name and not is_extra_label(name):
+                labels.add(name)
+        return sorted(labels)
+
+    def _build_soft_constraints_for_decode(
+        self,
+        view: Dict[str, Any],
+        descriptor: Dict[str, Any],
+        start: int,
+        end: int,
+    ) -> List[SoftConstraint]:
+        constraints: List[SoftConstraint] = []
+        s = int(start)
+        e = int(end)
+        if e < s:
+            s, e = e, s
+
+        for conflict in self._psr_trace_conflicts or []:
+            repair = conflict.get("repair") or {}
+            if str(repair.get("kind") or "") != "state_patch":
+                continue
+            try:
+                cs = int(repair.get("start", conflict.get("start", 0)) or 0)
+                ce = int(repair.get("end", conflict.get("end", cs)) or cs)
+            except Exception:
+                continue
+            if ce < cs:
+                cs, ce = ce, cs
+            if ce < s or cs > e:
+                continue
+            severity = self._cfg_float(
+                float(conflict.get("severity", 0) or 0.0) / 3.0,
+                0.0,
+                lo=0.0,
+                hi=1.0,
+            )
+            constraints.append(
+                SoftConstraint(
+                    kind="state_conflict_region",
+                    start_frame=max(int(s), int(cs)),
+                    end_frame=min(int(e), int(ce)),
+                    weight=float(max(0.2, severity)),
+                    payload={
+                        "component_id": conflict.get("component_id"),
+                        "component_name": conflict.get("component_name"),
+                        "reason": str(conflict.get("reason") or ""),
+                    },
+                )
+            )
+
+        if self._multiview_sync_active():
+            for idx in self._effective_sync_edit_indices():
+                if int(idx) == int(self.active_view_idx):
+                    continue
+                if not (0 <= int(idx) < len(self.views)):
+                    continue
+                other_view = self.views[int(idx)]
+                other_store = self._store_for_view_descriptor(other_view, descriptor)
+                if other_store is None:
+                    continue
+                other_cuts = self._trim_cut_set_for_view(
+                    other_view, descriptor, create=False
+                )
+                for seg in self._segments_for_correction_store(
+                    other_store,
+                    start=int(s),
+                    end=int(e),
+                    cut_frames=other_cuts,
+                ):
+                    label = str(seg.get("label", "") or "").strip()
+                    if not label:
+                        continue
+                    constraints.append(
+                        SoftConstraint(
+                            kind="multiview_preferred_label",
+                            start_frame=int(seg.get("start", s) or s),
+                            end_frame=int(seg.get("end", e) or e),
+                            weight=0.35,
+                            payload={
+                                "preferred_label": label,
+                                "view_idx": int(idx),
+                                "view_name": self._effective_view_name(other_view, idx=idx),
+                            },
+                        )
+                    )
+        return constraints
+
+    def _apply_decoded_labels_to_store(
+        self,
+        store: AnnotationStore,
+        view: Dict[str, Any],
+        descriptor: Dict[str, Any],
+        decoded: Dict[int, str],
+        changed_spans: List[Tuple[int, int]],
+        *,
+        protected_boundary: Optional[int] = None,
+    ) -> None:
+        if store is None:
+            return
+        if changed_spans:
+            self._patch_store_frames_in_spans(store, changed_spans, decoded)
+        cuts = self._trim_cut_set_for_view(view, descriptor, create=True)
+        if cuts is None:
+            return
+        spans = list(changed_spans or [])
+        if protected_boundary is not None:
+            spans.append((int(protected_boundary) - 1, int(protected_boundary)))
+        merged = self._merge_spans(spans)
+        if not merged:
+            return
+        start = min(int(item[0]) for item in merged)
+        end = max(int(item[1]) for item in merged)
+        protected = (
+            {int(protected_boundary)}
+            if protected_boundary is not None and int(protected_boundary) >= 0
+            else set()
+        )
+        existing = {int(c) for c in (cuts or set()) if int(start) <= int(c) <= int(end)}
+        candidate_cuts = set(existing) | set(protected)
+        new_cuts = set()
+        for cut in sorted(candidate_cuts):
+            left_label = str(decoded.get(int(cut) - 1, store.label_at(int(cut) - 1) or "") or "")
+            right_label = str(decoded.get(int(cut), store.label_at(int(cut)) or "") or "")
+            if int(cut) in protected or left_label != right_label:
+                new_cuts.add(int(cut))
+        self._replace_cut_set_excluding_positions(
+            cuts,
+            int(start),
+            int(end),
+            protected_positions=protected,
+            new_cuts=new_cuts,
+        )
+
+    def _accept_last_scribble_proposal(self) -> bool:
+        if self._is_psr_task() or not self.views:
+            self._update_scribble_proposal_ui()
+            return False
+        proposal = dict(self._last_scribble_result or {})
+        boundary_frame = proposal.get("boundary_frame")
+        if boundary_frame is None:
+            self._set_status("No pending scribble proposal to accept.")
+            self._update_scribble_proposal_ui()
+            return False
+        row = self._active_scribble_row()
+        descriptor = self._mask_descriptor_from_row(row) if row is not None else None
+        if not descriptor or str(descriptor.get("kind") or "") not in ("store", "entity"):
+            descriptor = {"kind": "store"}
+        view = self.views[self.active_view_idx]
+        st = self._store_for_view_descriptor(view, descriptor)
+        if st is None:
+            self._set_status("No editable action row is available for scribble acceptance.")
+            self._update_scribble_proposal_ui()
+            return False
+        frame_i = int(boundary_frame)
+        view_start = int(view.get("start", 0) or 0)
+        view_end = int(view.get("end", self._get_frame_count() - 1) or (self._get_frame_count() - 1))
+        cuts = self._trim_cut_set_for_view(view, descriptor, create=True)
+        seg_s, seg_e, seg_label = self._segment_bounds_with_cuts(st, frame_i, cuts)
+        if seg_label is None:
+            self._set_status("The scribble proposal does not map to an editable labeled segment.")
+            self._update_scribble_proposal_ui()
+            return False
+
+        self._begin_correction_session(
+            "scribble_accept",
+            frame=int(frame_i),
+            descriptor=str(descriptor.get("kind") or "store"),
+            view=self._effective_view_name(view, idx=self.active_view_idx),
+            view_idx=int(self.active_view_idx),
+        )
+        changed = False
+        trim_mode = "noop"
+        left_label = str(proposal.get("left_label", "") or "").strip() or str(
+            seg_label or ""
+        )
+        right_label = str(proposal.get("right_label", "") or "").strip() or str(
+            seg_label or ""
+        )
+
+        if frame_i not in cuts and frame_i > int(seg_s) and frame_i <= int(seg_e):
+            cuts.add(frame_i)
+            self._push_undo_item(
+                {
+                    "kind": "trim_cuts",
+                    "ops": [
+                        {
+                            "view_idx": int(self.active_view_idx),
+                            "descriptor": dict(descriptor),
+                            "frame": int(frame_i),
+                            "op": "add",
+                        }
+                    ],
+                }
+            )
+            self._redo_stack.clear()
+            try:
+                view["dirty"] = True
+            except Exception:
+                pass
+            changed = True
+            trim_mode = "split"
+
+        confirmed = ConfirmedWindow(
+            start_frame=int(seg_s),
+            end_frame=int(seg_e),
+            boundary_frame=int(frame_i),
+            left_label=str(left_label),
+            right_label=str(right_label),
+            hard=True,
+            meta={
+                "descriptor": str(descriptor.get("kind") or "store"),
+                "view_idx": int(self.active_view_idx),
+            },
+        )
+        current_labels = {
+            int(frame): str(label)
+            for frame, label in dict(getattr(st, "frame_to_label", {}) or {}).items()
+            if int(view_start) <= int(frame) <= int(view_end) and str(label or "").strip()
+        }
+        anchor_before = count_anchor_violations(current_labels, [confirmed])
+        state_before = self._count_state_conflicts_in_span(view_start, view_end)
+        decode_cfg = self._structured_decode_cfg()
+        soft_constraints = self._build_soft_constraints_for_decode(
+            view, descriptor, view_start, view_end
+        )
+        decoded, decode_diag = decode_frame_labels_with_constraints(
+            current_labels,
+            [confirmed],
+            soft_constraints,
+            label_vocabulary=self._decode_label_vocabulary(
+                view,
+                descriptor,
+                view_start,
+                view_end,
+                left_label,
+                right_label,
+            ),
+            frame_start=int(view_start),
+            frame_end=int(view_end),
+            transition_penalty=self._cfg_float(
+                decode_cfg.get("transition_penalty", 0.55), 0.55, lo=0.0, hi=3.0
+            ),
+            stay_bonus=self._cfg_float(
+                decode_cfg.get("stay_bonus", 0.05), 0.05, lo=0.0, hi=1.0
+            ),
+            current_label_score=self._cfg_float(
+                decode_cfg.get("current_label_score", 1.0), 1.0, lo=0.1, hi=4.0
+            ),
+            alternate_label_score=self._cfg_float(
+                decode_cfg.get("alternate_label_score", 0.16), 0.16, lo=0.0, hi=2.0
+            ),
+            anchor_boost=self._cfg_float(
+                decode_cfg.get("anchor_boost", 0.55), 0.55, lo=0.0, hi=2.0
+            ),
+        )
+        anchor_after = int(decode_diag.get("hard_violations_after", 0) or 0)
+        changed_spans = list(decode_diag.get("changed_spans") or [])
+        changed_frame_count = int(decode_diag.get("changed_frame_count", 0) or 0)
+        if changed_spans:
+            self._apply_decoded_labels_to_store(
+                st,
+                view,
+                descriptor,
+                decoded,
+                changed_spans,
+                protected_boundary=int(frame_i),
+            )
+            changed = True
+
+        self._psr_mark_dirty()
+        try:
+            self._psr_recompute_cache()
+        except Exception:
+            pass
+        state_after = self._count_state_conflicts_in_span(view_start, view_end)
+
+        applied_left = (
+            str(decoded.get(int(frame_i - 1), left_label) or left_label)
+            if int(seg_s) <= int(frame_i - 1)
+            else ""
+        )
+        applied_right = (
+            str(decoded.get(int(max(seg_s, frame_i)), right_label) or right_label)
+            if int(frame_i) <= int(seg_e)
+            else ""
+        )
+
+        if not changed:
+            self._record_scribble_proposal_feedback(
+                proposal,
+                accepted=False,
+                reason="accept_noop",
+                changed=False,
+            )
+            self._discard_correction_session("scribble_accept_noop")
+            self._set_status("Scribble proposal produced no new boundary or label change.")
+            self._update_scribble_proposal_ui()
+            return False
+
+        self._dirty = True
+        try:
+            view["dirty"] = True
+        except Exception:
+            pass
+        self._note_correction_step()
+        self._record_scribble_proposal_feedback(
+            proposal,
+            accepted=True,
+            reason="accepted",
+            changed=True,
+        )
+        self._commit_correction_session(
+            query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
+            point_type="boundary_scribble_accept",
+            feedback_start=int(seg_s),
+            feedback_end=int(seg_e),
+            boundary_frame=int(frame_i),
+            left_label=str(applied_left),
+            right_label=str(applied_right),
+            mode=str(trim_mode),
+            raw_confidence=float(
+                self._cfg_float(
+                    proposal.get("raw_confidence", proposal.get("confidence", 0.0)),
+                    0.0,
+                    lo=0.0,
+                    hi=1.0,
+                )
+            ),
+            calibrated_confidence=float(
+                self._cfg_float(proposal.get("confidence", 0.0), 0.0, lo=0.0, hi=1.0)
+            ),
+            anchor_violations_before=int(anchor_before),
+            anchor_violations_after=int(anchor_after),
+            state_conflicts_before=int(state_before),
+            state_conflicts_after=int(state_after),
+            changed_frame_count=int(changed_frame_count),
+            changed_span_count=int(len(changed_spans)),
+            decode_switch_count=int(decode_diag.get("switch_count", 0) or 0),
+            decode_soft_penalty=float(decode_diag.get("soft_penalty_total", 0.0) or 0.0),
+        )
+        self._rebuild_timeline_sources()
+        try:
+            self.timeline.flash_boundary_marker(int(frame_i))
+        except Exception:
+            pass
+        try:
+            self._log(
+                "scribble_accept",
+                boundary_frame=int(frame_i),
+                trim_mode=str(trim_mode),
+                left_label=str(applied_left),
+                right_label=str(applied_right),
+                anchor_violations_before=int(anchor_before),
+                anchor_violations_after=int(anchor_after),
+                state_conflicts_before=int(state_before),
+                state_conflicts_after=int(state_after),
+                changed_frame_count=int(changed_frame_count),
+                changed_span_count=int(len(changed_spans)),
+                decode_switch_count=int(decode_diag.get("switch_count", 0) or 0),
+                decode_soft_penalty=float(
+                    decode_diag.get("soft_penalty_total", 0.0) or 0.0
+                ),
+                descriptor=str(descriptor.get("kind") or "store"),
+            )
+        except Exception:
+            pass
+        left_txt = applied_left or str(left_label or seg_label or "?")
+        right_txt = applied_right or str(right_label or seg_label or "?")
+        active_session = str(
+            proposal.get("session_id") or getattr(self, "_active_scribble_session_id", "") or ""
+        ).strip()
+        if active_session:
+            accepted_proposal = dict(proposal)
+            accepted_proposal["boundary_frame"] = int(frame_i)
+            accepted_proposal["left_label"] = str(applied_left)
+            accepted_proposal["right_label"] = str(applied_right)
+            self._replace_scribble_session_with_marker(
+                active_session,
+                proposal=accepted_proposal,
+                accepted=True,
+            )
+        self._active_scribble_session_id = ""
+        self._last_scribble_result = None
+        self._store_active_view_scribble_state()
+        try:
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._refresh_query_planner_hint()
+        auto_advanced = False
+        next_decision = self._boundary_query_decision()
+        if isinstance(next_decision, QueryDecision):
+            next_cand = next_decision.candidate
+            next_focus = int(
+                next_cand.payload.get(
+                    "boundary_frame",
+                    (int(next_cand.start_frame) + int(next_cand.end_frame)) // 2,
+                )
+                or 0
+            )
+            if abs(int(next_focus) - int(frame_i)) > 2:
+                auto_advanced = self._focus_query_decision(
+                    next_decision, status_prefix="Next boundary"
+                )
+        if not auto_advanced:
+            self._set_status(
+                f"Accepted scribble proposal at F{frame_i}: {left_txt} | {right_txt}"
+            )
+            self._set_interaction_status(f"Boundary Scribble accepted at F{frame_i}")
+        return True
+
+    def enter_scribble_mode(self) -> None:
+        if self.extra_mode:
+            QMessageBox.information(
+                self,
+                "Interaction",
+                "Exit Manual Segmentation before starting Boundary Scribble mode.",
+            )
+            return
+        if self.interaction_mode == "assisted":
+            QMessageBox.information(
+                self,
+                "Interaction",
+                "Exit Assisted Review before starting Boundary Scribble mode.",
+            )
+            return
+        if self._is_psr_task():
+            QMessageBox.information(
+                self,
+                "Interaction",
+                "Boundary Scribble mode is currently limited to Action Segmentation.",
+            )
+            return
+        self._scribble_mode_enabled = True
+        self.interaction_mode = "scribble"
+        try:
+            self.timeline.set_scribble_mode(True)
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._set_status(
+            "Boundary Scribble mode: draw over a suspicious boundary to propose or refine a split."
+        )
+        self._set_interaction_status("Boundary Scribble: draw boundary")
+
+    def exit_scribble_mode(self) -> None:
+        self._scribble_mode_enabled = False
+        if self.interaction_mode == "scribble":
+            self.interaction_mode = None
+        try:
+            self.timeline.set_scribble_mode(False)
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._set_status("Boundary Scribble mode off.")
+        self._set_interaction_status("Interaction: idle")
+
+    def _payload_to_temporal_scribble(
+        self,
+        payload: object,
+        *,
+        fallback_start: int = 0,
+        fallback_end: int = 0,
+        fallback_kind: str = ScribbleKind.UNCERTAIN.value,
+    ) -> TemporalScribble:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        meta = dict(data.get("meta") or {})
+        kind = resolve_scribble_kind(data.get("kind", fallback_kind))
+        return TemporalScribble(
+            start_frame=int(data.get("start_frame", fallback_start) or fallback_start),
+            end_frame=int(data.get("end_frame", fallback_end) or fallback_end),
+            kind=kind,
+            view_id=str(
+                self.views[self.active_view_idx].get("name", "")
+                if self.views and 0 <= self.active_view_idx < len(self.views)
+                else ""
+            ),
+            meta={
+                **meta,
+                "view_idx": int(self.active_view_idx),
+            },
+        )
+
+    def _max_loaded_scribble_session_counter(self, items: TemporalScribbleSet) -> int:
+        max_counter = 0
+        for item in list(getattr(items, "items", []) or []):
+            meta = dict(getattr(item, "meta", {}) or {})
+            session_id = str(meta.get("session_id") or "").strip()
+            if not session_id.startswith("scribble-session-"):
+                continue
+            try:
+                max_counter = max(max_counter, int(session_id.rsplit("-", 1)[-1]))
+            except Exception:
+                continue
+        return max_counter
+
+    def _next_scribble_session_id(self) -> str:
+        self._scribble_session_counter = int(self._scribble_session_counter) + 1
+        return f"scribble-session-{self._scribble_session_counter}"
+
+    def _active_scribble_session_items(self) -> List[TemporalScribble]:
+        session_id = str(getattr(self, "_active_scribble_session_id", "") or "").strip()
+        if not session_id:
+            return []
+        items: List[TemporalScribble] = []
+        for item in list(getattr(self._scribble_items, "items", []) or []):
+            meta = dict(getattr(item, "meta", {}) or {})
+            if bool(meta.get("accepted", False)):
+                continue
+            if str(meta.get("session_id") or "").strip() != session_id:
+                continue
+            items.append(item)
+        return items
+
+    def _build_scribble_session_marker(
+        self,
+        session_items: List[TemporalScribble],
+        *,
+        proposal: Optional[Dict[str, Any]] = None,
+        accepted: bool = False,
+    ) -> Optional[TemporalScribble]:
+        if not session_items:
+            return None
+        start_i = min(int(item.start_frame) for item in session_items)
+        end_i = max(int(item.end_frame) for item in session_items)
+        primary = None
+        for item in session_items:
+            if item.kind == ScribbleKind.UNCERTAIN:
+                primary = item
+                break
+        if primary is None:
+            primary = session_items[0]
+        primary_meta = dict(getattr(primary, "meta", {}) or {})
+        session_id = str(primary_meta.get("session_id") or "").strip()
+        marker_meta: Dict[str, Any] = {
+            "session_id": session_id,
+            "stroke_id": str(primary_meta.get("stroke_id") or f"{session_id}-marker"),
+            "view_idx": int(primary_meta.get("view_idx", self.active_view_idx)),
+        }
+        if accepted:
+            marker_meta["accepted"] = True
+        else:
+            marker_meta["archived_proposal"] = True
+        if isinstance(proposal, dict):
+            boundary_frame = proposal.get("boundary_frame")
+            try:
+                if boundary_frame is not None:
+                    marker_meta["boundary_frame"] = int(boundary_frame)
+            except Exception:
+                pass
+            for key in ("left_label", "right_label"):
+                value = str(proposal.get(key, "") or "").strip()
+                if value:
+                    marker_meta[key] = value
+            try:
+                marker_meta["confidence"] = float(proposal.get("confidence", 0.0) or 0.0)
+            except Exception:
+                pass
+        if "boundary_frame" not in marker_meta:
+            marker_meta["boundary_frame"] = int(round((start_i + end_i) / 2.0))
+        return TemporalScribble(
+            start_frame=int(start_i),
+            end_frame=int(end_i),
+            kind=primary.kind,
+            view_id=str(primary.view_id or ""),
+            meta=marker_meta,
+        )
+
+    def _replace_scribble_session_with_marker(
+        self,
+        session_id: str,
+        *,
+        proposal: Optional[Dict[str, Any]] = None,
+        accepted: bool = False,
+    ) -> Optional[TemporalScribble]:
+        session_key = str(session_id or "").strip()
+        if not session_key:
+            return None
+        kept: List[TemporalScribble] = []
+        session_items: List[TemporalScribble] = []
+        for item in list(getattr(self._scribble_items, "items", []) or []):
+            meta = dict(getattr(item, "meta", {}) or {})
+            if str(meta.get("session_id") or "").strip() == session_key:
+                session_items.append(item)
+                continue
+            kept.append(item)
+        marker = self._build_scribble_session_marker(
+            session_items, proposal=proposal, accepted=accepted
+        )
+        if marker is not None:
+            kept.append(marker)
+        self._scribble_items.items = kept
+        return marker
+
+    def _on_timeline_scribble_edited_payload(self, payload: object) -> None:
+        if not self._scribble_mode_enabled or self._is_psr_task():
+            return
+        prev_active_session = str(getattr(self, "_active_scribble_session_id", "") or "").strip()
+        prev_active_items = self._active_scribble_session_items()
+        prev_proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        scribble = self._payload_to_temporal_scribble(payload)
+        scribble_meta = dict(getattr(scribble, "meta", {}) or {})
+        session_id = str(scribble_meta.get("session_id") or "").strip()
+        reuse_active = False
+        if scribble.kind == ScribbleKind.UNCERTAIN:
+            reuse_active = self._should_reuse_active_uncertain_session(
+                scribble,
+                prev_active_items,
+                prev_proposal,
+            )
+            if prev_active_session and prev_active_items and not reuse_active:
+                self._replace_scribble_session_with_marker(
+                    prev_active_session,
+                    proposal=prev_proposal,
+                    accepted=False,
+                )
+            if prev_active_session and reuse_active:
+                session_id = prev_active_session
+                self._active_scribble_session_id = session_id
+            else:
+                session_id = self._next_scribble_session_id()
+                self._active_scribble_session_id = session_id
+        scribble_meta["session_id"] = session_id
+        scribble_meta.pop("accepted", None)
+        inferred_kind = self._infer_followup_scribble_kind(
+            scribble,
+            prev_proposal,
+            reuse_active=bool(reuse_active),
+        )
+        if scribble.kind != inferred_kind:
+            scribble_meta["inferred_kind"] = str(inferred_kind.value)
+        scribble = TemporalScribble(
+            start_frame=int(scribble.start_frame),
+            end_frame=int(scribble.end_frame),
+            kind=inferred_kind,
+            view_id=str(scribble.view_id or ""),
+            meta=scribble_meta,
+        )
+        self._scribble_items.add(scribble)
+        try:
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        if (
+            prev_proposal
+            and prev_proposal.get("boundary_frame") is not None
+            and str(prev_proposal.get("session_id") or "") == str(session_id or "")
+        ):
+            self._record_scribble_proposal_feedback(
+                prev_proposal,
+                accepted=False,
+                reason="refined_before_accept",
+                changed=False,
+            )
+        self._begin_correction_session(
+            "temporal_boundary_scribble",
+            start=int(scribble.start_frame),
+            end=int(scribble.end_frame),
+            brush_kind=str(scribble.kind.value),
+            view=str(scribble.view_id or ""),
+        )
+        self._note_correction_step(1)
+        active_items = self._active_scribble_session_items()
+        result = self._run_scribble_local_refiner(list(active_items))
+        if isinstance(result, dict):
+            result["session_id"] = str(session_id or "")
+        self._last_scribble_result = result
+        self._store_active_view_scribble_state()
+        self._update_scribble_proposal_ui()
+        episode_kinds = sorted({str(item.kind.value) for item in active_items})
+        summary = self._commit_correction_session(
+            point_type="boundary_scribble",
+            boundary_frame=(None if not result else result.get("boundary_frame")),
+            confidence=(0.0 if not result else float(result.get("confidence", 0.0))),
+            left_label="" if not result else str(result.get("left_label", "") or ""),
+            right_label="" if not result else str(result.get("right_label", "") or ""),
+            brush_kind=str(scribble.kind.value),
+            episode_size=int(len(active_items)),
+            episode_kinds="|".join(episode_kinds),
+            session_id=str(session_id or ""),
+        )
+        if result and result.get("boundary_frame") is not None:
+            try:
+                self.timeline.flash_boundary_marker(int(result["boundary_frame"]))
+            except Exception:
+                pass
+        try:
+            self._log(
+                "timeline_scribble",
+                start_frame=int(scribble.start_frame),
+                end_frame=int(scribble.end_frame),
+                kind=str(scribble.kind.value),
+                stroke_id=str((scribble.meta or {}).get("stroke_id") or ""),
+                frame_visit_count=int(
+                    sum(
+                        float(v)
+                        for v in dict((scribble.meta or {}).get("frame_counts") or {}).values()
+                    )
+                ),
+                boundary_frame=(None if not result else result.get("boundary_frame")),
+                confidence=(0.0 if not result else float(result.get("confidence", 0.0))),
+                left_label="" if not result else str(result.get("left_label", "") or ""),
+                right_label="" if not result else str(result.get("right_label", "") or ""),
+                episode_size=int(len(active_items)),
+                episode_kinds="|".join(episode_kinds),
+                session_changed=bool(summary.get("changed")),
+                session_id=str(session_id or ""),
+            )
+        except Exception:
+            pass
+        if result and result.get("boundary_frame") is not None:
+            boundary_frame = int(result["boundary_frame"])
+            conf = float(result.get("confidence", 0.0) or 0.0)
+            left_label = str(result.get("left_label", "") or "") or "?"
+            right_label = str(result.get("right_label", "") or "") or "?"
+            episode_size = int(result.get("scribble_count", len(active_items)) or 0)
+            self._set_status(
+                f"Scribble episode x{episode_size} -> boundary {boundary_frame} (conf {conf:.2f}), {left_label} | {right_label}"
+            )
+            self._set_interaction_status(
+                f"Boundary Scribble: refine -> F{boundary_frame}"
+            )
+        else:
+            self._set_status(
+                f"Scribble episode x{len(active_items)} recorded."
+            )
+            self._set_interaction_status(
+                "Boundary Scribble: drawing"
+            )
+
+    def _on_timeline_scribble_activated(self, payload: object) -> None:
+        if not self._scribble_mode_enabled or self._is_psr_task():
+            return
+        data = dict(payload) if isinstance(payload, dict) else {}
+        target_meta = dict(data.get("meta") or {})
+        target_id = str(target_meta.get("stroke_id") or "").strip()
+        target_session_id = str(target_meta.get("session_id") or "").strip()
+        prev_active_session = str(
+            getattr(self, "_active_scribble_session_id", "") or ""
+        ).strip()
+        prev_active_items = self._active_scribble_session_items()
+        prev_proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        if prev_active_session and prev_active_items and prev_active_session != target_session_id:
+            if (
+                prev_proposal
+                and prev_proposal.get("boundary_frame") is not None
+                and str(prev_proposal.get("session_id") or "").strip() == prev_active_session
+            ):
+                self._record_scribble_proposal_feedback(
+                    prev_proposal,
+                    accepted=False,
+                    reason="switched_session_before_accept",
+                    changed=False,
+                )
+            self._replace_scribble_session_with_marker(
+                prev_active_session,
+                proposal=prev_proposal,
+                accepted=False,
+            )
+
+        kept: List[TemporalScribble] = []
+        marker_item: Optional[TemporalScribble] = None
+        try:
+            target_start = int(
+                -1 if data.get("start_frame", None) is None else data.get("start_frame")
+            )
+        except Exception:
+            target_start = -1
+        try:
+            target_end = int(
+                -1 if data.get("end_frame", None) is None else data.get("end_frame")
+            )
+        except Exception:
+            target_end = -1
+        target_kind = resolve_scribble_kind(
+            data.get("kind", ScribbleKind.UNCERTAIN.value)
+        )
+        for item in list(getattr(self._scribble_items, "items", []) or []):
+            meta = dict(getattr(item, "meta", {}) or {})
+            item_id = str(meta.get("stroke_id") or "").strip()
+            item_session_id = str(meta.get("session_id") or "").strip()
+            same_id = bool(target_id) and item_id == target_id
+            same_session = bool(target_session_id) and item_session_id == target_session_id
+            same_span = (
+                int(getattr(item, "start_frame", -1)) == target_start
+                and int(getattr(item, "end_frame", -1)) == target_end
+                and resolve_scribble_kind(getattr(item, "kind", ScribbleKind.UNCERTAIN))
+                == target_kind
+            )
+            if marker_item is None and (same_id or same_session or same_span):
+                marker_item = item
+                continue
+            kept.append(item)
+        if marker_item is None:
+            return
+
+        self._scribble_items.items = kept
+        marker_meta = dict(getattr(marker_item, "meta", {}) or {})
+        session_id = str(marker_meta.get("session_id") or target_session_id or "").strip()
+        if not session_id:
+            session_id = self._next_scribble_session_id()
+        self._active_scribble_session_id = session_id
+        reopen_meta: Dict[str, Any] = {
+            "session_id": session_id,
+            "stroke_id": f"{session_id}-edit",
+            "view_idx": int(self.active_view_idx),
+            "reopened_from_stroke_id": str(
+                marker_meta.get("stroke_id") or target_id or ""
+            ).strip(),
+            "reopened_from_state": (
+                "accepted"
+                if bool(marker_meta.get("accepted", False))
+                else "proposal"
+            ),
+        }
+        reopened = TemporalScribble(
+            start_frame=int(getattr(marker_item, "start_frame", target_start)),
+            end_frame=int(getattr(marker_item, "end_frame", target_end)),
+            kind=resolve_scribble_kind(
+                getattr(marker_item, "kind", ScribbleKind.UNCERTAIN)
+            ),
+            view_id=str(
+                getattr(
+                    marker_item,
+                    "view_id",
+                    self.views[self.active_view_idx].get("name", "")
+                    if self.views and 0 <= self.active_view_idx < len(self.views)
+                    else "",
+                )
+                or ""
+            ),
+            meta=reopen_meta,
+        )
+        self._scribble_items.add(reopened)
+        active_items = self._active_scribble_session_items()
+        result = self._run_scribble_local_refiner(list(active_items))
+        if isinstance(result, dict):
+            result["session_id"] = session_id
+        else:
+            boundary_hint = marker_meta.get("boundary_frame")
+            try:
+                boundary_frame = (
+                    int(boundary_hint)
+                    if boundary_hint is not None
+                    else int(
+                        round(
+                            (
+                                int(reopened.start_frame)
+                                + int(reopened.end_frame)
+                            )
+                            / 2.0
+                        )
+                    )
+                )
+            except Exception:
+                boundary_frame = int(reopened.start_frame)
+            result = {
+                "boundary_frame": int(boundary_frame),
+                "left_label": str(marker_meta.get("left_label", "") or ""),
+                "right_label": str(marker_meta.get("right_label", "") or ""),
+                "confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
+                "raw_confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
+                "scribble_count": int(len(active_items)),
+                "session_id": session_id,
+            }
+        self._last_scribble_result = result
+        self._store_active_view_scribble_state()
+        try:
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        boundary_frame = result.get("boundary_frame") if isinstance(result, dict) else None
+        if boundary_frame is not None:
+            try:
+                self.timeline.set_current_frame(int(boundary_frame), follow=True)
+            except Exception:
+                pass
+        self._update_scribble_proposal_ui()
+        self._refresh_query_planner_hint()
+        try:
+            self._log(
+                "timeline_scribble_activate",
+                start_frame=int(reopened.start_frame),
+                end_frame=int(reopened.end_frame),
+                kind=str(reopened.kind.value),
+                session_id=str(session_id or ""),
+                reopened_from_state=str(reopen_meta.get("reopened_from_state") or ""),
+                reopened_from_stroke_id=str(
+                    reopen_meta.get("reopened_from_stroke_id") or ""
+                ),
+                boundary_frame=boundary_frame,
+                confidence=float(
+                    (result or {}).get("confidence", 0.0)
+                    if isinstance(result, dict)
+                    else 0.0
+                ),
+            )
+        except Exception:
+            pass
+        if boundary_frame is not None:
+            self._set_status(
+                f"Reopened boundary at F{int(boundary_frame)} for local refinement."
+            )
+            self._set_interaction_status(
+                f"Boundary Scribble: reopened F{int(boundary_frame)}"
+            )
+        else:
+            self._set_status("Reopened archived boundary marker.")
+            self._set_interaction_status("Boundary Scribble: reopened marker")
+
+    def _on_timeline_scribble_removed(self, payload: object) -> None:
+        if not self._scribble_mode_enabled or self._is_psr_task():
+            return
+        data = dict(payload) if isinstance(payload, dict) else {}
+        target_meta = dict(data.get("meta") or {})
+        target_id = str(target_meta.get("stroke_id") or "").strip()
+        target_session_id = str(target_meta.get("session_id") or "").strip()
+        kept = []
+        removed = None
+        for item in list(self._scribble_items.items):
+            item_meta = dict(getattr(item, "meta", {}) or {})
+            item_id = str(item_meta.get("stroke_id") or "").strip()
+            same_id = bool(target_id) and item_id == target_id
+            same_span = (
+                int(getattr(item, "start_frame", -1)) == int(data.get("start_frame", -2))
+                and int(getattr(item, "end_frame", -1)) == int(data.get("end_frame", -2))
+                and str(getattr(getattr(item, "kind", ""), "value", getattr(item, "kind", "")))
+                == str(data.get("kind") or ScribbleKind.UNCERTAIN.value)
+            )
+            if removed is None and (same_id or same_span):
+                removed = item
+                continue
+            kept.append(item)
+        if removed is None:
+            return
+        self._scribble_items.items = kept
+        if self._last_scribble_result and self._last_scribble_result.get("boundary_frame") is not None:
+            self._record_scribble_proposal_feedback(
+                dict(self._last_scribble_result),
+                accepted=False,
+                reason="stroke_removed_before_accept",
+                changed=False,
+            )
+        active_session = str(getattr(self, "_active_scribble_session_id", "") or "").strip()
+        if active_session and active_session == target_session_id:
+            active_items = self._active_scribble_session_items()
+            if active_items:
+                result = self._run_scribble_local_refiner(list(active_items))
+                if isinstance(result, dict):
+                    result["session_id"] = active_session
+                self._last_scribble_result = result
+            else:
+                self._active_scribble_session_id = ""
+                self._last_scribble_result = None
+        elif self._last_scribble_result and str(self._last_scribble_result.get("session_id") or "") == target_session_id:
+            self._last_scribble_result = None
+        elif self._last_scribble_result and not active_session:
+            self._last_scribble_result = None
+        elif self._scribble_items.items and active_session:
+            active_items = self._active_scribble_session_items()
+            if active_items:
+                result = self._run_scribble_local_refiner(list(active_items))
+                if isinstance(result, dict):
+                    result["session_id"] = active_session
+                self._last_scribble_result = result
+            else:
+                self._last_scribble_result = None
+        else:
+            self._last_scribble_result = None
+        self._store_active_view_scribble_state()
+        try:
+            self.timeline.set_scribble_items(self._scribble_items.items)
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._refresh_query_planner_hint()
+        try:
+            self._log(
+                "timeline_scribble_remove",
+                start_frame=int(getattr(removed, "start_frame", 0)),
+                end_frame=int(getattr(removed, "end_frame", 0)),
+                kind=str(getattr(getattr(removed, "kind", None), "value", "")),
+                stroke_id=str((getattr(removed, "meta", {}) or {}).get("stroke_id") or ""),
+                remaining=int(len(self._scribble_items.items)),
+            )
+        except Exception:
+            pass
+        if self._last_scribble_result and self._last_scribble_result.get("boundary_frame") is not None:
+            boundary_frame = int(self._last_scribble_result["boundary_frame"])
+            self._set_status(f"Scribble stroke removed. Updated proposal at F{boundary_frame}.")
+            self._set_interaction_status("Boundary Scribble: stroke removed")
+        else:
+            self._set_status("Scribble stroke removed.")
+            self._set_interaction_status("Boundary Scribble: stroke removed")
 
     # ----- Interaction (legacy Extra) helpers -----
     def _record_extra_cut(self, frame: int):
@@ -13723,6 +17069,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.extra_cuts = sorted(cuts)
         try:
             self.timeline.set_extra_cuts(self.extra_cuts)
+            self.timeline.set_segment_cuts(self.extra_cuts)
         except Exception:
             pass
         try:
@@ -13774,6 +17121,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.extra_last_frame = None
         try:
             self.timeline.set_extra_cuts(self.extra_cuts)
+            self.timeline.set_segment_cuts(self.extra_cuts)
         except Exception:
             pass
 
@@ -13985,6 +17333,254 @@ class ActionWindow(FrameControlMixin, QWidget):
         base, ext = os.path.splitext(self.current_annotation_path)
         return f"{base}_extra{ext or '.json'}"
 
+    def _scribble_sidecar_path(self, annotation_path: str = "") -> Optional[str]:
+        target = str(annotation_path or self.current_annotation_path or "").strip()
+        if not target:
+            return None
+        base, ext = os.path.splitext(target)
+        return f"{base}_scribble{ext or '.json'}"
+
+    def _jsonify_data(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(k): self._jsonify_data(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._jsonify_data(v) for v in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _serialize_temporal_scribble(self, scribble: TemporalScribble) -> Dict[str, Any]:
+        meta = dict(scribble.meta or {})
+        if bool(meta.get("accepted", False)):
+            meta.pop("path_points", None)
+            meta.pop("frame_counts", None)
+        else:
+            path_points = list(meta.get("path_points") or [])
+            if len(path_points) > 24:
+                keep = []
+                last_idx = len(path_points) - 1
+                keep_idx = {0, last_idx}
+                for idx in range(1, 23):
+                    pick = int(round(idx * last_idx / 23.0))
+                    keep_idx.add(max(0, min(last_idx, pick)))
+                for idx in sorted(keep_idx):
+                    keep.append(path_points[idx])
+                meta["path_points"] = keep
+            frame_counts = dict(meta.get("frame_counts") or {})
+            if len(frame_counts) > 96:
+                ordered_keys = sorted(frame_counts.keys(), key=lambda v: int(v))
+                reduced = {}
+                last_idx = len(ordered_keys) - 1
+                keep_idx = {0, last_idx}
+                for idx in range(1, 95):
+                    pick = int(round(idx * last_idx / 95.0))
+                    keep_idx.add(max(0, min(last_idx, pick)))
+                for idx in sorted(keep_idx):
+                    key = ordered_keys[idx]
+                    reduced[key] = frame_counts[key]
+                meta["frame_counts"] = reduced
+        return {
+            "start_frame": int(scribble.start_frame),
+            "end_frame": int(scribble.end_frame),
+            "kind": str(scribble.kind.value),
+            "view_id": str(scribble.view_id or ""),
+            "meta": self._jsonify_data(meta),
+        }
+
+    def _deserialize_temporal_scribble(self, payload: Dict[str, Any]) -> Optional[TemporalScribble]:
+        if not isinstance(payload, dict):
+            return None
+        kind = resolve_scribble_kind(payload.get("kind"))
+        try:
+            return TemporalScribble(
+                start_frame=int(payload.get("start_frame", 0) or 0),
+                end_frame=int(payload.get("end_frame", 0) or 0),
+                kind=kind,
+                view_id=str(payload.get("view_id", "") or ""),
+                meta=dict(payload.get("meta") or {}),
+            )
+        except Exception:
+            return None
+
+    def _serialize_query_decision(
+        self, decision: Optional[QueryDecision]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(decision, QueryDecision):
+            return None
+        cand = decision.candidate
+        return {
+            "query_type": str(decision.query_type.value),
+            "utility": float(decision.utility),
+            "candidate": {
+                "query_id": str(cand.query_id),
+                "query_type": str(cand.query_type.value),
+                "start_frame": int(cand.start_frame),
+                "end_frame": int(cand.end_frame),
+                "score_terms": self._jsonify_data(dict(cand.score_terms or {})),
+                "estimated_cost": float(cand.estimated_cost),
+                "payload": self._jsonify_data(dict(cand.payload or {})),
+            },
+        }
+
+    def _deserialize_query_decision(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Optional[QueryDecision]:
+        if not isinstance(payload, dict):
+            return None
+        cand_payload = payload.get("candidate") or {}
+        if not isinstance(cand_payload, dict):
+            return None
+        try:
+            qtype = QueryType(
+                str(
+                    cand_payload.get("query_type")
+                    or payload.get("query_type")
+                    or QueryType.BOUNDARY_SCRIBBLE.value
+                )
+            )
+        except Exception:
+            return None
+        try:
+            candidate = QueryCandidate(
+                query_id=str(cand_payload.get("query_id") or ""),
+                query_type=qtype,
+                start_frame=int(cand_payload.get("start_frame", 0) or 0),
+                end_frame=int(cand_payload.get("end_frame", 0) or 0),
+                score_terms=dict(cand_payload.get("score_terms") or {}),
+                estimated_cost=float(cand_payload.get("estimated_cost", 1.0) or 1.0),
+                payload=dict(cand_payload.get("payload") or {}),
+            )
+            return QueryDecision(
+                query_type=qtype,
+                candidate=candidate,
+                utility=float(payload.get("utility", 0.0) or 0.0),
+            )
+        except Exception:
+            return None
+
+    def _view_scribble_sidecar_payload(self, view: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        self._ensure_view_scribble_state(view)
+        scribble_items = view.get("scribble_items") or TemporalScribbleSet()
+        correction_history = []
+        view_name = self._effective_view_name(view, idx=idx)
+        for item in list(getattr(self._correction_buffer, "history", []) or []):
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("meta") or {}
+            meta_view = str(meta.get("view") or "").strip()
+            meta_idx = meta.get("view_idx")
+            if meta_view and meta_view == view_name:
+                correction_history.append(item)
+                continue
+            try:
+                if meta_idx is not None and int(meta_idx) == int(idx):
+                    correction_history.append(item)
+                    continue
+            except Exception:
+                pass
+            if not meta:
+                correction_history.append(item)
+        return {
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "video_id": str(self.current_video_id or ""),
+            "view": {
+                "index": int(idx),
+                "name": view_name,
+                "start": int(view.get("start", 0) or 0),
+                "end": int(view.get("end", view.get("start", 0)) or 0),
+                "path": str(view.get("path", "") or ""),
+            },
+            "scribble_items": [
+                self._serialize_temporal_scribble(item)
+                for item in list(getattr(scribble_items, "items", []) or [])
+                if isinstance(item, TemporalScribble)
+            ],
+            "scribble_proposal": self._jsonify_data(view.get("scribble_proposal")),
+            "active_scribble_session_id": str(
+                view.get("active_scribble_session_id", "") or ""
+            ),
+            "query_decision": self._serialize_query_decision(view.get("query_decision")),
+            "confirmed_accept_records": self._jsonify_data(
+                list(view.get("confirmed_accept_records") or [])
+            ),
+            "correction_history": self._jsonify_data(correction_history),
+        }
+
+    def _save_scribble_sidecar_if_possible(
+        self, saved_paths: Optional[List[str]] = None
+    ) -> None:
+        paths = [str(p).strip() for p in (saved_paths or []) if str(p).strip()]
+        if not paths and self.current_annotation_path:
+            paths = [str(self.current_annotation_path)]
+        if not paths or not self.views:
+            return
+        self._store_active_view_scribble_state()
+        view_pairs: List[Tuple[str, Dict[str, Any], int]] = []
+        if len(paths) == len(self.views):
+            for idx, (path, view) in enumerate(zip(paths, self.views)):
+                view_pairs.append((path, view, int(idx)))
+        else:
+            idx = int(self.active_view_idx) if 0 <= self.active_view_idx < len(self.views) else 0
+            view_pairs.append((paths[0], self.views[idx], idx))
+        for ann_path, view, idx in view_pairs:
+            sidecar = self._scribble_sidecar_path(ann_path)
+            if not sidecar:
+                continue
+            payload = self._view_scribble_sidecar_payload(view, idx)
+            payload["annotation_path"] = str(ann_path)
+            try:
+                with open(sidecar, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+            except Exception as ex:
+                print(f"[SCRIBBLE] Failed to save sidecar: {sidecar} ({ex})")
+
+    def _load_scribble_sidecar(self, main_path: str) -> None:
+        path = self._scribble_sidecar_path(main_path)
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as ex:
+            print(f"[SCRIBBLE] Failed to load sidecar: {ex}")
+            return
+        if not isinstance(data, dict):
+            return
+        view_payload = data.get("view") or {}
+        target_name = str(view_payload.get("name") or "").strip()
+        target_idx = self.active_view_idx
+        if target_name:
+            for idx, view in enumerate(self.views):
+                if self._effective_view_name(view, idx=idx) == target_name:
+                    target_idx = int(idx)
+                    break
+        if not (0 <= int(target_idx) < len(self.views)):
+            return
+        view = self.views[int(target_idx)]
+        items = TemporalScribbleSet()
+        for row in list(data.get("scribble_items") or []):
+            item = self._deserialize_temporal_scribble(row)
+            if item is not None:
+                items.add(item)
+        view["scribble_items"] = items
+        proposal = data.get("scribble_proposal")
+        view["scribble_proposal"] = dict(proposal) if isinstance(proposal, dict) else None
+        view["active_scribble_session_id"] = str(
+            data.get("active_scribble_session_id", "") or ""
+        )
+        view["query_decision"] = self._deserialize_query_decision(
+            data.get("query_decision")
+        )
+        history = data.get("correction_history")
+        if isinstance(history, list):
+            self._correction_buffer.history = [dict(item) for item in history if isinstance(item, dict)]
+            self._rebuild_query_learning_models_from_history()
+        if int(target_idx) == int(self.active_view_idx):
+            self._load_active_view_scribble_state()
+
     def _save_extra_sidecar_if_possible(self):
         path = self._extra_sidecar_path()
         if not path:
@@ -14128,6 +17724,17 @@ class ActionWindow(FrameControlMixin, QWidget):
         return False
 
     def enter_extra_mode(self):
+        if self.interaction_mode == "scribble":
+            QMessageBox.information(
+                self,
+                "Interaction",
+                "Exit Boundary Scribble mode before starting Manual Segmentation.",
+            )
+            try:
+                self.btn_extra.setChecked(False)
+            except Exception:
+                pass
+            return
         if self.interaction_mode == "assisted":
             QMessageBox.information(
                 self,
@@ -14146,6 +17753,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self.extra_mode = True
         self.interaction_mode = "manual"
+        self._update_scribble_proposal_ui()
         self.extra_last_frame = None
         self._extra_txn_stores = []
         self._extra_force_follow = True
@@ -14163,7 +17771,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._set_status(
-            f"{EXTRA_LABEL_NAME} mode: filling the Interaction track only; click to add boundaries."
+            f"{EXTRA_LABEL_NAME} mode: auto-filling current span; click to add boundaries."
         )
         self._set_interaction_status("Manual Segmentation: active")
 
@@ -14186,6 +17794,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._extra_txn_stores = []
         self._freeze = False
         self.interaction_mode = None
+        self._update_scribble_proposal_ui()
         try:
             self.btn_extra.setChecked(False)
         except Exception:
@@ -14197,6 +17806,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._freeze = bool(on)
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "timeline_right_panel", None):
+            if event.type() in (QEvent.Resize, QEvent.Show, QEvent.Move):
+                QTimer.singleShot(0, self._position_query_decision_card)
         if getattr(self, "_freeze", False) and self.extra_mode:
             allowed = []
             for vw in self.views:
@@ -14410,7 +18022,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         return [(int(s), int(e)) for s, e in fragments if int(e) >= int(s)]
 
     def _apply_autolabel_predictions(
-        self, txt_path: str, json_path: Optional[str], model_name: str = "Model"
+        self, txt_path: str, json_path: Optional[str], model_name: str = "Auto-label"
     ):
         if not txt_path or not os.path.isfile(txt_path):
             QMessageBox.warning(
@@ -14693,8 +18305,17 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._auto_boundary_candidates = sorted(set(int(x) for x in keep))
 
-    def _on_infer_done(self, txt_path: str, json_path: str, model_name: str = "Model"):
-        run_name = f"{model_name} run"
+    def _on_infer_done(
+        self, txt_path: str, json_path: str, model_name: str = "Auto-label"
+    ):
+        try:
+            if getattr(self, "btn_auto_label_asot", None) is not None:
+                self.btn_auto_label_asot.setEnabled(True)
+        except Exception:
+            pass
+        run_name = {
+            "ASOT": "ASOT pre-labeling",
+        }.get(str(model_name or "").upper(), f"{model_name} run")
         if not txt_path:
             log_hint = getattr(self, "_last_autolabel_log_path", "")
             if log_hint:
@@ -14703,6 +18324,138 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._set_status(f"{run_name} failed; check logs.")
             return
         self._apply_autolabel_predictions(txt_path, json_path, model_name=model_name)
+
+    def on_click_auto_label_asot(self):
+        if not self._ensure_python_modules_available(
+            ("torch",),
+            feature_name="ASOT pre-labeling",
+            install_hint=(
+                "Install the optional ASOT dependencies first, "
+                "for example: pip install torch pytorch-lightning wandb scipy scikit-learn"
+            ),
+            unavailable_status=(
+                "ASOT pre-labeling is unavailable until the optional dependencies are installed."
+            ),
+        ):
+            return
+
+        features_dir = str(getattr(self, "currentFeatureDir", "") or "").strip()
+        if (not features_dir) or (
+            not os.path.isfile(os.path.join(features_dir, "features.npy"))
+        ):
+            feat_dir = self._ensure_features_for_current_video()
+            if feat_dir and not os.path.isfile(os.path.join(feat_dir, "features.npy")):
+                prep_state = self._prepare_missing_features_for_task(
+                    feat_dir, "ASOT pre-labeling"
+                )
+                if prep_state != "ready":
+                    return
+            features_dir = os.path.abspath(
+                str(getattr(self, "currentFeatureDir", "") or feat_dir or "").strip()
+            )
+            if not features_dir or not os.path.isfile(
+                os.path.join(features_dir, "features.npy")
+            ):
+                self._set_status("ASOT pre-labeling cancelled.")
+                return
+            self.currentFeatureDir = features_dir
+
+        default_ckpt = self._default_asot_ckpt()
+        init_dir = (
+            os.path.dirname(default_ckpt)
+            if default_ckpt
+            else os.path.join(self._root_dir, "external", "action_seg_ot")
+        )
+        ckpt, _ = QFileDialog.getOpenFileName(
+            self,
+            (
+                "Choose ASOT checkpoint "
+                f"(default: {os.path.basename(default_ckpt) if default_ckpt else 'none'})"
+            ),
+            init_dir,
+            "PyTorch Models (*.pth *.pt *.ckpt)",
+        )
+        if not ckpt:
+            ckpt = default_ckpt
+        if not ckpt or not os.path.isfile(ckpt):
+            QMessageBox.warning(
+                self, "Missing checkpoint", "No ASOT checkpoint selected or found."
+            )
+            return
+
+        class_txt = self._resolve_action_label_bank_path(
+            features_dir,
+            generated_file_name="asot_labels.txt",
+            dialog_title="Choose semantic label bank (TXT)",
+            missing_title="Missing labels",
+            missing_text="ASOT pre-labeling requires a semantic label bank or current action labels.",
+        )
+        if not class_txt:
+            return
+
+        feat_path = os.path.join(features_dir, "features.npy")
+        if not os.path.isfile(feat_path):
+            QMessageBox.warning(
+                self,
+                "Missing file",
+                "features.npy not found in the selected directory.",
+            )
+            return
+
+        try:
+            feat = np.load(feat_path, mmap_mode="r")
+            input_layout = self._infer_feature_layout(
+                feat,
+                self._load_feature_meta(features_dir),
+            )
+        except Exception as ex:
+            QMessageBox.warning(
+                self,
+                "ASOT pre-labeling",
+                f"Failed to inspect features.npy:\n{ex}",
+            )
+            return
+
+        tool_path = os.path.join(self._root_dir, "tools", "asot_full_infer_adapter.py")
+        if not os.path.isfile(tool_path):
+            QMessageBox.warning(
+                self, "Missing script", f"ASOT adapter script not found: {tool_path}"
+            )
+            return
+
+        log_path = os.path.join(features_dir, "pred_asot_infer.log")
+        self._last_autolabel_log_path = log_path
+        self._set_status("Starting ASOT pre-labeling...")
+        try:
+            if getattr(self, "btn_auto_label_asot", None) is not None:
+                self.btn_auto_label_asot.setEnabled(False)
+        except Exception:
+            pass
+        self._infer_thread_asot = QThread(self)
+        self._infer_worker_asot = ASOTInferWorker(
+            features_dir=features_dir,
+            ckpt=ckpt,
+            class_names=class_txt,
+            smooth_k=3,
+            out_prefix="pred_asot",
+            tool_path=tool_path,
+            log_path=log_path,
+            extra_args=[
+                "--input_layout",
+                input_layout,
+                "--min_seg_len",
+                str(self._current_min_action_segment_frames()),
+            ],
+        )
+        self._infer_worker_asot.moveToThread(self._infer_thread_asot)
+        self._infer_thread_asot.started.connect(self._infer_worker_asot.run)
+        self._infer_worker_asot.progress.connect(self._set_status)
+        self._infer_worker_asot.done.connect(
+            lambda t, j: self._on_infer_done(t, j, "ASOT")
+        )
+        self._infer_worker_asot.done.connect(self._infer_thread_asot.quit)
+        self._infer_thread_asot.finished.connect(self._infer_worker_asot.deleteLater)
+        self._infer_thread_asot.start()
 
     def _on_player_frame_advanced(self, frame: int):
         # update controls for active view
@@ -14892,6 +18645,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         elif text.startswith("Features: Import external features"):
             self._import_external_features()
 
+        elif text.startswith("ASOT Pre-label"):
+            self.on_click_auto_label_asot()
+
         elif text.startswith("Assembly State: Load Components"):
             self._load_psr_components()
 
@@ -14917,11 +18673,30 @@ class ActionWindow(FrameControlMixin, QWidget):
         text = self.combo_interaction.itemText(idx)
         self.combo_interaction.setCurrentIndex(0)
 
+        if text.startswith("Boundary Scribble"):
+            if self.interaction_mode == "scribble":
+                self.exit_scribble_mode()
+            else:
+                self.enter_scribble_mode()
+            return
+
+        if text.startswith("Accept Proposal"):
+            self._accept_current_interaction_suggestion()
+            return
+
+        if text.startswith("Reject Suggestion"):
+            self._reject_current_interaction_suggestion()
+            return
+
         if text.startswith("Manual Segmentation"):
+            if self.interaction_mode == "scribble":
+                self.exit_scribble_mode()
             self.on_extra_clicked()
             return
 
         if text.startswith("Assisted Review"):
+            if self.interaction_mode == "scribble":
+                self.exit_scribble_mode()
             try:
                 self.btn_assisted.setChecked(not self.btn_assisted.isChecked())
             except Exception:
@@ -14934,8 +18709,12 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self.exit_extra_mode()
             if self.interaction_mode == "assisted":
                 self._exit_assisted_mode()
+            if self.interaction_mode == "scribble":
+                self.exit_scribble_mode()
 
     def _after_video_loaded(self):
+        self._last_scribble_result = None
+        self._update_scribble_proposal_ui()
         self._set_controls_enabled(True)
         self.slider.setMinimum(self.player.crop_start)
         self.slider.setMaximum(self.player.crop_end)
@@ -14946,6 +18725,8 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         self.timeline.view_start = 0
         self._rebuild_timeline_sources()
+        self._load_active_view_scribble_state()
+        self._refresh_query_planner_hint()
         self._timeline_auto_follow = True
         self.timeline.set_current_frame(self.player.current_frame, follow=True)
         self.timeline.set_current_hits(
@@ -16122,6 +19903,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             v["psr_state"] = self._psr_empty_view_state()
             v["trim_cuts"] = self._empty_trim_state()
             v["baseline_trim_cuts"] = self._empty_trim_state()
+            v["scribble_items"] = TemporalScribbleSet()
+            v["scribble_proposal"] = None
+            v["active_scribble_session_id"] = ""
+            v["query_decision"] = None
             if "prelabel_store" in v and v["prelabel_store"] is not None:
                 try:
                     v["prelabel_store"].frame_to_label.clear()
@@ -16144,6 +19929,11 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._extra_force_follow = False
         self._extra_txn_stores = []
         self.interaction_mode = None
+        self._scribble_mode_enabled = False
+        self._scribble_items = TemporalScribbleSet()
+        self._last_scribble_result = None
+        self._last_query_decision = None
+        self._pending_label_review = None
         self.assisted_points = []
         self.assisted_active_idx = -1
         self._assisted_review_done = False
@@ -16154,13 +19944,16 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._auto_boundary_candidates = []
         self._auto_boundary_source = ""
         self._boundary_snap_cache = {}
+        self._feature_meta_cache = {}
         self._segment_embedding_cache = {}
-        self._label_text_bank_cache = {}
         self._label_prototypes = {}
         self._label_proto_counts = {}
         self._knn_memory = []
         self._correction_buffer = CorrectionBuffer()
         self._confirmed_correction_records = []
+        self._query_cost_model = QueryCostModel()
+        self._query_utility_model = QueryUtilityModel()
+        self._proposal_confidence_calibrator = ProposalConfidenceCalibrator()
         self._forced_segment = None
         self.phase_mode_enabled = False
         self._phase_selected = None
@@ -16193,6 +19986,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     pass
         self.current_annotation_path = None
         self.currentFeatureDir = None
+        self._label_text_bank_cache = {}
         self._psr_clear_undo()
         # Keep rules/components/model settings, but clear per-video state edits.
         self._psr_manual_events = []
@@ -16288,6 +20082,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                         "phase_stores": {},
                         "anomaly_type_stores": {},
                         "trim_cuts": self._empty_trim_state(),
+                        "baseline_trim_cuts": self._empty_trim_state(),
+                        "scribble_items": TemporalScribbleSet(),
+                        "scribble_proposal": None,
+                        "query_decision": None,
                         "dirty": False,
                     }
                 )
@@ -16406,9 +20204,37 @@ class ActionWindow(FrameControlMixin, QWidget):
         if forced and 0 <= idx < len(self.labels):
             lb = self.labels[idx]
             if lb and lb.name:
-                if self._apply_label_to_segment(
-                    forced.get("start"), forced.get("end"), lb.name
-                ):
+                pending_label_review = (
+                    dict(self._pending_label_review)
+                    if self._pending_label_review_matches_span(
+                        forced.get("start"), forced.get("end")
+                    )
+                    else None
+                )
+                if pending_label_review:
+                    applied = self._apply_label_review_choice(
+                        lb.name,
+                        review=pending_label_review,
+                        accepted_suggestion=(
+                            str(lb.name or "").strip()
+                            == str(
+                                pending_label_review.get("suggested_label", "") or ""
+                            ).strip()
+                        ),
+                        reason=(
+                            "accepted_manual_choice"
+                            if str(lb.name or "").strip()
+                            == str(
+                                pending_label_review.get("suggested_label", "") or ""
+                            ).strip()
+                            else "manual_override"
+                        ),
+                    )
+                else:
+                    applied = self._apply_label_to_segment(
+                        forced.get("start"), forced.get("end"), lb.name
+                    )
+                if applied:
                     handled_forced = True
                     self._log(
                         "segment_relabel",
@@ -16422,6 +20248,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                     self.panel.clear_candidate_priority()
                 except Exception:
                     pass
+                if pending_label_review:
+                    self._update_scribble_proposal_ui()
+                    self._refresh_query_planner_hint()
                 if self.interaction_mode == "assisted":
                     try:
                         self._build_assisted_points_from_store(
@@ -16838,7 +20667,18 @@ class ActionWindow(FrameControlMixin, QWidget):
         combo = getattr(self, "combo_overlay", None)
         if lbl is None or combo is None:
             return
-        show = self._is_action_task() and not self._is_psr_task()
+        review_visible = False
+        try:
+            review_visible = bool(
+                getattr(self, "review_panel", None) and self.review_panel.isVisible()
+            )
+        except Exception:
+            pass
+        show = (
+            self._is_action_task()
+            and not self._is_psr_task()
+            and (self.validation_enabled or review_visible)
+        )
         try:
             lbl.setVisible(show)
             combo.setVisible(show)
@@ -16863,18 +20703,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 combo.setCurrentIndex(i)
                 break
         combo.blockSignals(False)
-        review_visible = False
-        try:
-            review_visible = bool(
-                getattr(self, "review_panel", None) and self.review_panel.isVisible()
-            )
-        except Exception:
-            review_visible = False
-        enabled = bool(self.validation_enabled or review_visible)
-        try:
-            combo.setEnabled(enabled)
-        except Exception:
-            pass
+        combo.setEnabled(True)
 
     def _on_validation_overlay_changed(self, _idx: int) -> None:
         combo = getattr(self, "combo_overlay", None)
@@ -17020,7 +20849,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.timeline.set_row_sources(row_sources)
         combined_groups = None
         tail_groups = None
-        coarse_has_main_content = bool(getattr(self.store, "frame_to_label", None))
         if self.mode == "Fine":
             entity_names = [e.name for e in self.entities]
             for ename in sorted(self.entity_stores.keys()):
@@ -17086,46 +20914,32 @@ class ActionWindow(FrameControlMixin, QWidget):
             combined_groups = groups if groups else None
             tail_groups = phase_groups if phase_groups else None
         elif has_extra and extra_sources:
-            manual_group_meta = {
-                "show_extra_overlay": False,
-                "editable": False,
-                "show_segment_cuts": False,
-            }
-            if coarse_has_main_content:
-                manual_group_meta.update(
+            main_sources = [
+                (lb, st, prefix)
+                for (lb, st, prefix) in row_sources
+                if not is_extra_label(lb.name)
+            ]
+            coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
+            combined_groups = [
+                (
+                    "Timeline",
+                    main_sources,
                     {
-                        "show_time_grid": False,
-                        "row_height": MANUAL_SEGMENT_ROW_HEIGHT,
-                    }
-                )
-                main_sources = [
-                    (lb, st, prefix)
-                    for (lb, st, prefix) in row_sources
-                    if not is_extra_label(lb.name)
-                ]
-                coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
-                combined_groups = [
-                    (
-                        "Timeline",
-                        main_sources,
-                        {
-                            "show_extra_overlay": False,
-                            "segment_cuts": coarse_cuts,
-                            "show_segment_cuts": True,
-                        },
-                    ),
-                    ("Manual Segmentation", extra_sources, manual_group_meta),
-                ]
-            else:
-                manual_group_meta.update(
+                        "show_extra_overlay": False,
+                        "segment_cuts": coarse_cuts,
+                        "show_segment_cuts": True,
+                    },
+                ),
+                (
+                    "Manual Segmentation",
+                    extra_sources,
                     {
-                        "show_time_grid": True,
-                        "row_height": FINE_ACTION_ROW_HEIGHT,
-                    }
-                )
-                combined_groups = [
-                    ("Manual Segmentation", extra_sources, manual_group_meta)
-                ]
+                        "show_extra_overlay": True,
+                        "editable": False,
+                        "show_segment_cuts": False,
+                    },
+                ),
+            ]
         elif self.mode == "Coarse":
             coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
             combined_groups = [
@@ -17364,6 +21178,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             indices = [active_idx]
         hover_cfg = self._timeline_hover_preview_cfg()
         align_mode = str(hover_cfg.get("align", "absolute") or "absolute").lower()
+        min_delta = int(hover_cfg.get("min_delta", 0) or 0)
         base_start = int(active_view.get("start", 0))
         keep = set(indices)
         dropped = [k for k in self._hover_preview_last_targets.keys() if k not in keep]
@@ -17409,7 +21224,14 @@ class ActionWindow(FrameControlMixin, QWidget):
                         )
                     except Exception:
                         pass
-            if self._hover_preview_last_targets.get(idx) == target:
+            last_target = self._hover_preview_last_targets.get(idx)
+            if last_target == target:
+                continue
+            if (
+                min_delta > 0
+                and last_target is not None
+                and abs(int(last_target) - int(target)) < int(min_delta)
+            ):
                 continue
             try:
                 player.seek(target, preview_only=True)
@@ -17429,14 +21251,32 @@ class ActionWindow(FrameControlMixin, QWidget):
         if getattr(player, "is_playing", False):
             return
         target = int(frame) if frame is not None else -1
+        hover_cfg = self._timeline_hover_preview_cfg()
+        min_delta = int(hover_cfg.get("min_delta", 0) or 0)
         if self._hover_preview_timer.isActive():
             if self._hover_preview_pending_frame == target:
+                return
+            if (
+                min_delta > 0
+                and target >= 0
+                and self._hover_preview_pending_frame is not None
+                and self._hover_preview_pending_frame >= 0
+                and abs(int(self._hover_preview_pending_frame) - int(target))
+                < int(min_delta)
+            ):
                 return
         else:
             if (
                 target >= 0
                 and self._hover_preview_last_frame is not None
-                and int(self._hover_preview_last_frame) == target
+                and (
+                    int(self._hover_preview_last_frame) == target
+                    or (
+                        min_delta > 0
+                        and abs(int(self._hover_preview_last_frame) - int(target))
+                        < int(min_delta)
+                    )
+                )
             ):
                 return
         self._hover_preview_pending_frame = target
@@ -17943,7 +21783,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._export_action_fine_json()
             return
 
-        include_extra = name != "FrameTXT"
+        include_extra = name not in ("SegmentsJSON", "FrameTXT")
         canonical = self._build_canonical_from_store(include_extra=include_extra)
         try:
             out_obj = adapter.export_from_canonical(canonical, options=None)
@@ -17999,6 +21839,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         try:
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
+            self.current_annotation_path = fp
+            self._save_extra_sidecar_if_possible()
+            self._save_scribble_sidecar_if_possible([fp])
             self._set_status(f"Exported Native (fine): {os.path.basename(fp)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write file: {e}")
@@ -18520,6 +22363,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             if active_out:
                 self.current_annotation_path = active_out
             self._save_extra_sidecar_if_possible()
+            self._save_scribble_sidecar_if_possible(saved_paths)
             self._dirty = False
             for vw in self.views:
                 vw["dirty"] = False
@@ -18594,6 +22438,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             if active_out:
                 self.current_annotation_path = active_out
             self._save_extra_sidecar_if_possible()
+            self._save_scribble_sidecar_if_possible(saved_paths)
             self._dirty = False
             for vw in self.views:
                 vw["dirty"] = False
@@ -20027,6 +23872,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             "load_annotations", path=fp, segments=len(segs), labels=len(self.labels)
         )
         self._load_extra_sidecar(fp)
+        self._load_scribble_sidecar(fp)
         self._rebuild_timeline_sources()
         try:
             self.timeline.refresh_all_rows()

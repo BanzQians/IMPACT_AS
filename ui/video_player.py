@@ -991,7 +991,7 @@ class VideoPlayer(QLabel):
             except Exception:
                 pass
 
-        # --- add new box (HOI) ---
+        # --- add a new editable box ---
         if (
             self.edit_enabled
             and e.button() == Qt.LeftButton
@@ -1005,7 +1005,7 @@ class VideoPlayer(QLabel):
             e.accept()
             return
 
-        # --- delete box (HOI) ---
+        # --- delete an editable box ---
         if self.edit_enabled and e.button() == Qt.RightButton:
             mapped = self._screen_to_image(e.x(), e.y())
             if mapped:
@@ -1021,7 +1021,7 @@ class VideoPlayer(QLabel):
                     e.accept()
                     return
 
-        # --- box editing (HOI) ---
+        # --- editable box adjustment ---
         if self.edit_enabled and e.button() == Qt.LeftButton:
             pos = e.pos()
             mapped = self._screen_to_image(pos.x(), pos.y())

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Boundary evaluation tool.
 
@@ -20,11 +20,6 @@ Examples (ASRF dataset layout):
   python tools/boundary_eval.py \\
     --features_path external/ASRF/dataset/50salads/features/rgb-01-1.npy \\
     --gt external/ASRF/dataset/50salads/groundTruth/rgb-01-1.txt \\
-    --method m0
-
-  python tools/boundary_eval.py \\
-    --features_path /home/yinqian/IsaacDrive/YQ_MasterThesis/AS_Tool/cvhci-video-annotation-suite/external/ASRF/dataset/50salads/features/rgb-01-1.npy \\
-    --gt /home/yinqian/IsaacDrive/YQ_MasterThesis/AS_Tool/cvhci-video-annotation-suite/external/ASRF/dataset/50salads/groundTruth/rgb-01-1.txt \\
     --method m0
 
   python tools/boundary_eval.py \\

@@ -92,6 +92,25 @@ class LabelPanel(QWidget):
         self._item_fg = QColor(32, 32, 32)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+        self.setStyleSheet(
+            """
+            QLabel#labelPanelSection {
+                color: #475467;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#labelPanelColumn {
+                color: #101828;
+                font-weight: 600;
+            }
+            """
+        )
+
+        self.lbl_manage_section = QLabel("LABEL MANAGER", self)
+        self.lbl_manage_section.setObjectName("labelPanelSection")
+        root.addWidget(self.lbl_manage_section)
 
         search_row = QHBoxLayout()
         self.search_edit = QLineEdit(self)
@@ -119,6 +138,9 @@ class LabelPanel(QWidget):
         row.addWidget(self.combo, 1)
         row.addWidget(self.btn_add, 0)
         root.addLayout(row)
+        self.lbl_browser_section = QLabel("LABEL BROWSER", self)
+        self.lbl_browser_section.setObjectName("labelPanelSection")
+        root.addWidget(self.lbl_browser_section)
 
         self._verb_only = False
         self._no_split_tokens = {"null", "error", "finish"}
@@ -134,7 +156,9 @@ class LabelPanel(QWidget):
         verb_layout = QVBoxLayout(self.verb_col)
         verb_layout.setContentsMargins(0, 0, 0, 0)
         verb_layout.setSpacing(4)
-        verb_layout.addWidget(QLabel("Verb"))
+        self.lbl_verb = QLabel("Verb")
+        self.lbl_verb.setObjectName("labelPanelColumn")
+        verb_layout.addWidget(self.lbl_verb)
         self.verb_list = QListWidget(self)
         self.verb_list.setSelectionMode(QAbstractItemView.SingleSelection)
         verb_layout.addWidget(self.verb_list, 1)
@@ -143,7 +167,9 @@ class LabelPanel(QWidget):
         obj_layout = QVBoxLayout(self.obj_col)
         obj_layout.setContentsMargins(0, 0, 0, 0)
         obj_layout.setSpacing(4)
-        obj_layout.addWidget(QLabel("Object"))
+        self.lbl_object = QLabel("Object")
+        self.lbl_object.setObjectName("labelPanelColumn")
+        obj_layout.addWidget(self.lbl_object)
         self.obj_list = QListWidget(self)
         self.obj_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.obj_list.setItemDelegate(PhraseLabelDelegate(self))

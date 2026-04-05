@@ -1117,6 +1117,24 @@ class CombinedTimelineRow(BaseTimelineRow):
     def sizeHint(self):
         return QSize(800, max(int(self.minimumHeight()), int(self.height()), 44))
 
+    def set_base_row_height(self, height: int) -> None:
+        try:
+            target_h = max(44, int(height))
+        except Exception:
+            target_h = 44
+        self._row_height_normal = int(target_h)
+        if self._scribble_mode:
+            self._pre_scribble_row_height = max(
+                int(self._pre_scribble_row_height or 0), int(target_h)
+            )
+            target_h = max(int(target_h), int(self._row_height_scribble))
+        else:
+            self._pre_scribble_row_height = int(target_h)
+        self.setMinimumHeight(int(target_h))
+        self.setMaximumHeight(int(target_h))
+        self.updateGeometry()
+        self.update()
+
     def set_current_frame(self, f: Optional[int]):
         super().set_current_frame(f)
         self._update_active_scribble_marker()
@@ -2442,6 +2460,22 @@ class CombinedTimelineRow(BaseTimelineRow):
         lb = self._label_at(self.current_frame)
         self._current_hit = lb in self._current_hits
 
+    def _active_segment(self) -> Optional[Tuple[int, int, Optional[str]]]:
+        if self.current_frame is None:
+            return None
+        try:
+            frame_i = int(self.current_frame)
+        except Exception:
+            return None
+        start = self.get_vs()
+        end = start + self.get_span()
+        if not (start <= frame_i <= end):
+            return None
+        try:
+            return self._segment_at(frame_i)
+        except Exception:
+            return None
+
     def paintEvent(self, e):
         p = QPainter(self)
         meta = getattr(self, "_group_meta", None)
@@ -2460,6 +2494,7 @@ class CombinedTimelineRow(BaseTimelineRow):
 
         self._draw_time_grid(p, start, end, fps)
         self._draw_gutter_title(p, self.title)
+        active_segment = self._active_segment()
 
         # draw label runs
         runs = self._label_runs(start, end)
@@ -2471,6 +2506,12 @@ class CombinedTimelineRow(BaseTimelineRow):
             x1 = self.frame_to_x(s_vis)
             x2 = self.frame_to_x(e_vis + 1)
             rect = QRect(x1, 6, max(4, x2 - x1), self.height() - 12)
+            is_active_segment = bool(
+                active_segment
+                and int(active_segment[0]) == int(s)
+                and int(active_segment[1]) == int(e_)
+                and active_segment[2] == lb
+            )
             base_col = self._color_for_label(lb)
             fill_col = QColor(base_col)
             if is_phase_row:
@@ -2478,20 +2519,31 @@ class CombinedTimelineRow(BaseTimelineRow):
                 fill_col.setAlpha(170)
             if lb in self.highlight_labels:
                 fill_col = fill_col.lighter(130)
+            if is_active_segment:
+                accent_fill = QColor(fill_col)
+                accent_fill.setAlpha(38 if is_phase_row else 34)
+                p.setBrush(QBrush(accent_fill))
+                p.setPen(QPen(base_col.darker(150), 3))
+                p.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), 6, 6)
             p.setBrush(QBrush(fill_col.lighter(100)))
             border_col = base_col.darker(170) if is_phase_row else base_col.darker(140)
-            p.setPen(QPen(border_col, 2 if lb in self.highlight_labels else 1))
+            border_w = 3 if is_active_segment else (2 if lb in self.highlight_labels else 1)
+            p.setPen(QPen(border_col, border_w))
             p.drawRoundedRect(rect, 4, 4)
             if lb and self.show_label_text:
-                p.setPen(QPen(QColor(40, 40, 40)))
-                p.setFont(QFont("Arial", 8))
+                font = QFont("Arial", 9 if is_active_segment or rect.height() >= 56 else 8)
+                font.setBold(bool(is_active_segment and rect.width() >= 64))
+                p.setFont(font)
+                p.setPen(QPen(QColor(24, 24, 27) if is_active_segment else QColor(40, 40, 40)))
                 text = str(lb)
-                elided = p.fontMetrics().elidedText(
-                    text, Qt.ElideRight, rect.width() - 8
-                )
-                p.drawText(
-                    rect.adjusted(4, 2, -4, -2), Qt.AlignLeft | Qt.AlignVCenter, elided
-                )
+                text_w = max(0, rect.width() - 10)
+                if text_w >= 28:
+                    elided = p.fontMetrics().elidedText(text, Qt.ElideRight, text_w)
+                    p.drawText(
+                        rect.adjusted(5, 2, -5, -2),
+                        Qt.AlignLeft | Qt.AlignVCenter,
+                        elided,
+                    )
 
         # selection highlight
         if self._selected_interval is not None:
@@ -3882,8 +3934,7 @@ class TimelineArea(QWidget):
                 try:
                     rh = int(row_height)
                     if rh > 0:
-                        row.setMinimumHeight(rh)
-                        row.setMaximumHeight(rh)
+                        row.set_base_row_height(rh)
                 except Exception:
                     pass
             self._apply_snap_tuning_to_row(row)

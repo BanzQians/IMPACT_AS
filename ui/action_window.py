@@ -189,7 +189,9 @@ DEFAULT_ANOMALY_TYPES = [
     "error_procedural",
 ]
 
-# Fine mode: tweak combined row heights for clearer grouping
+# Timeline row heights for clearer combined axes
+COARSE_TIMELINE_ROW_HEIGHT = 96
+MANUAL_SEGMENTATION_ROW_HEIGHT = 72
 FINE_ACTION_ROW_HEIGHT = 44
 FINE_PHASE_ROW_HEIGHT = 30
 
@@ -399,6 +401,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._label_proto_counts: Dict[str, int] = {}
         self._knn_memory: List[Tuple[np.ndarray, str]] = []
         self._forced_segment: Optional[Dict[str, Any]] = None
+        self._timeline_selected_segment: Optional[Dict[str, Any]] = None
         self._pending_label_review: Optional[Dict[str, Any]] = None
         self._assisted_candidates: Dict[Any, Any] = {}  # per-segment label candidates
         self._has_auto_segments: bool = False
@@ -476,8 +479,28 @@ class ActionWindow(FrameControlMixin, QWidget):
         ctrl_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ctrl = QHBoxLayout(ctrl_container)
         ctrl.setContentsMargins(0, 0, 0, 0)
+        ctrl.setSpacing(8)
 
-        ctrl.addWidget(QLabel("Task:"))
+        def _toolbar_group() -> Tuple[QWidget, QHBoxLayout]:
+            box = QWidget(self)
+            box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+            layout = QHBoxLayout(box)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+            return box, layout
+
+        def _toolbar_separator() -> QFrame:
+            sep = QFrame(self)
+            sep.setFrameShape(QFrame.VLine)
+            sep.setFrameShadow(QFrame.Plain)
+            sep.setStyleSheet("color: #d0d5dd;")
+            return sep
+
+        playback_group, playback_ctrl = _toolbar_group()
+        annotation_group, annotation_ctrl = _toolbar_group()
+        assistant_group, assistant_ctrl = _toolbar_group()
+
+        playback_ctrl.addWidget(QLabel("Task:"))
         self.combo_task = QComboBox()
         items = self._task_items or [
             "Action Segmentation",
@@ -485,8 +508,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         ]
         self.combo_task.addItems(items)
         self.combo_task.currentTextChanged.connect(self._emit_task_changed)
-        ctrl.addWidget(self.combo_task)
-        ctrl.addSpacing(8)
+        playback_ctrl.addWidget(self.combo_task)
         self._fit_combo_to_contents(self.combo_task, min_width=180)
 
         self.btn_rew = QToolButton()
@@ -508,20 +530,20 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._shape_btn(b)
             b.setToolButtonStyle(Qt.ToolButtonIconOnly)
             b.setIconSize(QSize(22, 22))
-            ctrl.addWidget(b)
+            playback_ctrl.addWidget(b)
 
-        ctrl.addSpacing(12)
+        playback_ctrl.addSpacing(8)
         self.lbl_jump = QLabel("Jump to frame:")
-        ctrl.addWidget(self.lbl_jump)
+        playback_ctrl.addWidget(self.lbl_jump)
         self.spin_jump = QSpinBox()
         self.spin_jump.setMinimum(0)
         self.spin_jump.setMaximum(0)
         self.spin_jump.setKeyboardTracking(False)
         self.btn_jump = QPushButton("Go")
-        ctrl.addWidget(self.spin_jump)
-        ctrl.addWidget(self.btn_jump)
+        playback_ctrl.addWidget(self.spin_jump)
+        playback_ctrl.addWidget(self.btn_jump)
 
-        ctrl.addSpacing(12)
+        playback_ctrl.addSpacing(8)
         self.combo_actions = _NoWheelComboBox()
         self._action_groups = [
             (
@@ -573,66 +595,53 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._action_section_headers: Set[str] = set()
         self.combo_actions.addItem("Choose action...")
         self._apply_psr_action_dropdown(False)
-        ctrl.addWidget(self.combo_actions)
-        ctrl.addSpacing(12)
+        playback_ctrl.addWidget(self.combo_actions)
         self._fit_combo_to_contents(self.combo_actions, min_width=220)
+
         self.lbl_mode = QLabel("Mode:")
-        ctrl.addWidget(self.lbl_mode)
+        annotation_ctrl.addWidget(self.lbl_mode)
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["Coarse", "Fine"])
-        ctrl.addWidget(self.combo_mode)
+        annotation_ctrl.addWidget(self.combo_mode)
         self._fit_combo_to_contents(self.combo_mode, min_width=90)
 
-        ctrl.addSpacing(8)
         self.lbl_speed = QLabel("Speed:")
-        ctrl.addWidget(self.lbl_speed)
+        annotation_ctrl.addWidget(self.lbl_speed)
         self.combo_speed = QComboBox()
         self.combo_speed.addItems(["0.25x", "0.5x", "1x", "1.5x", "2x"])
         self.combo_speed.setCurrentText("1x")
-        ctrl.addWidget(self.combo_speed)
+        annotation_ctrl.addWidget(self.combo_speed)
         self._fit_combo_to_contents(self.combo_speed, min_width=90)
-        ctrl.addSpacing(6)
-        self.btn_settings = QToolButton()
-        self._shape_btn(self.btn_settings)
-        self.btn_settings.setText("⚙")
-        self.btn_settings.setToolTip("Settings (Ctrl+,)")
-        self.btn_settings.clicked.connect(self._open_settings_dialog)
-        ctrl.addWidget(self.btn_settings)
-
-        ctrl.addSpacing(12)
         self.btn_auto_label_asot = QPushButton("ASOT Pre-label")
         self.btn_auto_label_asot.setToolTip(
             "Run ASOT pre-labeling for the current video and load it as baseline action segments."
         )
         self.btn_auto_label_asot.clicked.connect(self.on_click_auto_label_asot)
-        ctrl.addWidget(self.btn_auto_label_asot)
+        annotation_ctrl.addWidget(self.btn_auto_label_asot)
 
         # Magnifier toggle
-        ctrl.addSpacing(12)
         self.btn_mag = QToolButton()
         self._shape_btn(self.btn_mag)
         self.btn_mag.setText("🔍")
         self.btn_mag.setCheckable(True)
-        ctrl.addWidget(self.btn_mag)
+        self.btn_mag.setToolTip("Toggle magnifier for the active view")
+        annotation_ctrl.addWidget(self.btn_mag)
 
-        ctrl.addSpacing(8)
         self.lbl_validation = QLabel("Validation")
-        ctrl.addWidget(self.lbl_validation, 0)
+        assistant_ctrl.addWidget(self.lbl_validation, 0)
         self.btn_validation = ToggleSwitch(self)
         self.btn_validation.setToolTip("Toggle validation on/off")
-        ctrl.addWidget(self.btn_validation, 0)
-        ctrl.addSpacing(6)
+        assistant_ctrl.addWidget(self.btn_validation, 0)
         self.lbl_overlay = QLabel("Overlay:")
-        ctrl.addWidget(self.lbl_overlay, 0)
+        assistant_ctrl.addWidget(self.lbl_overlay, 0)
         self.combo_overlay = QComboBox()
         self.combo_overlay.setToolTip("On-video validation overlay")
         self.combo_overlay.currentIndexChanged.connect(
             self._on_validation_overlay_changed
         )
-        ctrl.addWidget(self.combo_overlay, 0)
+        assistant_ctrl.addWidget(self.combo_overlay, 0)
         self._fit_combo_to_contents(self.combo_overlay, min_width=150)
 
-        ctrl.addSpacing(8)
         self.btn_extra = QToolButton()
         self._shape_btn(self.btn_extra)
         self.btn_extra.setText("Manual Segmentation")
@@ -640,11 +649,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.btn_extra.setToolTip("Manual global segmentation mode")
         self.btn_extra.clicked.connect(self.on_extra_clicked)
         self.btn_extra.setVisible(False)
-
-        ctrl.addWidget(self.btn_extra)
-        ctrl.addSpacing(8)
         self.lbl_interaction = QLabel("Interaction:")
-        ctrl.addWidget(self.lbl_interaction)
+        assistant_ctrl.addWidget(self.lbl_interaction)
         self.combo_interaction = QComboBox()
         self.combo_interaction.addItems(
             [
@@ -656,9 +662,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self.combo_interaction.setToolTip("Switch interaction modes")
         self.combo_interaction.activated[int].connect(self._on_interaction_selected)
-        ctrl.addWidget(self.combo_interaction)
+        assistant_ctrl.addWidget(self.combo_interaction)
         self._fit_combo_to_contents(self.combo_interaction, min_width=180)
-        ctrl.addSpacing(6)
         self.btn_scribble_clear = QToolButton()
         self._shape_btn(self.btn_scribble_clear)
         self.btn_scribble_clear.setFixedWidth(self.btn_scribble_clear.fontMetrics().horizontalAdvance("Clear Scribbles") + 24)
@@ -667,8 +672,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             "Clear the active view's current scribble episode and pending proposal."
         )
         self.btn_scribble_clear.clicked.connect(self._clear_active_scribble_episode)
-        ctrl.addWidget(self.btn_scribble_clear)
-        ctrl.addSpacing(6)
+        assistant_ctrl.addWidget(self.btn_scribble_clear)
         self.btn_query_suggest = QToolButton()
         self._shape_btn(self.btn_query_suggest)
         self.btn_query_suggest.setFixedWidth(self.btn_query_suggest.fontMetrics().horizontalAdvance("Suggest Query") + 24)
@@ -677,8 +681,19 @@ class ActionWindow(FrameControlMixin, QWidget):
             "Use the lightweight query planner to focus the next boundary, label, or state question."
         )
         self.btn_query_suggest.clicked.connect(self._suggest_next_query)
-        ctrl.addWidget(self.btn_query_suggest)
+        assistant_ctrl.addWidget(self.btn_query_suggest)
+        self.btn_settings = QToolButton()
+        self._shape_btn(self.btn_settings)
+        self.btn_settings.setText("⚙")
+        self.btn_settings.setToolTip("Settings (Ctrl+,)")
+        self.btn_settings.clicked.connect(self._open_settings_dialog)
+        assistant_ctrl.addWidget(self.btn_settings)
 
+        ctrl.addWidget(playback_group)
+        ctrl.addWidget(_toolbar_separator())
+        ctrl.addWidget(annotation_group)
+        ctrl.addWidget(_toolbar_separator())
+        ctrl.addWidget(assistant_group)
         ctrl.addStretch(1)
 
         # playback slider
@@ -725,6 +740,7 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         self.video_scroll = QScrollArea(self)
         self.video_scroll.setWidgetResizable(True)
+        self.video_scroll.setFrameShape(QFrame.NoFrame)
         self.video_scroll.setWidget(self.video_grid_inner)
         self.video_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.video_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -985,127 +1001,67 @@ class ActionWindow(FrameControlMixin, QWidget):
         left_scroll.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Expanding)
         self.left_scroll = left_scroll
 
-        self.query_decision_card = QFrame(self)
-        self.query_decision_card.setObjectName("queryDecisionCard")
-        self.query_decision_card.setMaximumWidth(420)
-        self.query_decision_card.setSizePolicy(
-            QSizePolicy.Maximum, QSizePolicy.Fixed
-        )
-        self.query_decision_card.setStyleSheet(
+        self.timeline_context_bar = QFrame(self)
+        self.timeline_context_bar.setObjectName("timelineContextBar")
+        self.timeline_context_bar.setStyleSheet(
             """
-            QFrame#queryDecisionCard {
-                background: rgba(252, 252, 253, 242);
-                border: 1px solid #d0d5dd;
-                border-radius: 12px;
-            }
-            QLabel#queryDecisionTitle {
-                color: #1d2939;
-                font-size: 12px;
-                font-weight: 700;
-            }
-            QLabel#queryDecisionInfo {
-                color: #101828;
-                font-size: 14px;
-                font-weight: 600;
-            }
-            QLabel#queryDecisionMeta {
-                color: #667085;
-                font-size: 11px;
-            }
-            QPushButton#queryAcceptButton {
-                background: #175cd3;
-                color: white;
-                border: 1px solid #175cd3;
-                border-radius: 8px;
-                padding: 6px 12px;
-                font-weight: 600;
-            }
-            QPushButton#queryAcceptButton:hover {
-                background: #1849a9;
-                border-color: #1849a9;
-            }
-            QPushButton#queryAcceptButton:disabled {
-                background: #d0d5dd;
-                border-color: #d0d5dd;
-                color: #98a2b3;
-            }
-            QPushButton#queryRejectButton {
+            QFrame#timelineContextBar {
                 background: #f8fafc;
+                border: 1px solid #d0d5dd;
+                border-radius: 10px;
+            }
+            QLabel#timelineContextChip {
                 color: #344054;
+                background: #ffffff;
                 border: 1px solid #d0d5dd;
-                border-radius: 8px;
-                padding: 6px 12px;
+                border-radius: 10px;
+                padding: 3px 8px;
+                font-size: 12px;
                 font-weight: 600;
             }
-            QPushButton#queryRejectButton:hover {
-                background: #eef2f6;
-            }
-            QPushButton#queryRejectButton:disabled {
-                color: #98a2b3;
-                background: #f8fafc;
+            QLabel#timelineContextSegment {
+                color: #101828;
+                background: #eef2ff;
+                border: 1px solid #c7d7fe;
+                border-radius: 10px;
+                padding: 3px 10px;
+                font-size: 12px;
+                font-weight: 600;
             }
             """
         )
-        query_card_layout = QVBoxLayout(self.query_decision_card)
-        query_card_layout.setContentsMargins(12, 10, 12, 10)
-        query_card_layout.setSpacing(3)
-        self.lbl_query_decision_title = QLabel("Suggestion Pending")
-        self.lbl_query_decision_title.setObjectName("queryDecisionTitle")
-        query_card_layout.addWidget(self.lbl_query_decision_title)
-        self.lbl_query_decision_info = QLabel(
-            "Draw a boundary scribble or ask for a suggestion."
+        timeline_context_layout = QHBoxLayout(self.timeline_context_bar)
+        timeline_context_layout.setContentsMargins(10, 6, 10, 6)
+        timeline_context_layout.setSpacing(8)
+        self.lbl_timeline_ctx_view = QLabel("View: -")
+        self.lbl_timeline_ctx_view.setObjectName("timelineContextChip")
+        timeline_context_layout.addWidget(self.lbl_timeline_ctx_view)
+        self.lbl_timeline_ctx_frame = QLabel("Frame: F0")
+        self.lbl_timeline_ctx_frame.setObjectName("timelineContextChip")
+        timeline_context_layout.addWidget(self.lbl_timeline_ctx_frame)
+        self.lbl_timeline_ctx_mode = QLabel("Mode: Coarse")
+        self.lbl_timeline_ctx_mode.setObjectName("timelineContextChip")
+        timeline_context_layout.addWidget(self.lbl_timeline_ctx_mode)
+        self.lbl_timeline_ctx_segment = QLabel("Segment: -")
+        self.lbl_timeline_ctx_segment.setObjectName("timelineContextSegment")
+        self.lbl_timeline_ctx_segment.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
         )
-        self.lbl_query_decision_info.setObjectName("queryDecisionInfo")
-        self.lbl_query_decision_info.setWordWrap(True)
-        query_card_layout.addWidget(self.lbl_query_decision_info)
-        self.lbl_query_decision_meta = QLabel(
-            "Accept or reject the current suggestion near the timeline."
-        )
-        self.lbl_query_decision_meta.setObjectName("queryDecisionMeta")
-        self.lbl_query_decision_meta.setWordWrap(True)
-        query_card_layout.addWidget(self.lbl_query_decision_meta)
-        query_card_buttons = QHBoxLayout()
-        query_card_buttons.setContentsMargins(0, 4, 0, 0)
-        query_card_buttons.setSpacing(8)
-        self.btn_scribble_accept = QPushButton("Accept Proposal")
-        self.btn_scribble_accept.setObjectName("queryAcceptButton")
-        self.btn_scribble_accept.setToolTip(
-            "Accept the current interaction suggestion and write it back to the timeline."
-        )
-        self.btn_scribble_accept.clicked.connect(
-            self._accept_current_interaction_suggestion
-        )
-        self.btn_scribble_accept.setEnabled(False)
-        query_card_buttons.addWidget(self.btn_scribble_accept)
-        self.btn_query_reject = QPushButton("Reject Suggestion")
-        self.btn_query_reject.setObjectName("queryRejectButton")
-        self.btn_query_reject.setToolTip(
-            "Reject the current label or boundary suggestion without applying it."
-        )
-        self.btn_query_reject.clicked.connect(
-            self._reject_current_interaction_suggestion
-        )
-        self.btn_query_reject.setEnabled(False)
-        query_card_buttons.addWidget(self.btn_query_reject)
-        query_card_buttons.addStretch(1)
-        query_card_layout.addLayout(query_card_buttons)
-        self.query_decision_card.hide()
+        timeline_context_layout.addWidget(self.lbl_timeline_ctx_segment, 1)
 
         self.timeline_right_panel = QWidget(self)
         timeline_right_layout = QVBoxLayout(self.timeline_right_panel)
         timeline_right_layout.setContentsMargins(0, 0, 0, 0)
-        timeline_right_layout.setSpacing(0)
+        timeline_right_layout.setSpacing(6)
+        timeline_right_layout.addWidget(self.timeline_context_bar, 0)
         timeline_right_layout.addWidget(self.timeline, 1)
-        self.query_decision_card.setParent(self.timeline_right_panel)
-        self.query_decision_card.raise_()
-        self.timeline_right_panel.installEventFilter(self)
 
         splitter_ann.addWidget(left_scroll)
         splitter_ann.addWidget(self.timeline_right_panel)
 
         splitter_ann.setStretchFactor(0, 0)
         splitter_ann.setStretchFactor(1, 1)
-        splitter_ann.setSizes([260, 940])
+        splitter_ann.setSizes([230, 970])
 
         # --- MAIN VERTICAL SPLITTER: top / bottom ---
         splitter_main = QSplitter(Qt.Vertical, self)
@@ -1153,6 +1109,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                 font-size: 15px;
                 font-weight: 700;
             }
+            QLabel#queryFooterMeta {
+                color: #475467;
+                font-size: 12px;
+            }
             QLabel#queryFooterSub {
                 color: #344054;
                 background: #eef2ff;
@@ -1162,30 +1122,121 @@ class ActionWindow(FrameControlMixin, QWidget):
                 font-size: 13px;
                 font-weight: 600;
             }
+            QPushButton#queryAcceptButton {
+                background: #175cd3;
+                color: white;
+                border: 1px solid #175cd3;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton#queryAcceptButton:hover {
+                background: #1849a9;
+                border-color: #1849a9;
+            }
+            QPushButton#queryAcceptButton:disabled {
+                background: #d0d5dd;
+                border-color: #d0d5dd;
+                color: #98a2b3;
+            }
+            QPushButton#querySecondaryButton {
+                background: #f8fafc;
+                color: #344054;
+                border: 1px solid #d0d5dd;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton#querySecondaryButton:hover {
+                background: #eef2f6;
+            }
+            QPushButton#querySecondaryButton:disabled {
+                color: #98a2b3;
+                background: #f8fafc;
+            }
             """
         )
-        query_footer_layout = QHBoxLayout(self.query_footer_card)
+        query_footer_layout = QVBoxLayout(self.query_footer_card)
+        self.query_footer_layout = query_footer_layout
         query_footer_layout.setContentsMargins(12, 8, 12, 8)
-        query_footer_layout.setSpacing(10)
+        query_footer_layout.setSpacing(6)
+        query_footer_head = QHBoxLayout()
+        self.query_footer_head = query_footer_head
+        query_footer_head.setContentsMargins(0, 0, 0, 0)
+        query_footer_head.setSpacing(10)
         self.lbl_query_footer_kicker = QLabel("NEXT SUGGESTION")
         self.lbl_query_footer_kicker.setObjectName("queryFooterKicker")
-        query_footer_layout.addWidget(self.lbl_query_footer_kicker)
+        query_footer_head.addWidget(self.lbl_query_footer_kicker)
         self.lbl_query_hint = QLabel(
             "No suggestion yet. Use Suggest Query when a baseline is ready."
         )
         self.lbl_query_hint.setObjectName("queryFooterMain")
-        self.lbl_query_hint.setWordWrap(False)
+        self.lbl_query_hint.setWordWrap(True)
         self.lbl_query_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        query_footer_layout.addWidget(self.lbl_query_hint, 1)
+        query_footer_head.addWidget(self.lbl_query_hint, 1)
         self.lbl_interaction_status = QLabel("Interaction: idle")
         self.lbl_interaction_status.setObjectName("queryFooterSub")
         self.lbl_interaction_status.setWordWrap(False)
         self.lbl_interaction_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        query_footer_layout.addWidget(self.lbl_interaction_status)
+        query_footer_head.addWidget(self.lbl_interaction_status)
+        query_footer_layout.addLayout(query_footer_head)
+        query_footer_detail = QHBoxLayout()
+        self.query_footer_detail = query_footer_detail
+        query_footer_detail.setContentsMargins(0, 0, 0, 0)
+        query_footer_detail.setSpacing(12)
+        self.lbl_query_footer_meta = QLabel(
+            "Use Suggest Query to compute the next lightweight interaction target."
+        )
+        self.lbl_query_footer_meta.setObjectName("queryFooterMeta")
+        self.lbl_query_footer_meta.setWordWrap(True)
+        self.lbl_query_footer_meta.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        query_footer_detail.addWidget(self.lbl_query_footer_meta, 1)
+        self.query_footer_button_bar = QWidget(self.query_footer_card)
+        self.query_footer_button_bar.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Fixed
+        )
+        query_footer_actions = QHBoxLayout(self.query_footer_button_bar)
+        query_footer_actions.setContentsMargins(0, 0, 0, 0)
+        query_footer_actions.setSpacing(8)
+        self.btn_query_refine = QPushButton("Start Scribble")
+        self.btn_query_refine.setObjectName("querySecondaryButton")
+        self.btn_query_refine.setToolTip(
+            "Enter Boundary Scribble mode and refine the active boundary suggestion on the timeline."
+        )
+        self.btn_query_refine.clicked.connect(self._start_scribble_refine_from_footer)
+        self.btn_query_refine.setEnabled(False)
+        query_footer_actions.addWidget(self.btn_query_refine)
+        self.btn_scribble_accept = QPushButton("Accept Suggestion")
+        self.btn_scribble_accept.setObjectName("queryAcceptButton")
+        self.btn_scribble_accept.setToolTip(
+            "Accept the current interaction suggestion and write it back to the timeline."
+        )
+        self.btn_scribble_accept.clicked.connect(
+            self._accept_current_interaction_suggestion
+        )
+        self.btn_scribble_accept.setEnabled(False)
+        query_footer_actions.addWidget(self.btn_scribble_accept)
+        self.btn_query_reject = QPushButton("Reject Suggestion")
+        self.btn_query_reject.setObjectName("querySecondaryButton")
+        self.btn_query_reject.setToolTip(
+            "Reject the current label or boundary suggestion without applying it."
+        )
+        self.btn_query_reject.clicked.connect(
+            self._reject_current_interaction_suggestion
+        )
+        self.btn_query_reject.setEnabled(False)
+        query_footer_actions.addWidget(self.btn_query_reject)
+        self.query_footer_button_bar.hide()
+        query_footer_detail.addWidget(
+            self.query_footer_button_bar, 0, Qt.AlignRight | Qt.AlignVCenter
+        )
+        query_footer_layout.addLayout(query_footer_detail)
         root.addWidget(self.query_footer_card)
         self._update_query_hint_ui()
         self._update_scribble_proposal_ui()
-        QTimer.singleShot(0, self._position_query_decision_card)
+        self._update_timeline_context_bar()
 
         # status
         self.lbl_status = QLabel("Ready. Choose 'Load Video...' from the dropdown.")
@@ -4434,6 +4485,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._timeline_auto_follow = True
         self.timeline.set_current_frame(frame, follow=True)
         self.timeline.set_current_hits(self._hit_names_for_frame(frame))
+        self._update_timeline_context_bar(frame)
         self._update_play_pause_button()
         self._log(
             "set_primary_view",
@@ -4490,6 +4542,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             p.current_frame, follow=self._timeline_auto_follow
         )
         self.timeline.set_current_hits(self._hit_names_for_frame(p.current_frame))
+        self._update_timeline_context_bar(p.current_frame)
         self._update_gap_indicator()
         self._log(
             "sync_controls",
@@ -4807,6 +4860,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.combo_speed,
             self.btn_validation,
             self.btn_extra,
+            getattr(self, "btn_query_refine", None),
             getattr(self, "btn_scribble_accept", None),
             getattr(self, "btn_query_reject", None),
             getattr(self, "combo_interaction", None),
@@ -4923,6 +4977,119 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _set_interaction_status(self, s: str):
         try:
             self.lbl_interaction_status.setText(s)
+        except Exception:
+            pass
+
+    def _timeline_context_frame(self, frame: Optional[int] = None) -> int:
+        if frame is not None:
+            try:
+                return max(0, int(frame))
+            except Exception:
+                pass
+        try:
+            return max(0, int(getattr(self.player, "current_frame", 0) or 0))
+        except Exception:
+            return 0
+
+    def _timeline_context_segment_text(self, frame: int) -> str:
+        try:
+            frame_i = max(0, int(frame))
+        except Exception:
+            frame_i = 0
+        if self._is_psr_task():
+            seg = getattr(self, "_psr_selected_segment", None)
+            if isinstance(seg, dict):
+                label = str(seg.get("label", "") or "").strip()
+                if label:
+                    return label
+            return "Assembly state"
+        selected = getattr(self, "_timeline_selected_segment", None)
+        if (
+            isinstance(selected, dict)
+            and int(selected.get("start", frame_i) or frame_i) <= frame_i
+            <= int(selected.get("end", frame_i) or frame_i)
+        ):
+            label = self._resolve_action_label_name(selected.get("label"))
+            if label:
+                return label
+        if self.mode == "Fine":
+            row = getattr(self.timeline, "_active_combined_row", None)
+            meta = getattr(row, "_group_meta", {}) if row is not None else {}
+            title = str(getattr(row, "title", "") or "")
+            if meta.get("row_type") == "phase":
+                ename = str(meta.get("entity") or title.replace(" (phase)", "") or "")
+                pstore = self.phase_stores.get(ename)
+                if pstore is not None:
+                    phase_label = str(pstore.label_at(frame_i) or "").strip()
+                    if phase_label:
+                        return f"Phase {ename}: {phase_label}"
+            active_name = str(getattr(self, "_active_entity_name", "") or "").strip()
+            if active_name:
+                st = self.entity_stores.get(active_name)
+                if st is not None:
+                    label = self._resolve_action_label_name(st.label_at(frame_i))
+                    if label:
+                        return f"{active_name}: {label}"
+            for ename, st in (self.entity_stores or {}).items():
+                label = self._resolve_action_label_name(st.label_at(frame_i))
+                if label:
+                    return f"{ename}: {label}"
+            global_label = self._resolve_action_label_name(self.store.label_at(frame_i))
+            if global_label:
+                return f"Global: {global_label}"
+            return "No fine segment"
+        label = self._resolve_action_label_name(self.store.label_at(frame_i))
+        if label:
+            return label
+        extra_label = str(getattr(self.extra_store, "label_at", lambda _f: "")(frame_i) or "").strip()
+        if extra_label:
+            return self._resolve_action_label_name(extra_label)
+        return "No segment"
+
+    @staticmethod
+    def _truncate_context_text(text: Any, max_chars: int = 44) -> str:
+        value = str(text or "").strip()
+        if not value:
+            return "-"
+        if len(value) <= max_chars:
+            return value
+        return f"{value[: max(0, max_chars - 3)].rstrip()}..."
+
+    def _update_timeline_context_bar(self, frame: Optional[int] = None) -> None:
+        view_label = getattr(self, "lbl_timeline_ctx_view", None)
+        frame_label = getattr(self, "lbl_timeline_ctx_frame", None)
+        mode_label = getattr(self, "lbl_timeline_ctx_mode", None)
+        segment_label = getattr(self, "lbl_timeline_ctx_segment", None)
+        if any(
+            item is None
+            for item in (
+                view_label,
+                frame_label,
+                mode_label,
+                segment_label,
+            )
+        ):
+            return
+        frame_i = self._timeline_context_frame(frame)
+        if self.views and 0 <= self.active_view_idx < len(self.views):
+            view_name = self._effective_view_name(
+                self.views[self.active_view_idx], idx=self.active_view_idx
+            )
+        else:
+            view_name = "-"
+        mode_text = "PSR" if self._is_psr_task() else str(self.mode or "Coarse")
+        segment_text = self._timeline_context_segment_text(frame_i)
+        try:
+            view_label.setText(
+                f"View: {self._truncate_context_text(view_name, max_chars=18)}"
+            )
+            view_label.setToolTip(str(view_name))
+            frame_label.setText(f"Frame: F{frame_i}")
+            mode_label.setText(f"Mode: {mode_text}")
+            segment_label.setText(
+                f"Segment: {self._truncate_context_text(segment_text, max_chars=42)}"
+            )
+            segment_label.setToolTip(str(segment_text))
         except Exception:
             pass
 
@@ -5476,7 +5643,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         footer = getattr(self, "query_footer_card", None)
         kicker = getattr(self, "lbl_query_footer_kicker", None)
         decision = self._last_query_decision
-        text = "No suggestion yet. Use Suggest Query when a baseline is ready."
+        text = "Use Suggest Query when a baseline is ready."
         tooltip = "Use Suggest Query to compute the next lightweight interaction target."
         kicker_text = "NEXT SUGGESTION"
         if isinstance(decision, QueryDecision):
@@ -5511,26 +5678,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             label.setToolTip(tooltip)
         except Exception:
             pass
-
-    def _position_query_decision_card(self) -> None:
-        card = getattr(self, "query_decision_card", None)
-        host = getattr(self, "timeline_right_panel", None)
-        if card is None or host is None:
-            return
-        if not card.isVisible():
-            return
-        try:
-            host_rect = host.contentsRect()
-            max_width = max(280, host_rect.width() - 24)
-            target_width = min(int(card.maximumWidth()), int(max_width))
-            card_width = max(280, min(int(card.sizeHint().width()), target_width))
-            card.resize(card_width, card.sizeHint().height())
-            x = max(12, host_rect.left() + (host_rect.width() - card.width()) // 2)
-            y = max(12, host_rect.top() + 12)
-            card.move(int(x), int(y))
-            card.raise_()
-        except Exception:
-            pass
+        self._update_timeline_context_bar()
 
     def _refresh_query_planner_hint(self) -> Optional[QueryDecision]:
         decision = None
@@ -5823,62 +5971,197 @@ class ActionWindow(FrameControlMixin, QWidget):
             return False
         return self._focus_query_decision(decision, status_prefix="Suggested")
 
-    def _update_query_decision_card(
+    def _start_scribble_refine_from_footer(self) -> bool:
+        if not self._is_action_task() or self._is_psr_task():
+            return False
+        if self.extra_mode:
+            self._set_status(
+                "Exit Manual Segmentation before starting Boundary Scribble."
+            )
+            self._update_scribble_proposal_ui()
+            return False
+        proposal = (
+            dict(self._last_scribble_result)
+            if isinstance(self._last_scribble_result, dict)
+            else None
+        )
+        if not proposal or proposal.get("boundary_frame") is None:
+            self._set_status("No boundary suggestion is available to refine.")
+            self._update_scribble_proposal_ui()
+            return False
+        frame_i = int(proposal.get("boundary_frame") or 0)
+        try:
+            self.player.pause()
+        except Exception:
+            pass
+        try:
+            self.player.seek(int(frame_i), preview_only=False)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "timeline", None) is not None:
+                self.timeline.set_current_frame(int(frame_i), follow=True)
+                if hasattr(self.timeline, "center_on_frame"):
+                    self.timeline.center_on_frame(int(frame_i))
+                self.timeline.flash_boundary_marker(int(frame_i))
+        except Exception:
+            pass
+        if self.interaction_mode != "scribble":
+            self.enter_scribble_mode()
+        self._set_status(f"Boundary Scribble ready near F{frame_i}.")
+        self._set_interaction_status(f"Boundary Scribble: refine near F{frame_i}")
+        return True
+
+    def _update_query_footer_actions(
         self,
         proposal: Optional[Dict[str, Any]],
         pending_label_review: Optional[Dict[str, Any]],
     ) -> None:
-        card = getattr(self, "query_decision_card", None)
-        if card is None:
+        footer = getattr(self, "query_footer_card", None)
+        kicker = getattr(self, "lbl_query_footer_kicker", None)
+        main_label = getattr(self, "lbl_query_hint", None)
+        meta_label = getattr(self, "lbl_query_footer_meta", None)
+        button_bar = getattr(self, "query_footer_button_bar", None)
+        accept_btn = getattr(self, "btn_scribble_accept", None)
+        reject_btn = getattr(self, "btn_query_reject", None)
+        refine_btn = getattr(self, "btn_query_refine", None)
+        if (
+            footer is None
+            or kicker is None
+            or main_label is None
+            or meta_label is None
+            or button_bar is None
+            or accept_btn is None
+            or reject_btn is None
+            or refine_btn is None
+        ):
             return
-        if not self._is_action_task() or self._is_psr_task():
-            card.hide()
-            return
-        title = ""
-        info = ""
-        meta = ""
-        show = False
+        visible = bool(self._is_action_task() and not self._is_psr_task())
+        kicker_text = None
+        main_text = None
+        meta_text = "Use Suggest Query to compute the next lightweight interaction target."
+        accept_text = "Accept Suggestion"
+        accept_tooltip = (
+            "Accept the current interaction suggestion and write it back to the timeline."
+        )
+        reject_tooltip = (
+            "Reject the current label or boundary suggestion without applying it."
+        )
+        refine_tooltip = (
+            "Enter Boundary Scribble mode and refine the active boundary suggestion on the timeline."
+        )
+        accept_visible = False
+        reject_visible = False
+        refine_visible = False
+        accept_enabled = False
+        reject_enabled = False
+        refine_enabled = False
+        active_footer = False
         if pending_label_review and pending_label_review.get("suggested_label"):
             start = int(pending_label_review.get("start_frame", 0) or 0)
             end = int(pending_label_review.get("end_frame", start) or start)
             current = str(pending_label_review.get("current_label", "") or "?")
             suggested = str(pending_label_review.get("suggested_label", "") or "?")
-            title = "Label Review"
-            info = f"{current} -> {suggested} @ F{start}-{end}"
-            meta = (
+            kicker_text = "LABEL SUGGESTION"
+            main_text = f"Label review: {current} -> {suggested} @ F{start}-{end}"
+            meta_text = (
                 "Use Accept to apply the suggestion, Reject to dismiss it, "
                 "or click another label in the panel to override."
             )
-            show = True
+            accept_text = "Accept Label"
+            accept_tooltip = (
+                f"Accept the suggested label review at F{start}-{end}: {current} -> {suggested}."
+            )
+            reject_tooltip = (
+                f"Reject the current label review suggestion {current} -> {suggested}."
+            )
+            accept_visible = True
+            reject_visible = True
+            accept_enabled = True
+            reject_enabled = True
+            active_footer = True
+            refine_tooltip = (
+                "Boundary Scribble refinement is only available for boundary suggestions."
+            )
         elif proposal and proposal.get("boundary_frame") is not None:
             frame = int(proposal.get("boundary_frame") or 0)
             conf = float(proposal.get("confidence", 0.0) or 0.0)
             left = str(proposal.get("left_label", "") or "?")
             right = str(proposal.get("right_label", "") or "?")
-            title = "Boundary Suggestion" if proposal.get("query_hint") else "Boundary Proposal"
-            info = f"F{frame} · {left} | {right}"
+            accept_text = "Accept Boundary"
             if proposal.get("query_hint"):
-                meta = (
+                kicker_text = "BOUNDARY SUGGESTION"
+                main_text = f"Boundary around F{frame}: {left} | {right}"
+                meta_text = (
                     "Accept to apply this boundary directly, Reject to skip it, "
-                    "or draw a scribble on the timeline to refine it first."
+                    "or use Start Scribble to refine it first."
+                )
+                accept_tooltip = (
+                    f"Accept the suggested boundary at frame {frame} and apply it to the timeline."
+                )
+                reject_tooltip = (
+                    f"Reject the suggested boundary at frame {frame} and move on."
                 )
             else:
-                meta = (
+                kicker_text = "BOUNDARY PROPOSAL"
+                main_text = f"Boundary proposal at F{frame}: {left} | {right}"
+                meta_text = (
                     f"Confidence {conf:.2f}. Drag the proposed boundary on the timeline "
-                    "if you want to nudge it before accepting."
+                    "or use Start Scribble if you want to refine it before accepting."
                 )
-            show = True
-        if show:
-            try:
-                self.lbl_query_decision_title.setText(title)
-                self.lbl_query_decision_info.setText(info)
-                self.lbl_query_decision_meta.setText(meta)
-                card.show()
-                self._position_query_decision_card()
-            except Exception:
-                pass
+                accept_tooltip = (
+                    f"Accept the latest boundary scribble proposal at frame {frame} (confidence {conf:.2f})."
+                )
+                reject_tooltip = (
+                    f"Reject the current boundary scribble proposal at frame {frame}."
+                )
+            refine_tooltip = (
+                f"Enter Boundary Scribble mode and refine the active boundary suggestion near frame {frame}."
+            )
+            accept_visible = True
+            reject_visible = True
+            refine_visible = True
+            accept_enabled = bool(not self.extra_mode)
+            reject_enabled = True
+            refine_enabled = bool(not self.extra_mode)
+            active_footer = True
         else:
-            card.hide()
+            active_footer = isinstance(getattr(self, "_last_query_decision", None), QueryDecision)
+        try:
+            footer.setVisible(visible)
+            footer_layout = getattr(self, "query_footer_layout", None)
+            detail_layout = getattr(self, "query_footer_detail", None)
+            compact_idle = bool(visible and not active_footer)
+            if footer_layout is not None:
+                footer_layout.setContentsMargins(12, 6 if compact_idle else 8, 12, 6 if compact_idle else 8)
+                footer_layout.setSpacing(4 if compact_idle else 6)
+            if detail_layout is not None:
+                detail_layout.setSpacing(8 if compact_idle else 12)
+            if kicker_text is not None:
+                kicker.setText(kicker_text)
+            kicker.setVisible(bool(visible and not compact_idle))
+            if main_text is not None:
+                main_label.setText(main_text)
+                main_label.setToolTip(main_text)
+            main_label.setWordWrap(bool(not compact_idle))
+            meta_label.setVisible(bool(visible and not compact_idle))
+            meta_label.setText(meta_text)
+            meta_label.setToolTip(meta_text)
+            button_bar.setVisible(
+                bool(visible and (accept_visible or reject_visible or refine_visible))
+            )
+            accept_btn.setVisible(bool(visible and accept_visible))
+            accept_btn.setText(accept_text)
+            accept_btn.setEnabled(bool(visible and accept_enabled))
+            accept_btn.setToolTip(accept_tooltip)
+            reject_btn.setVisible(bool(visible and reject_visible))
+            reject_btn.setEnabled(bool(visible and reject_enabled))
+            reject_btn.setToolTip(reject_tooltip)
+            refine_btn.setVisible(bool(visible and refine_visible))
+            refine_btn.setEnabled(bool(visible and refine_enabled))
+            refine_btn.setToolTip(refine_tooltip)
+        except Exception:
+            pass
 
     def _update_scribble_proposal_ui(self) -> None:
         proposal = (
@@ -5899,85 +6182,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                     self.timeline.clear_scribble_proposal()
         except Exception:
             pass
-        self._update_query_decision_card(proposal, pending_label_review)
-        btn = getattr(self, "btn_scribble_accept", None)
-        if btn is None:
-            return
-        can_accept_scribble = bool(
-            proposal
-            and proposal.get("boundary_frame") is not None
-            and self._is_action_task()
-            and not self._is_psr_task()
-            and not self.extra_mode
-        )
-        can_accept_label_review = bool(
-            pending_label_review
-            and pending_label_review.get("suggested_label")
-            and self._is_action_task()
-            and not self._is_psr_task()
-        )
-        enabled = bool(can_accept_scribble or can_accept_label_review)
-        try:
-            btn.setEnabled(enabled)
-            btn.setVisible(self._is_action_task() and not self._is_psr_task())
-            if can_accept_scribble and proposal and proposal.get("boundary_frame") is not None:
-                frame = int(proposal.get("boundary_frame"))
-                conf = float(proposal.get("confidence", 0.0) or 0.0)
-                if proposal.get("query_hint"):
-                    btn.setToolTip(
-                        f"Accept the suggested boundary at frame {frame} and apply it to the timeline."
-                    )
-                else:
-                    btn.setToolTip(
-                        f"Accept the latest boundary scribble proposal at frame {frame} (confidence {conf:.2f})."
-                    )
-            elif can_accept_label_review and pending_label_review:
-                start = int(pending_label_review.get("start_frame", 0) or 0)
-                end = int(pending_label_review.get("end_frame", start) or start)
-                current = str(pending_label_review.get("current_label", "") or "?")
-                suggested = str(pending_label_review.get("suggested_label", "") or "?")
-                btn.setToolTip(
-                    f"Accept the suggested label review at F{start}-{end}: {current} -> {suggested}."
-                )
-            else:
-                btn.setToolTip(
-                    "Accept the current interaction suggestion and write it back to the timeline."
-                )
-        except Exception:
-            pass
-        reject_btn = getattr(self, "btn_query_reject", None)
-        if reject_btn is not None:
-            reject_enabled = bool(
-                (proposal and proposal.get("boundary_frame") is not None)
-                or (pending_label_review and pending_label_review.get("suggested_label"))
-            )
-            try:
-                reject_btn.setEnabled(reject_enabled)
-                reject_btn.setVisible(self._is_action_task() and not self._is_psr_task())
-                if pending_label_review and pending_label_review.get("suggested_label"):
-                    current = str(pending_label_review.get("current_label", "") or "?")
-                    suggested = str(
-                        pending_label_review.get("suggested_label", "") or "?"
-                    )
-                    reject_btn.setToolTip(
-                        f"Reject the current label review suggestion {current} -> {suggested}."
-                    )
-                elif proposal and proposal.get("boundary_frame") is not None:
-                    frame = int(proposal.get("boundary_frame") or 0)
-                    if proposal.get("query_hint"):
-                        reject_btn.setToolTip(
-                            f"Reject the suggested boundary at frame {frame} and move on."
-                        )
-                    else:
-                        reject_btn.setToolTip(
-                            f"Reject the current boundary scribble proposal at frame {frame}."
-                        )
-                else:
-                    reject_btn.setToolTip(
-                        "Reject the current label or boundary suggestion without applying it."
-                    )
-            except Exception:
-                pass
+        if not proposal and not pending_label_review:
+            self._update_query_hint_ui()
+        self._update_query_footer_actions(proposal, pending_label_review)
+        self._update_timeline_context_bar()
 
     def _get_frame_count(self) -> int:
         return self.player.frame_count
@@ -6560,8 +6768,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         widgets = [
             getattr(self, "btn_auto_label_asot", None),
             getattr(self, "btn_mag", None),
-            getattr(self, "query_decision_card", None),
             getattr(self, "query_footer_card", None),
+            getattr(self, "lbl_query_footer_meta", None),
+            getattr(self, "btn_query_refine", None),
             getattr(self, "btn_scribble_accept", None),
             getattr(self, "btn_query_reject", None),
             getattr(self, "lbl_interaction", None),
@@ -16881,9 +17090,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._freeze = bool(on)
 
     def eventFilter(self, obj, event):
-        if obj is getattr(self, "timeline_right_panel", None):
-            if event.type() in (QEvent.Resize, QEvent.Show, QEvent.Move):
-                QTimer.singleShot(0, self._position_query_decision_card)
         if getattr(self, "_freeze", False) and self.extra_mode:
             allowed = []
             for vw in self.views:
@@ -17534,6 +17740,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._sync_other_views(frame)
         follow = self._timeline_auto_follow or self._extra_force_follow
         self.timeline.set_current_frame(frame, follow=follow)
+        self.timeline.set_current_hits(self._hit_names_for_frame(frame))
+        self._update_timeline_context_bar(frame)
         self._update_overlay_for_frame(frame)
         self._psr_update_component_panel(frame)
         self._log("frame_advanced", frame=frame)
@@ -17547,6 +17755,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._split_extra_at(frame)
         self._sync_views_to_frame(frame, preview_only=False)
         self.timeline.set_current_frame(frame, follow=True)
+        self.timeline.set_current_hits(self._hit_names_for_frame(frame))
+        self._update_timeline_context_bar(frame)
         self._update_overlay_for_frame(frame)
         self._psr_update_component_panel(frame)
         self._log(
@@ -17567,6 +17777,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._update_overlay_for_frame(pos)
             self.timeline.set_current_frame(pos, follow=self._timeline_auto_follow)
             self.timeline.set_current_hits(self._hit_names_for_frame(pos))
+            self._update_timeline_context_bar(pos)
             self._psr_update_component_panel(pos)
             self._log("seek_slider", target=pos)
 
@@ -17583,6 +17794,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._sync_views_to_frame(target, preview_only=False)
         self.timeline.set_current_frame(target, follow=self._timeline_auto_follow)
         self.timeline.set_current_hits(self._hit_names_for_frame(target))
+        self._update_timeline_context_bar(target)
         self._log("seek_relative", seconds=secs, target=target)
 
     def _on_speed_changed(self, text: str):
@@ -18310,6 +18522,7 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _refresh_after_manual_store_change(self) -> None:
         self.timeline.refresh_all_rows()
         self._update_gap_indicator()
+        self._update_timeline_context_bar()
         if self.phase_mode_enabled and self.mode == "Fine":
             rows = getattr(self.timeline, "_combined_rows", []) or []
             for row in rows:
@@ -19311,6 +19524,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 break
 
     def _on_timeline_segment_selected(self, start: int, end: int, label):
+        self._timeline_selected_segment = {
+            "start": int(start),
+            "end": int(end),
+            "label": label if label is not None else "",
+        }
         if self._is_psr_task():
             row = getattr(self.timeline, "_active_combined_row", None)
             scope = (
@@ -19342,6 +19560,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     self._phase_selected = None
                     self._sync_anomaly_panel()
         if not self._topk_enabled():
+            self._update_timeline_context_bar()
             return
         try:
             s = int(start)
@@ -19351,6 +19570,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         seg = {"start": s, "end": e, "label": label}
         candidates = self._label_candidates_for_segment(seg)
         if not candidates:
+            self._update_timeline_context_bar()
             return
         self._forced_segment = {"start": s, "end": e, "label": label}
         try:
@@ -19358,6 +19578,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._set_interaction_status("Top-K: select a label to apply")
+        self._update_timeline_context_bar()
 
     def _on_label_search_matches(self, names: List[str]):
         if getattr(self, "timeline", None):
@@ -19735,6 +19956,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._apply_validation_timeline(self.validation_enabled)
         self._sync_entity_panel_mode()
         self._update_overlay_for_frame(getattr(self.player, "current_frame", 0))
+        self._update_timeline_context_bar()
         self._log("mode_change", mode=text)
 
     def _set_validation_button_state(self, on: bool):
@@ -19860,7 +20082,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 )
             self._validation_forced_layout = True
             try:
-                self.timeline.set_center_single_row(True)
+                self.timeline.set_center_single_row(False)
             except Exception:
                 pass
         else:
@@ -20010,6 +20232,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Timeline",
                     main_sources,
                     {
+                        "row_height": COARSE_TIMELINE_ROW_HEIGHT,
                         "segment_cuts": coarse_cuts,
                         "show_segment_cuts": True,
                     },
@@ -20018,6 +20241,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Manual Segmentation",
                     extra_sources,
                     {
+                        "row_height": MANUAL_SEGMENTATION_ROW_HEIGHT,
                         "split_on_extra_cuts": True,
                         "editable": False,
                         "show_segment_cuts": False,
@@ -20031,6 +20255,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Timeline",
                     row_sources,
                     {
+                        "row_height": COARSE_TIMELINE_ROW_HEIGHT,
                         "segment_cuts": coarse_cuts,
                         "show_segment_cuts": True,
                     },
@@ -20083,7 +20308,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             ):
                 group_count = len(combined_groups or [])
                 self.timeline.set_center_single_row(group_count <= 1)
-            elif not (self.validation_enabled and self.mode == "Coarse"):
+            else:
                 self.timeline.set_center_single_row(False)
         except Exception:
             pass
@@ -20189,7 +20414,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         total = sp.height()
         if total <= 0:
             total = max(400, self.height() - 40)
-        top = int(total * 0.6)
+        top = int(total * 0.55)
         sp.setSizes([top, max(1, total - top)])
         self._splitter_init_done = True
 

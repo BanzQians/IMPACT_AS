@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 )
 from core.models import AnnotationStore, LabelDef
 from utils.constants import (
+    PRESET_COLORS,
     color_from_key,
     ROW_HEIGHT,
     EDGE_TOLERANCE_PX,
@@ -103,6 +104,7 @@ class BaseTimelineRow(QWidget):
         self.get_gutter = get_gutter
         self._hover_frame: Optional[int] = None
         self.current_frame: Optional[int] = None
+        self._flash_frame: Optional[int] = None
         self._row_dragging = False
         self._row_drag_active = False
         self._row_drag_start = None
@@ -137,6 +139,13 @@ class BaseTimelineRow(QWidget):
 
     def set_current_frame(self, f: Optional[int]):
         self.current_frame = f
+        self.update()
+
+    def set_boundary_flash(self, frame: Optional[int]) -> None:
+        self._flash_frame = None if frame is None else int(frame)
+        if frame is not None:
+            ref = weakref.ref(self)
+            QTimer.singleShot(800, lambda: _safe_qt_call(ref, "set_boundary_flash", None))
         self.update()
 
     @staticmethod
@@ -1021,7 +1030,7 @@ class CombinedTimelineRow(BaseTimelineRow):
         extra_cuts: Optional[List[int]] = None,
         segment_cuts: Optional[List[int]] = None,
         editable: bool = False,
-        show_extra_overlay: bool = True,
+        split_on_extra_cuts: bool = False,
         parent=None,
     ):
         super().__init__(
@@ -1032,7 +1041,7 @@ class CombinedTimelineRow(BaseTimelineRow):
         self.title = title
         self.show_label_text = bool(show_label_text)
         self.editable = bool(editable)
-        self.show_extra_overlay = bool(show_extra_overlay)
+        self.split_on_extra_cuts = bool(split_on_extra_cuts)
 
         self.setMouseTracking(True)
         self._row_height_normal = 44
@@ -1053,8 +1062,6 @@ class CombinedTimelineRow(BaseTimelineRow):
         self._create_anchor: Optional[int] = None
         self._selected_interval: Optional[Tuple[int, int]] = None
         self._selected_label: Optional[str] = None
-        self.interaction_points: list = []
-        self.active_interaction_id = None
         self.delete_handler = None
         self.split_handler = None
         self._selection_scope = "segment"
@@ -1091,7 +1098,6 @@ class CombinedTimelineRow(BaseTimelineRow):
         # prefer non-interaction labels over interaction when multiple stores carry the same frame
         self._label_sources = []
         extras = []
-        self._extra_store = None
         self._extra_cuts = list(extra_cuts or [])
         self._segment_cuts = list(segment_cuts or [])
         seen = set()
@@ -1102,8 +1108,6 @@ class CombinedTimelineRow(BaseTimelineRow):
             (extras if is_extra_label(lb.name) else self._label_sources).append(
                 (lb.name, st)
             )
-            if is_extra_label(lb.name):
-                self._extra_store = st
         self._label_sources.extend(extras)
         self._label_to_store = {}
         for lb, st, _prefix in self.row_sources:
@@ -1121,11 +1125,6 @@ class CombinedTimelineRow(BaseTimelineRow):
     def resizeEvent(self, e):
         self._invalidate_scribble_cache()
         return super().resizeEvent(e)
-
-    def set_interaction_points(self, points, active_id=None):
-        self.interaction_points = list(points or [])
-        self.active_interaction_id = active_id
-        self.update()
 
     def set_scribble_mode(self, enabled: bool) -> None:
         self._scribble_mode = bool(enabled)
@@ -2087,7 +2086,34 @@ class CombinedTimelineRow(BaseTimelineRow):
     def _color_for_label(self, name: Optional[str]) -> QColor:
         if name is None:
             return QColor(190, 190, 190)
-        return self._color_map.get(name, QColor(120, 120, 120))
+        cached = self._color_map.get(name)
+        if cached is not None:
+            return cached
+        normalized = str(name or "").strip()
+        if normalized:
+            folded = normalized.casefold()
+            for existing_name, color in list(self._color_map.items()):
+                existing = str(existing_name or "").strip()
+                if not existing:
+                    continue
+                if existing == normalized or existing.casefold() == folded:
+                    self._color_map[str(name)] = QColor(color)
+                    return self._color_map[str(name)]
+        fallback = self._fallback_color_for_name(str(name or ""))
+        self._color_map[str(name)] = fallback
+        return fallback
+
+    def _fallback_color_for_name(self, name: str) -> QColor:
+        palette = [key for key in PRESET_COLORS.keys() if key.lower() != "gray"]
+        if not palette:
+            return QColor(120, 120, 120)
+        text = str(name or "").strip()
+        if not text:
+            return QColor(120, 120, 120)
+        score = 0
+        for idx, ch in enumerate(text):
+            score += (idx + 1) * ord(ch)
+        return color_from_key(palette[score % len(palette)])
 
     def _label_at(self, frame: int) -> Optional[str]:
         for name, st in self._label_sources:
@@ -2097,37 +2123,6 @@ class CombinedTimelineRow(BaseTimelineRow):
             except Exception:
                 continue
         return None
-
-    def _extra_frames(self) -> List[int]:
-        frames = set()
-        if self._extra_store is None:
-            return []
-        for alias in EXTRA_ALIASES:
-            try:
-                frames.update(self._extra_store.frames_of(alias))
-            except Exception:
-                continue
-        return sorted(frames)
-
-    def _extra_runs(self, start: int, end: int) -> List[Tuple[int, int]]:
-        """Optional overlay strip for interaction boundaries."""
-        if self._extra_store is None:
-            return []
-        frames = self._extra_frames()
-        runs = AnnotationStore.frames_to_runs(frames) if frames else []
-        return [
-            (max(s, start), min(e, end)) for s, e in runs if not (e < start or s > end)
-        ]
-
-    def _extra_boundaries(self, start: int, end: int) -> List[int]:
-        bounds = set()
-        for s, e in self._extra_runs(start, end):
-            bounds.add(s)
-            bounds.add(e + 1)
-        for c in self._extra_cuts:
-            if start <= c <= end:
-                bounds.add(c)
-        return sorted(bounds)
 
     def _status_color(self, status: str) -> QColor:
         mapping = {
@@ -2150,6 +2145,12 @@ class CombinedTimelineRow(BaseTimelineRow):
             for c in (self._segment_cuts or [])
             if c is not None and start < int(c) <= end
         }
+        if self.split_on_extra_cuts:
+            cut_set.update(
+                int(c)
+                for c in (self._extra_cuts or [])
+                if c is not None and start < int(c) <= end
+            )
         cur = self._label_at(start)
         s = start
         for f in range(start + 1, end + 1):
@@ -2164,6 +2165,8 @@ class CombinedTimelineRow(BaseTimelineRow):
         fc = max(1, self.get_fc())
         f = max(0, min(frame, fc - 1))
         cut_set = {int(c) for c in (self._segment_cuts or []) if c is not None}
+        if self.split_on_extra_cuts:
+            cut_set.update(int(c) for c in (self._extra_cuts or []) if c is not None)
         lb = self._label_at(f)
         s = f
         while s > 0 and self._label_at(s - 1) == lb and s not in cut_set:
@@ -2425,15 +2428,6 @@ class CombinedTimelineRow(BaseTimelineRow):
         self.highlight_labels = set(names or [])
         self.update()
 
-    def set_boundary_flash(self, frame: Optional[int]):
-        self._flash_frame = None if frame is None else int(frame)
-        if frame is not None:
-            ref = weakref.ref(self)
-            QTimer.singleShot(
-                800, lambda: _safe_qt_call(ref, "set_boundary_flash", None)
-            )
-        self.update()
-
     def flash_labels(self, names):
         base = set(self.highlight_labels)
         flash = set(names or [])
@@ -2618,89 +2612,6 @@ class CombinedTimelineRow(BaseTimelineRow):
                 p.setPen(QPen(QColor(80, 80, 80, 140), 1, Qt.DotLine))
                 for c in cuts:
                     x = self.frame_to_x(int(c))
-                    p.drawLine(x, 0, x, self.height())
-
-        # assisted interaction overlays (uncertain boundaries/labels)
-        if self.interaction_points:
-            active_id = self.active_interaction_id
-            # label-level uncertainty bars near the top
-            for pt in self.interaction_points:
-                if pt.get("type") != "label":
-                    continue
-                s = int(pt.get("start", 0))
-                e_ = int(pt.get("end", s))
-                if e_ < start or s > end:
-                    continue
-                s_vis = max(s, start)
-                e_vis = min(e_, end)
-                x1 = self.frame_to_x(s_vis)
-                x2 = self.frame_to_x(e_vis + 1)
-                bar_h = 6
-                rect = QRect(x1, 2, max(2, x2 - x1), bar_h)
-                col = self._status_color(pt.get("status"))
-                fill = QColor(col.red(), col.green(), col.blue(), 70)
-                p.fillRect(rect, fill)
-                pen = QPen(col, 2 if pt.get("id") == active_id else 1, Qt.DashLine)
-                p.setPen(pen)
-                p.drawRect(rect)
-
-            # boundary markers with status colors
-            for pt in self.interaction_points:
-                if pt.get("type") != "boundary":
-                    continue
-                frame = int(pt.get("frame", -1))
-                if frame < start or frame > end:
-                    continue
-                x = self.frame_to_x(frame)
-                col = self._status_color(pt.get("status"))
-                line_pen = QPen(
-                    QColor(col.red(), col.green(), col.blue(), 140), 1, Qt.DashLine
-                )
-                tick_pen = QPen(col, 3 if pt.get("id") == active_id else 2)
-                p.setPen(line_pen)
-                p.drawLine(x, 0, x, self.height())
-                p.setPen(tick_pen)
-                p.drawLine(x, 0, x, 14)
-
-        # interaction overlay strip (bottom bar) to visualize boundaries even in combined mode
-        extra_runs = self._extra_runs(start, end) if self.show_extra_overlay else []
-        if extra_runs:
-            bar_h = 14
-            y0 = self.height() - bar_h - 2
-            extra_color = (
-                self._color_map.get(EXTRA_LABEL_NAME)
-                or self._color_map.get("Extra")
-                or QColor(100, 100, 100)
-            )
-            for s, e_ in extra_runs:
-                s_vis = max(s, start)
-                e_vis = min(e_, end)
-                x1 = self.frame_to_x(s_vis)
-                x2 = self.frame_to_x(e_vis + 1)
-                rect = QRect(x1, y0, max(2, x2 - x1), bar_h)
-                p.fillRect(rect, extra_color.lighter(110))
-                p.setPen(QPen(extra_color.darker(130)))
-                p.drawRect(rect)
-            # boundary ticks on top of the extra bar
-            ticks = self._extra_boundaries(start, end)
-            if ticks:
-                boundary_col = QColor(255, 0, 180)  # fixed magenta for clarity
-                tick_pen = QPen(boundary_col, 3)
-                line_pen = QPen(
-                    QColor(
-                        boundary_col.red(),
-                        boundary_col.green(),
-                        boundary_col.blue(),
-                        140,
-                    ),
-                    1,
-                )
-                for b in ticks:
-                    x = self.frame_to_x(b)
-                    p.setPen(tick_pen)
-                    p.drawLine(x, y0, x, y0 + bar_h)
-                    # extend faint line through the timeline for visibility
-                    p.setPen(line_pen)
                     p.drawLine(x, 0, x, self.height())
 
         self._draw_non_editable_overlay(p, start, end)
@@ -3273,8 +3184,6 @@ class TimelineArea(QWidget):
         self._combined_delete_handler = None
         self._combined_split_handler = None
         self._combined_reorder_handler = None
-        self._interaction_points = []
-        self._active_interaction_id = None
         self._scribble_mode = False
         self._scribble_items = []
         self._scribble_proposal = None
@@ -3717,17 +3626,6 @@ class TimelineArea(QWidget):
                     pass
         self.refresh_all_rows()
 
-    def set_interaction_points(self, points, active_id=None):
-        self._interaction_points = list(points or [])
-        self._active_interaction_id = active_id
-        for row in self.rows:
-            if hasattr(row, "set_interaction_points"):
-                try:
-                    row.set_interaction_points(self._interaction_points, active_id)
-                except Exception:
-                    pass
-        self.refresh_all_rows()
-
     def set_scribble_mode(self, enabled: bool) -> None:
         self._scribble_mode = bool(enabled)
         try:
@@ -3949,7 +3847,7 @@ class TimelineArea(QWidget):
             labels_for_row = self.labels
             show_label_text = getattr(self, "_combined_show_text", True)
             editable = getattr(self, "_combined_editable", False)
-            show_extra_overlay = True
+            split_on_extra_cuts = False
             segment_cuts = getattr(self, "_segment_cuts", [])
             if isinstance(meta, dict):
                 row_height = meta.get("row_height")
@@ -3959,8 +3857,8 @@ class TimelineArea(QWidget):
                     show_label_text = bool(meta["show_label_text"])
                 if "editable" in meta:
                     editable = bool(meta["editable"])
-                if "show_extra_overlay" in meta:
-                    show_extra_overlay = bool(meta["show_extra_overlay"])
+                if "split_on_extra_cuts" in meta:
+                    split_on_extra_cuts = bool(meta["split_on_extra_cuts"])
                 if "segment_cuts" in meta:
                     segment_cuts = list(meta["segment_cuts"] or [])
                 if "show_segment_cuts" in meta and not meta["show_segment_cuts"]:
@@ -3978,7 +3876,7 @@ class TimelineArea(QWidget):
                 extra_cuts=getattr(self, "_extra_cuts", []),
                 segment_cuts=segment_cuts,
                 editable=editable,
-                show_extra_overlay=show_extra_overlay,
+                split_on_extra_cuts=split_on_extra_cuts,
             )
             if row_height is not None:
                 try:
@@ -4031,13 +3929,6 @@ class TimelineArea(QWidget):
             row.set_current_frame(self.current_frame)
             row.set_current_hits(self._current_hits)
             try:
-                row.set_interaction_points(
-                    getattr(self, "_interaction_points", []),
-                    getattr(self, "_active_interaction_id", None),
-                )
-            except Exception:
-                pass
-            try:
                 if isinstance(meta, dict) and meta.get("snap_segments") is not None:
                     row.set_snap_segments(meta.get("snap_segments") or [])
                 else:
@@ -4086,14 +3977,6 @@ class TimelineArea(QWidget):
                 row.set_highlighted(lb.name in self.highlight_labels)
                 row.set_current_frame(self.current_frame)
                 row.set_current_hit(lb.name in self._current_hits)
-                if hasattr(row, "set_interaction_points"):
-                    try:
-                        row.set_interaction_points(
-                            getattr(self, "_interaction_points", []),
-                            getattr(self, "_active_interaction_id", None),
-                        )
-                    except Exception:
-                        pass
                 try:
                     row.set_snap_segments(getattr(self, "_snap_segments", []))
                 except Exception:

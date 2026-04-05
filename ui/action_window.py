@@ -330,8 +330,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         # Slightly throttle hover preview seeks to reduce decode churn on low-end devices.
         self._hover_preview_timer.setInterval(40)
         self._hover_preview_timer.timeout.connect(self._flush_timeline_hover_preview)
-        # interaction (manual + assisted)
-        self.interaction_mode: Optional[str] = None  # "manual" | "assisted" | "scribble"
+        # interaction (manual + scribble)
+        self.interaction_mode: Optional[str] = None  # "manual" | "scribble"
         self._scribble_mode_enabled = False
         self._scribble_items = TemporalScribbleSet()
         self._active_scribble_session_id: str = ""
@@ -383,7 +383,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "boundary_snap": {"enabled": True, "window_size": 15},
                 "segment_embedding": {"trim_ratio": 0.1},
                 "topk": {"enabled": True, "k": 5, "uncertainty_margin": 0.25},
-                "assisted": {"boundary_min_gap": 15},
+                "assisted": {},
             }
         )
         self._psr_model_specs = load_psr_model_registry()
@@ -400,13 +400,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._knn_memory: List[Tuple[np.ndarray, str]] = []
         self._forced_segment: Optional[Dict[str, Any]] = None
         self._pending_label_review: Optional[Dict[str, Any]] = None
-        self.assisted_points: List[dict] = []  # list of interaction points with status
-        self.assisted_active_idx: int = -1
-        self._assisted_review_done = False
-        self._assisted_loop_timer: Optional[QTimer] = None
-        self._assisted_loop_range: Optional[Tuple[int, int]] = None
         self._assisted_candidates: Dict[Any, Any] = {}  # per-segment label candidates
-        self._assisted_source_segments: List[dict] = []
         self._has_auto_segments: bool = False
         self.current_video_id = ""
         self.current_video_name = ""
@@ -646,16 +640,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.btn_extra.setToolTip("Manual global segmentation mode")
         self.btn_extra.clicked.connect(self.on_extra_clicked)
         self.btn_extra.setVisible(False)
-        self.btn_assisted = QToolButton()
-        self._shape_btn(self.btn_assisted)
-        self.btn_assisted.setText("Assisted Review")
-        self.btn_assisted.setCheckable(True)
-        self.btn_assisted.setToolTip("Review model predictions via interaction points")
-        self.btn_assisted.clicked.connect(self.on_assisted_clicked)
-        self.btn_assisted.setVisible(False)
 
         ctrl.addWidget(self.btn_extra)
-        ctrl.addWidget(self.btn_assisted)
         ctrl.addSpacing(8)
         self.lbl_interaction = QLabel("Interaction:")
         ctrl.addWidget(self.lbl_interaction)
@@ -1237,57 +1223,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             QKeySequence(Qt.Key_Left), self, activated=self._goto_prev_review
         )
         self.sc_review_prev.setContext(Qt.WidgetWithChildrenShortcut)
-        # assisted interaction shortcuts (enabled only in assisted mode)
-        self.sc_assist_left = QShortcut(
-            QKeySequence(Qt.Key_Left),
-            self,
-            activated=lambda: self._assist_nudge_boundary(-1),
-        )
-        self.sc_assist_left.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_left.setEnabled(False)
-        self.sc_assist_right = QShortcut(
-            QKeySequence(Qt.Key_Right),
-            self,
-            activated=lambda: self._assist_nudge_boundary(+1),
-        )
-        self.sc_assist_right.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_right.setEnabled(False)
-        self.sc_assist_confirm = QShortcut(
-            QKeySequence("S"), self, activated=self._confirm_active_boundary
-        )
-        self.sc_assist_confirm.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_confirm.setEnabled(False)
-        self.sc_assist_down = QShortcut(
-            QKeySequence(Qt.Key_Down), self, activated=self._confirm_active_boundary
-        )
-        self.sc_assist_down.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_down.setEnabled(False)
-        self.sc_assist_next = QShortcut(
-            QKeySequence("N"), self, activated=lambda: self._shift_assisted_idx(+1)
-        )
-        self.sc_assist_next.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_next.setEnabled(False)
-        self.sc_assist_prev = QShortcut(
-            QKeySequence("P"), self, activated=lambda: self._shift_assisted_idx(-1)
-        )
-        self.sc_assist_prev.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_prev.setEnabled(False)
-        self.sc_assist_skip = QShortcut(
-            QKeySequence("X"), self, activated=self._skip_active_assisted_point
-        )
-        self.sc_assist_skip.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_skip.setEnabled(False)
-        self.sc_assist_merge = QShortcut(
-            QKeySequence(Qt.Key_Backspace), self, activated=self._merge_active_boundary
-        )
-        self.sc_assist_merge.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_merge.setEnabled(False)
-        self.sc_assist_merge_del = QShortcut(
-            QKeySequence(Qt.Key_Delete), self, activated=self._merge_active_boundary
-        )
-        self.sc_assist_merge_del.setContext(Qt.WidgetWithChildrenShortcut)
-        self.sc_assist_merge_del.setEnabled(False)
-
         self._init_primary_view()
         self._apply_default_label_template(self.mode, reason="init")
 
@@ -1434,7 +1369,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
 
     def _apply_action_shortcuts_from_settings(self):
-        # Action / review / assisted shortcuts
+        # Action / review shortcuts
         self._set_shortcut_key(
             getattr(self, "sc_review_next", None),
             "action.review_next",
@@ -1444,51 +1379,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             getattr(self, "sc_review_prev", None),
             "action.review_prev",
             "Left",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_left", None),
-            "action.assist_nudge_left",
-            "Left",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_right", None),
-            "action.assist_nudge_right",
-            "Right",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_confirm", None),
-            "action.assist_confirm",
-            "S",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_down", None),
-            "action.assist_confirm_down",
-            "Down",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_next", None),
-            "action.assist_next",
-            "N",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_prev", None),
-            "action.assist_prev",
-            "P",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_skip", None),
-            "action.assist_skip",
-            "X",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_merge", None),
-            "action.assist_merge",
-            "Backspace",
-        )
-        self._set_shortcut_key(
-            getattr(self, "sc_assist_merge_del", None),
-            "action.assist_merge_delete",
-            "Delete",
         )
         self._set_shortcut_key(getattr(self, "sc_undo", None), "action.undo", "Ctrl+Z")
         self._set_shortcut_key(getattr(self, "sc_redo", None), "action.redo", "Ctrl+Y")
@@ -3590,7 +3480,7 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _current_query_policy_snapshot(self) -> Dict[str, Any]:
         cfg = self._assisted_cfg()
-        points = list(getattr(self, "_assisted_points", []) or [])
+        points: List[dict] = []
         label_scores: List[float] = []
         boundary_scores: List[float] = []
         buckets: Dict[str, int] = {}
@@ -4661,11 +4551,6 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _step_frames(self, delta: int):
         if not self.views:
             return
-        if self.interaction_mode == "assisted":
-            pt = self._active_assisted_point()
-            if pt and pt.get("type") == "boundary" and abs(int(delta)) == 1:
-                self._adjust_active_boundary(int(delta))
-                return
         p = self.views[self.active_view_idx]["player"]
         target = max(p.crop_start, min(p.current_frame + delta, p.crop_end))
         self._sync_views_to_frame(target, preview_only=False)
@@ -4922,7 +4807,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.combo_speed,
             self.btn_validation,
             self.btn_extra,
-            self.btn_assisted,
             getattr(self, "btn_scribble_accept", None),
             getattr(self, "btn_query_reject", None),
             getattr(self, "combo_interaction", None),
@@ -5120,13 +5004,28 @@ class ActionWindow(FrameControlMixin, QWidget):
             int(getattr(self, "_scribble_session_counter", 0) or 0),
             self._max_loaded_scribble_session_counter(self._scribble_items),
         )
-        try:
-            if getattr(self, "timeline", None) is not None:
-                self.timeline.set_scribble_items(self._scribble_items.items)
-        except Exception:
-            pass
+        self._sync_timeline_scribble_items()
         self._update_scribble_proposal_ui()
         self._update_query_hint_ui()
+
+    def _timeline_should_show_scribble_items(self) -> bool:
+        return bool(
+            self._scribble_mode_enabled
+            and self._is_action_task()
+            and not self._is_psr_task()
+        )
+
+    def _sync_timeline_scribble_items(self) -> None:
+        try:
+            if getattr(self, "timeline", None) is not None:
+                items = (
+                    self._scribble_items.items
+                    if self._timeline_should_show_scribble_items()
+                    else []
+                )
+                self.timeline.set_scribble_items(items)
+        except Exception:
+            pass
 
     def _query_history_prior(self, query_type: QueryType) -> float:
         rows = list(getattr(self, "_confirmed_correction_records", []) or [])
@@ -5907,7 +5806,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._store_active_view_scribble_state()
         try:
             if getattr(self, "timeline", None) is not None:
-                self.timeline.set_scribble_items(self._scribble_items.items)
+                self._sync_timeline_scribble_items()
                 self.timeline.clear_scribble_proposal()
         except Exception:
             pass
@@ -6010,7 +5909,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             and self._is_action_task()
             and not self._is_psr_task()
             and not self.extra_mode
-            and self.interaction_mode != "assisted"
         )
         can_accept_label_review = bool(
             pending_label_review
@@ -6662,8 +6560,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         widgets = [
             getattr(self, "btn_auto_label_asot", None),
             getattr(self, "btn_mag", None),
-            getattr(self, "btn_extra", None),
-            getattr(self, "btn_assisted", None),
             getattr(self, "query_decision_card", None),
             getattr(self, "query_footer_card", None),
             getattr(self, "btn_scribble_accept", None),
@@ -13000,7 +12896,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not isinstance(assist_cfg, dict):
             assist_cfg = {}
             cfg["assisted"] = assist_cfg
-        assist_cfg.setdefault("boundary_min_gap", 15)
         assist_cfg.setdefault("sort_by", "query_score")
         assist_cfg.setdefault("label_query_min", 0.35)
         assist_cfg.setdefault("boundary_query_min", 0.30)
@@ -13439,64 +13334,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         peak = max(0.0, min(1.0, float(val - mid) / upper))
         return max(linear, 0.45 + 0.55 * peak)
 
-    def _boundary_review_score_at_frame(self, frame: int) -> Optional[float]:
-        series = self._get_boundary_series()
-        if not series:
-            return None
-        frame_map = series.get("frame_map") or []
-        if not frame_map:
-            return None
-        try:
-            frame = int(frame)
-        except Exception:
-            return None
-        idx = bisect.bisect_left(frame_map, frame)
-        if idx >= len(frame_map):
-            idx = len(frame_map) - 1
-        if idx > 0:
-            prev = idx - 1
-            if abs(frame_map[prev] - frame) <= abs(frame_map[idx] - frame):
-                idx = prev
-        return self._boundary_energy_at(series, idx)
-
-    def _throttle_boundary_points(self, points: List[dict]) -> List[dict]:
-        gap = self._assisted_boundary_min_gap()
-        if gap <= 0 or len(points) <= 1:
-            return points
-        scored = []
-        for pt in points:
-            try:
-                frame = int(pt.get("frame", 0))
-            except Exception:
-                frame = 0
-            try:
-                score = float(pt.get("query_score", 0.0) or 0.0)
-            except Exception:
-                score = 0.0
-            if score <= 0.0:
-                energy = self._boundary_energy_at_frame(frame)
-                score = 0.0 if energy is None else float(energy)
-            scored.append((frame, score, pt))
-        scored.sort(key=lambda x: x[0])
-
-        def pick_cluster(cluster):
-            for item in cluster:
-                if item[2].get("status") == "ACTIVE":
-                    return item[2]
-            return max(cluster, key=lambda x: x[1])[2]
-
-        kept = []
-        cluster = [scored[0]]
-        for item in scored[1:]:
-            if item[0] - cluster[-1][0] <= gap:
-                cluster.append(item)
-            else:
-                kept.append(pick_cluster(cluster))
-                cluster = [item]
-        if cluster:
-            kept.append(pick_cluster(cluster))
-        return kept
-
     def _snap_boundary_frame(
         self, frame: int, lo: Optional[int] = None, hi: Optional[int] = None
     ) -> int:
@@ -13569,50 +13406,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             return frame
         return int(best[1])
 
-    def _move_active_boundary_to(self, new_frame: int) -> bool:
-        pt = self._active_assisted_point()
-        if not pt or pt.get("type") != "boundary":
-            return False
-        try:
-            new_frame = int(new_frame)
-        except Exception:
-            return False
-        old_frame = int(pt.get("frame", 0))
-        left = pt.get("left", {})
-        right = pt.get("right", {})
-        min_frame = int(left.get("start", 0)) + 1
-        max_frame = int(right.get("end", right.get("start", old_frame)))
-        new_frame = max(min_frame, min(new_frame, max_frame))
-        if new_frame == old_frame:
-            return False
-        try:
-            self.store.begin_txn()
-        except Exception:
-            pass
-        if new_frame < old_frame:
-            rng = range(new_frame, old_frame)
-            target_label = right.get("label")
-        else:
-            rng = range(old_frame, new_frame)
-            target_label = left.get("label")
-        for f in rng:
-            cur = self.store.label_at(f)
-            if cur and cur != target_label:
-                self.store.remove_at(f)
-            if target_label:
-                self.store.add(target_label, f)
-        try:
-            self.store.end_txn()
-        except Exception:
-            pass
-        self._note_correction_step()
-        self._dirty = True
-        self._build_assisted_points_from_store(
-            preserve_status=True, active_hint=("boundary", new_frame)
-        )
-        self._update_assisted_visuals()
-        return True
-
     # ----- Segment embedding helpers -----
     def _segment_embedding_cfg(self) -> float:
         self._ensure_algo_cfg_defaults()
@@ -13638,23 +13431,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             cfg = {}
         return cfg
-
-    def _assisted_cfg(self) -> Dict[str, Any]:
-        self._ensure_algo_cfg_defaults()
-        cfg = {}
-        try:
-            cfg = dict(getattr(self, "_algo_cfg", {}).get("assisted", {}))
-        except Exception:
-            cfg = {}
-        return cfg
-
-    def _assisted_boundary_min_gap(self) -> int:
-        cfg = self._assisted_cfg()
-        try:
-            gap = int(cfg.get("boundary_min_gap", 0))
-        except Exception:
-            gap = 0
-        return max(0, gap)
 
     def _topk_enabled(self) -> bool:
         cfg = self._topk_cfg()
@@ -14237,16 +14013,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             except Exception:
                 break
             overflow -= 1
-        for seg in self._assisted_source_segments or []:
-            try:
-                if (
-                    int(seg.get("start", -1)) == key[0]
-                    and int(seg.get("end", -1)) == key[1]
-                ):
-                    if seg.get("label") == key[2]:
-                        seg["embedding"] = embedding
-            except Exception:
-                continue
 
     def _get_or_compute_segment_embedding(
         self, start: int, end: int, label: Optional[str]
@@ -14261,12 +14027,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         if emb is not None:
             self._cache_segment_embedding(start, end, label, emb)
         return emb
-
-    # ----- Assisted Review (model-guided review) -----
-    def _active_assisted_point(self):
-        if 0 <= self.assisted_active_idx < len(self.assisted_points):
-            return self.assisted_points[self.assisted_active_idx]
-        return None
 
     def _segments_from_store_for_interaction(
         self, store: Optional[AnnotationStore] = None
@@ -14350,607 +14110,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         candidates, _source = self._label_candidates_with_source(seg)
         return candidates
 
-    def _is_label_uncertain(
-        self, candidates: List[Tuple[str, Optional[float]]], source: str = "model"
-    ) -> bool:
-        if not candidates:
-            return False
-        if source == "embedding":
-            margin_thr = self._topk_uncertainty_margin()
-            if margin_thr is None:
-                return True
-            top_conf = candidates[0][1] if candidates else None
-            second_conf = candidates[1][1] if len(candidates) > 1 else None
-            if top_conf is None:
-                return True
-            if second_conf is None:
-                return False
-            try:
-                margin = float(top_conf) - float(second_conf)
-            except Exception:
-                return True
-            return not (margin > float(margin_thr))
-        cfg = self._interaction_cfg["label"]
-        top_conf = candidates[0][1]
-        second_conf = candidates[1][1] if len(candidates) > 1 else None
-        if top_conf is None and second_conf is None:
-            # 无置信度时默认不标为不确定，避免过多点
-            return False
-        try:
-            if top_conf is not None and float(top_conf) < float(cfg["min_confidence"]):
-                return True
-        except Exception:
-            pass
-        if top_conf is not None and second_conf is not None:
-            try:
-                if abs(float(top_conf) - float(second_conf)) <= float(
-                    cfg.get("diff_eps", 0.05)
-                ):
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def _next_pending_interaction(
-        self,
-        points: Optional[List[dict]] = None,
-        start_idx: int = 0,
-        forward: bool = True,
-        wrap: bool = False,
-        type_filter: Optional[str] = None,
-    ) -> int:
-        pts = points if points is not None else self.assisted_points
-        if not pts:
-            return -1
-        total = len(pts)
-        if total <= 0:
-            return -1
-        if start_idx < 0:
-            start_idx = 0
-        if start_idx >= total:
-            if not wrap:
-                return -1
-            start_idx = 0 if forward else (total - 1)
-
-        if forward:
-            for idx in range(start_idx, total):
-                if type_filter and pts[idx].get("type") != type_filter:
-                    continue
-                if pts[idx].get("status") == "PENDING":
-                    return idx
-            if wrap:
-                for idx in range(0, start_idx):
-                    if type_filter and pts[idx].get("type") != type_filter:
-                        continue
-                    if pts[idx].get("status") == "PENDING":
-                        return idx
-        else:
-            for idx in range(start_idx, -1, -1):
-                if type_filter and pts[idx].get("type") != type_filter:
-                    continue
-                if pts[idx].get("status") == "PENDING":
-                    return idx
-            if wrap:
-                for idx in range(total - 1, start_idx, -1):
-                    if type_filter and pts[idx].get("type") != type_filter:
-                        continue
-                    if pts[idx].get("status") == "PENDING":
-                        return idx
-        return -1
-
-    def _interaction_point_pos(self, pt: Optional[dict]) -> int:
-        if not pt:
-            return 0
-        if pt.get("type") == "boundary":
-            try:
-                return int(pt.get("frame", 0))
-            except Exception:
-                return 0
-        try:
-            return int(pt.get("start", 0))
-        except Exception:
-            return 0
-
-    def _next_pending_after_frame(
-        self, frame: int, prefer_type: Optional[str] = None, wrap: bool = True
-    ) -> int:
-        try:
-            frame = int(frame)
-        except Exception:
-            frame = 0
-        start_idx = len(self.assisted_points)
-        for idx, pt in enumerate(self.assisted_points):
-            if self._interaction_point_pos(pt) > frame:
-                start_idx = idx
-                break
-        target = -1
-        if prefer_type:
-            target = self._next_pending_interaction(
-                start_idx=start_idx, forward=True, wrap=wrap, type_filter=prefer_type
-            )
-        if target < 0:
-            target = self._next_pending_interaction(
-                start_idx=start_idx, forward=True, wrap=wrap
-            )
-        return target
-
-    def _update_assisted_playback_for_active(self):
-        pt = self._active_assisted_point()
-        self._assisted_loop_range = None
-        if not pt:
-            return
-        if pt.get("type") == "label":
-            start = int(pt.get("start", getattr(self.player, "current_frame", 0)))
-            try:
-                self._sync_views_to_frame(start, preview_only=False)
-                self.timeline.set_current_frame(start, follow=True)
-                self._pause_all()
-            except Exception:
-                pass
-            return
-        if pt.get("type") != "boundary":
-            return
-        window = max(1, int(self._interaction_cfg["boundary"]["window_size"]))
-        frame = int(pt.get("frame", getattr(self.player, "current_frame", 0)))
-        crop_start = getattr(self.player, "crop_start", 0)
-        crop_end = getattr(self.player, "crop_end", frame)
-        start = max(crop_start, frame - window)
-        end = min(crop_end, frame + window)
-        if end < start:
-            end = start
-        self._assisted_loop_range = (start, end)
-        try:
-            self._sync_views_to_frame(start, preview_only=False)
-            self._timeline_auto_follow = True
-            self._play_all()
-        except Exception:
-            pass
-
-    def _update_assisted_visuals(self):
-        active = self._active_assisted_point()
-        active_id = active.get("id") if active else None
-        try:
-            self.timeline.set_interaction_points(
-                self.assisted_points, active_id=active_id
-            )
-        except Exception:
-            pass
-        if active and active.get("type") == "label":
-            cands = active.get("candidates") or []
-            try:
-                self.panel.set_candidate_priority(cands)
-            except Exception:
-                pass
-            label_name = active.get("label")
-            if label_name:
-                try:
-                    self.timeline.set_highlight_labels([label_name])
-                except Exception:
-                    pass
-        else:
-            try:
-                self.panel.clear_candidate_priority()
-            except Exception:
-                pass
-            try:
-                self.timeline.set_highlight_labels([])
-            except Exception:
-                pass
-        resolved = sum(1 for p in self.assisted_points if p.get("status") == "RESOLVED")
-        total = len(self.assisted_points)
-        summary = (
-            "Assisted: no points"
-            if total == 0
-            else f"Assisted: {resolved}/{total} resolved"
-        )
-        if self._assisted_review_done and total:
-            summary += " • review complete"
-        elif active:
-            summary += f" • active {active.get('type')}"
-        self._set_interaction_status(summary)
-
-    def _set_active_assisted_idx(self, idx: int):
-        prev = self.assisted_active_idx
-        if (
-            prev != idx
-            and getattr(self._correction_buffer, "active", None) is not None
-            and str(getattr(self._correction_buffer.active, "kind", "") or "").startswith(
-                "assisted_"
-            )
-        ):
-            self._discard_correction_session("assisted_point_switched")
-        if 0 <= prev < len(self.assisted_points):
-            if self.assisted_points[prev].get("status") == "ACTIVE":
-                self.assisted_points[prev]["status"] = "PENDING"
-        if 0 <= idx < len(self.assisted_points):
-            # allow re-activating resolved points for manual review
-            self.assisted_points[idx]["status"] = "ACTIVE"
-            self.assisted_active_idx = idx
-            pt = self.assisted_points[idx]
-            if pt.get("type") == "boundary":
-                self._begin_correction_session(
-                    "assisted_boundary",
-                    point_id=int(pt.get("id", idx)),
-                    frame=int(pt.get("frame", 0)),
-                )
-            elif pt.get("type") == "label":
-                self._begin_correction_session(
-                    "assisted_label",
-                    point_id=int(pt.get("id", idx)),
-                    start=int(pt.get("start", 0)),
-                    end=int(pt.get("end", pt.get("start", 0))),
-                    label=str(pt.get("label", "") or ""),
-                )
-        else:
-            self.assisted_active_idx = -1
-        self._update_assisted_playback_for_active()
-        self._update_assisted_visuals()
-
-    def _activate_assisted_at_frame(self, frame: int) -> bool:
-        """Activate the interaction point that covers/nearest to the given frame."""
-        if self.interaction_mode != "assisted" or not self.assisted_points:
-            return False
-        # prefer label points covering frame
-        for idx, pt in enumerate(self.assisted_points):
-            if pt.get("type") == "label" and int(pt.get("start", 0)) <= frame <= int(
-                pt.get("end", 0)
-            ):
-                self._set_active_assisted_idx(idx)
-                return True
-        # then nearest boundary
-        best = None
-        window = max(1, int(self._interaction_cfg["boundary"]["window_size"]))
-        for idx, pt in enumerate(self.assisted_points):
-            if pt.get("type") != "boundary":
-                continue
-            diff = abs(int(pt.get("frame", frame)) - frame)
-            if diff <= window and (best is None or diff < best[0]):
-                best = (diff, idx)
-        if best is not None:
-            self._set_active_assisted_idx(best[1])
-            return True
-        return False
-
-    def _shift_assisted_idx(self, delta: int):
-        """Move active interaction point without forcing prior confirmation."""
-        if not self.assisted_points:
-            return
-        forward = delta >= 0
-        total = len(self.assisted_points)
-        active = self._active_assisted_point()
-        prefer_type = active.get("type") if active else None
-        if self.assisted_active_idx < 0:
-            start_idx = 0 if forward else (total - 1)
-        else:
-            start_idx = self.assisted_active_idx + (1 if forward else -1)
-            if start_idx < 0 or start_idx >= total:
-                start_idx = 0 if forward else (total - 1)
-
-        has_pending = any(pt.get("status") == "PENDING" for pt in self.assisted_points)
-        if has_pending:
-            target = -1
-            if prefer_type:
-                target = self._next_pending_interaction(
-                    start_idx=start_idx,
-                    forward=forward,
-                    wrap=True,
-                    type_filter=prefer_type,
-                )
-            if target < 0:
-                target = self._next_pending_interaction(
-                    start_idx=start_idx, forward=forward, wrap=True
-                )
-        else:
-            if self.assisted_active_idx < 0:
-                target = 0 if forward else (total - 1)
-            else:
-                target = (self.assisted_active_idx + (1 if forward else -1)) % total
-        if target >= 0:
-            self._set_active_assisted_idx(target)
-
-    def _skip_active_assisted_point(self):
-        """Mark current point as resolved without edits and jump to next."""
-        if self.interaction_mode != "assisted":
-            return
-        if self.assisted_active_idx < 0:
-            return
-        pt = self._active_assisted_point()
-        accept_rec = self._build_accept_record_for_point(pt)
-        if accept_rec is not None:
-            self._store_explicit_confirm_record(accept_rec)
-            self._note_correction_step()
-            self._commit_correction_session(
-                point_type=str(pt.get("type", "") or "").strip().lower(),
-                mode="accept",
-            )
-        else:
-            self._discard_correction_session("assisted_skip")
-        self._resolve_assisted_point(self.assisted_active_idx)
-
-    def _merge_active_boundary(self):
-        """Merge boundary: apply左侧标签覆盖右段，视为已解决。"""
-        pt = self._active_assisted_point()
-        if (
-            self.interaction_mode != "assisted"
-            or not pt
-            or pt.get("type") != "boundary"
-        ):
-            return
-        ref_frame = int(pt.get("frame", 0))
-        left = pt.get("left", {})
-        right = pt.get("right", {})
-        left_label = left.get("label")
-        if not left_label:
-            return
-        start = int(right.get("start", pt.get("frame", 0)))
-        end = int(right.get("end", start))
-        try:
-            self.store.begin_txn()
-        except Exception:
-            pass
-        for f in range(start, end + 1):
-            cur = self.store.label_at(f)
-            if cur and cur != left_label:
-                self.store.remove_at(f)
-            self.store.add(left_label, f)
-        try:
-            self.store.end_txn()
-        except Exception:
-            pass
-        self._note_correction_step()
-        self._dirty = True
-        self._commit_correction_session(
-            point_type="boundary",
-            boundary_frame=int(ref_frame),
-            mode="merge",
-        )
-        # rebuild interaction points with hint to avoid losing place
-        self._build_assisted_points_from_store(preserve_status=True, active_hint=None)
-        next_idx = self._next_pending_after_frame(ref_frame, prefer_type="boundary")
-        self._set_active_assisted_idx(next_idx)
-
-    def _build_assisted_points_from_store(
-        self,
-        preserve_status: bool = True,
-        active_hint: Optional[Tuple[str, int]] = None,
-    ) -> bool:
-        segments = self._segments_from_store_for_interaction()
-        self._assisted_source_segments = segments
-        if not segments:
-            self.assisted_points = []
-            self.assisted_active_idx = -1
-            return False
-        old_boundaries = (
-            [p for p in self.assisted_points if p.get("type") == "boundary"]
-            if preserve_status
-            else []
-        )
-        old_labels = (
-            [p for p in self.assisted_points if p.get("type") == "label"]
-            if preserve_status
-            else []
-        )
-        boundary_points = []
-        label_points = []
-        active_idx = -1
-        # boundary points
-        for i in range(1, len(segments)):
-            left = segments[i - 1]
-            right = segments[i]
-            boundary_frame = max(
-                int(right.get("start", 0)), int(left.get("end", 0)) + 1
-            )
-            status = "PENDING"
-            raw_score = self._boundary_review_score_at_frame(boundary_frame)
-            query_score, query_terms = self._boundary_query_score(
-                frame=boundary_frame,
-                left_label=str(left.get("label", "") or ""),
-                right_label=str(right.get("label", "") or ""),
-                raw_score=raw_score,
-            )
-            if query_score < self._assisted_query_threshold("boundary"):
-                continue
-            matched = None
-            for j, ob in enumerate(list(old_boundaries)):
-                if ob.get("left", {}).get("label") == left.get("label") and ob.get(
-                    "right", {}
-                ).get("label") == right.get("label"):
-                    matched = ob
-                    old_boundaries.pop(j)
-                    break
-            if matched:
-                status = matched.get("status", "PENDING")
-            pt = {
-                "type": "boundary",
-                "frame": boundary_frame,
-                "left": dict(left),
-                "right": dict(right),
-                "status": status,
-                "score": raw_score,
-                "query_score": float(query_score),
-                "query_terms": dict(query_terms),
-                "id": 0,
-            }
-            boundary_points.append(pt)
-        boundary_points = self._throttle_boundary_points(boundary_points)
-        # label-uncertainty points
-        for seg in segments:
-            candidates, source = self._label_candidates_with_source(seg)
-            query_score, query_terms = self._label_query_score(
-                seg,
-                candidates,
-                source=source,
-            )
-            if query_score < self._assisted_query_threshold("label"):
-                continue
-            status = "PENDING"
-            matched = None
-            for j, ol in enumerate(list(old_labels)):
-                if ol.get("label") == seg.get("label"):
-                    o_s = int(ol.get("start", 0))
-                    o_e = int(ol.get("end", o_s))
-                    if not (o_e < seg.get("start", 0) or o_s > seg.get("end", 0)):
-                        matched = ol
-                        old_labels.pop(j)
-                        break
-            if matched:
-                status = matched.get("status", "PENDING")
-            pt = {
-                "type": "label",
-                "start": int(seg.get("start", 0)),
-                "end": int(seg.get("end", seg.get("start", 0))),
-                "label": seg.get("label"),
-                "candidates": candidates,
-                "status": status,
-                "score": candidates[0][1] if candidates else None,
-                "query_score": float(query_score),
-                "query_terms": dict(query_terms),
-                "candidate_source": str(source),
-                "id": 0,
-            }
-            label_points.append(pt)
-
-        points = boundary_points + label_points
-
-        def _pt_key(pt):
-            if pt.get("type") == "boundary":
-                try:
-                    pos = int(pt.get("frame", 0))
-                except Exception:
-                    pos = 0
-                rank = 0
-            else:
-                try:
-                    pos = int(pt.get("start", 0))
-                except Exception:
-                    pos = 0
-                rank = 1
-            if self._assisted_sort_mode() == "query_score":
-                try:
-                    query_bucket = int(max(0, min(10, round(float(pt.get("query_score", 0.0) or 0.0) * 10.0))))
-                except Exception:
-                    query_bucket = 0
-                return (-query_bucket, pos, rank)
-            return (pos, rank)
-
-        points.sort(key=_pt_key)
-        active_idx = -1
-        for idx, pt in enumerate(points):
-            pt["id"] = idx
-            if pt.get("status") == "ACTIVE":
-                active_idx = idx
-
-        if active_hint and active_idx < 0:
-            kind, frame = active_hint
-            if kind == "boundary":
-                for i, pt in enumerate(points):
-                    if pt.get("type") == "boundary" and abs(
-                        int(pt.get("frame", 0)) - int(frame)
-                    ) <= max(1, int(self._interaction_cfg["boundary"]["frame_step"])):
-                        active_idx = i
-                        break
-            elif kind == "label":
-                for i, pt in enumerate(points):
-                    if pt.get("type") == "label" and pt.get("start") <= frame <= pt.get(
-                        "end"
-                    ):
-                        active_idx = i
-                        break
-
-        self.assisted_points = points
-        self.assisted_active_idx = -1
-        if active_idx < 0:
-            active_idx = self._next_pending_interaction(
-                points=points, type_filter="boundary"
-            )
-            if active_idx < 0:
-                active_idx = self._next_pending_interaction(points=points)
-        self._set_active_assisted_idx(active_idx)
-        self._assisted_review_done = bool(points) and all(
-            p.get("status") == "RESOLVED" for p in points
-        )
-        return True
-
-    def _resolve_assisted_point(self, idx: int):
-        if not (0 <= idx < len(self.assisted_points)):
-            return
-        pt = self.assisted_points[idx]
-        if pt.get("type") == "label":
-            try:
-                start = int(pt.get("start", 0))
-                end = int(pt.get("end", start))
-            except Exception:
-                start = end = 0
-            label = pt.get("label")
-            emb = self._get_or_compute_segment_embedding(start, end, label)
-            if emb is not None:
-                pt["embedding"] = emb
-                self._update_label_prototype(label, emb)
-        self.assisted_points[idx]["status"] = "RESOLVED"
-        if idx == self.assisted_active_idx:
-            self.assisted_active_idx = -1
-            self._assisted_loop_range = None
-        if all(p.get("status") == "RESOLVED" for p in self.assisted_points):
-            self._assisted_review_done = True
-            self._set_status(
-                "Assisted review complete. All interaction points resolved."
-            )
-        prefer_type = pt.get("type")
-        next_idx = -1
-        if prefer_type:
-            next_idx = self._next_pending_interaction(
-                start_idx=idx + 1, forward=True, wrap=True, type_filter=prefer_type
-            )
-        if next_idx < 0:
-            next_idx = self._next_pending_interaction(
-                start_idx=idx + 1, forward=True, wrap=True
-            )
-        self._set_active_assisted_idx(next_idx)
-
-    def _adjust_active_boundary(self, direction: int):
-        pt = self._active_assisted_point()
-        if not pt or pt.get("type") != "boundary":
-            return
-        step = max(1, int(self._interaction_cfg["boundary"]["frame_step"]))
-        delta = step if direction > 0 else -step
-        old_frame = int(pt.get("frame", 0))
-        self._move_active_boundary_to(old_frame + delta)
-
-    def _assist_nudge_boundary(self, direction: int):
-        if self.interaction_mode != "assisted":
-            return
-        self._adjust_active_boundary(direction)
-
-    def _confirm_active_boundary(self):
-        pt = self._active_assisted_point()
-        if not pt or pt.get("type") != "boundary":
-            return
-        try:
-            frame = int(pt.get("frame", 0))
-        except Exception:
-            frame = 0
-        left = pt.get("left", {})
-        right = pt.get("right", {})
-        min_frame = int(left.get("start", 0)) + 1
-        max_frame = int(right.get("end", right.get("start", frame)))
-        snapped = self._snap_boundary_frame(frame, lo=min_frame, hi=max_frame)
-        if snapped != frame:
-            self._move_active_boundary_to(snapped)
-        accept_rec = self._build_accept_record_for_point(pt, boundary_frame=int(snapped))
-        if accept_rec is not None:
-            self._store_explicit_confirm_record(accept_rec)
-        self._commit_correction_session(
-            point_type="boundary",
-            boundary_frame=int(snapped),
-        )
-        idx = self.assisted_active_idx
-        self._resolve_assisted_point(idx)
-        self._assisted_loop_range = None
-        try:
-            self._pause_all()
-        except Exception:
-            pass
-
     def _apply_label_range(
         self, store: AnnotationStore, start: int, end: int, label_name: str
     ) -> None:
@@ -15007,47 +14166,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             st = self.entity_stores.setdefault(ename, AnnotationStore())
             targets.append((ename, st))
         return targets
-
-    def _apply_assisted_label_choice(self, label_name: str) -> bool:
-        pt = self._active_assisted_point()
-        if not pt or pt.get("type") != "label":
-            return False
-        if not label_name:
-            return False
-        try:
-            pt["label"] = label_name
-        except Exception:
-            pass
-        start = int(pt.get("start", 0))
-        end = int(pt.get("end", start))
-        targets = self._target_entity_stores(label_name)
-        if self.mode == "Fine" and not targets:
-            QMessageBox.information(
-                self,
-                "Choose entity",
-                "Select an entity row or enable one entity for this label before editing.",
-            )
-            return False
-        if targets:
-            for _ename, st in targets:
-                self._apply_label_range(st, start, end, label_name)
-        else:
-            self._apply_label_range(self.store, start, end, label_name)
-        if str(pt.get("label", "") or "").strip() == str(label_name or "").strip():
-            accept_rec = self._build_accept_record_for_point(pt)
-            if accept_rec is not None:
-                self._store_explicit_confirm_record(accept_rec)
-        self._dirty = True
-        self._note_correction_step()
-        self._commit_correction_session(
-            point_type="label",
-            start=int(start),
-            end=int(end),
-            label=str(label_name),
-        )
-        self._resolve_assisted_point(self.assisted_active_idx)
-        self._update_assisted_visuals()
-        return True
 
     def _apply_label_to_segment(self, start: int, end: int, label_name: str) -> bool:
         if not label_name:
@@ -15121,28 +14239,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._set_status(f"Top-K margin set to {val:.3f}")
             self._log("topk_margin_set", value=val)
 
-        if self.interaction_mode == "assisted":
-            active = self._active_assisted_point()
-            hint = None
-            if active:
-                if active.get("type") == "boundary":
-                    try:
-                        hint = ("boundary", int(active.get("frame", 0)))
-                    except Exception:
-                        hint = None
-                elif active.get("type") == "label":
-                    try:
-                        hint = ("label", int(active.get("start", 0)))
-                    except Exception:
-                        hint = None
-            try:
-                self._build_assisted_points_from_store(
-                    preserve_status=True, active_hint=hint
-                )
-                self._update_assisted_visuals()
-            except Exception:
-                pass
-
     def _open_settings_dialog(self):
         self._psr_reload_model_registry()
         if getattr(self, "psr_embedded", None) is not None and callable(
@@ -15157,7 +14253,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         boundary_cfg = dict(self._algo_cfg.get("boundary_snap", {}))
         seg_cfg = dict(self._algo_cfg.get("segment_embedding", {}))
         topk_cfg = dict(self._algo_cfg.get("topk", {}))
-        assist_cfg = dict(self._algo_cfg.get("assisted", {}))
         psr_cfg = dict(self._algo_cfg.get("psr", {}))
 
         dlg = QDialog(self)
@@ -15216,21 +14311,15 @@ class ActionWindow(FrameControlMixin, QWidget):
         form_timeline.addRow("Hover preview alignment", combo_hover_align)
         root.addWidget(group_timeline)
 
-        group_assisted = QGroupBox("Boundary Assistance", dlg)
+        group_assisted = QGroupBox("Boundary Snap", dlg)
         form_assisted = QFormLayout(group_assisted)
         cb_snap = QCheckBox(group_assisted)
         cb_snap.setChecked(bool(boundary_cfg.get("enabled", True)))
         sp_snap = QSpinBox(group_assisted)
         sp_snap.setRange(1, 300)
         sp_snap.setValue(self._cfg_int(boundary_cfg.get("window_size", 15), 15, 1, 300))
-        sp_gap = QSpinBox(group_assisted)
-        sp_gap.setRange(0, 300)
-        sp_gap.setValue(
-            self._cfg_int(assist_cfg.get("boundary_min_gap", 15), 15, 0, 300)
-        )
         form_assisted.addRow("Boundary snap enabled", cb_snap)
         form_assisted.addRow("Boundary snap window (frames)", sp_snap)
-        form_assisted.addRow("Boundary minimum gap (frames)", sp_gap)
         root.addWidget(group_assisted)
 
         group_psr = QGroupBox("Assembly State Model", dlg)
@@ -15593,9 +14682,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             if cb_margin.isChecked()
             else None
         )
-        self._algo_cfg.setdefault("assisted", {})["boundary_min_gap"] = self._cfg_int(
-            sp_gap.value(), 15, 0, 300
-        )
         psr_section = self._algo_cfg.setdefault("psr", {})
         psr_policy = str(combo_psr_init.currentData() or "auto").strip().lower()
         if psr_policy not in {"auto", "installed", "not_installed"}:
@@ -15682,7 +14768,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             topk_enabled=cb_topk.isChecked(),
             topk_k=self._algo_cfg["topk"]["k"],
             topk_margin=self._algo_cfg["topk"]["uncertainty_margin"],
-            assisted_min_gap=self._algo_cfg["assisted"]["boundary_min_gap"],
             psr_model_type=self._algo_cfg["psr"].get("model_type"),
             psr_initial_policy=self._algo_cfg["psr"].get("initial_state_policy"),
             psr_no_gap=self._algo_cfg["psr"].get("no_gap_timeline"),
@@ -15707,162 +14792,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._psr_update_component_panel()
             except Exception:
                 pass
-
-        if self.interaction_mode == "assisted":
-            active = self._active_assisted_point()
-            hint = None
-            if active:
-                if active.get("type") == "boundary":
-                    try:
-                        hint = ("boundary", int(active.get("frame", 0)))
-                    except Exception:
-                        hint = None
-                elif active.get("type") == "label":
-                    try:
-                        hint = ("label", int(active.get("start", 0)))
-                    except Exception:
-                        hint = None
-            try:
-                self._build_assisted_points_from_store(
-                    preserve_status=True, active_hint=hint
-                )
-                self._update_assisted_visuals()
-            except Exception:
-                pass
-
-    def _enter_assisted_mode(self):
-        if self.interaction_mode == "scribble":
-            QMessageBox.information(
-                self,
-                "Interaction",
-                "Exit Boundary Scribble mode before starting Assisted Review.",
-            )
-            try:
-                self.btn_assisted.setChecked(False)
-            except Exception:
-                pass
-            return
-        if self.extra_mode:
-            QMessageBox.information(
-                self,
-                "Interaction",
-                "Exit Manual Segmentation before starting Assisted Review.",
-            )
-            try:
-                self.btn_assisted.setChecked(False)
-            except Exception:
-                pass
-            return
-        if not self._has_auto_segments:
-            QMessageBox.information(
-                self,
-                "Assisted Review",
-                "Run automatic segmentation before entering Assisted Review.",
-            )
-            try:
-                self.btn_assisted.setChecked(False)
-            except Exception:
-                pass
-            return
-        ok = self._build_assisted_points_from_store(preserve_status=False)
-        if not ok or not self.assisted_points:
-            QMessageBox.information(
-                self,
-                "Assisted Review",
-                "No review points were found. Run auto-segmentation and try again.",
-            )
-            try:
-                self.btn_assisted.setChecked(False)
-            except Exception:
-                pass
-            return
-        self.interaction_mode = "assisted"
-        self._assisted_review_done = False
-        self._update_scribble_proposal_ui()
-        try:
-            self.btn_extra.setEnabled(False)
-        except Exception:
-            pass
-        self._set_status("Assisted Review mode: review uncertain boundaries and labels.")
-        self._set_interaction_status("Assisted: starting review")
-        try:
-            self.sc_review_next.setEnabled(False)
-            self.sc_review_prev.setEnabled(False)
-        except Exception:
-            pass
-        for sc in (
-            getattr(self, "sc_assist_left", None),
-            getattr(self, "sc_assist_right", None),
-            getattr(self, "sc_assist_confirm", None),
-            getattr(self, "sc_assist_down", None),
-            getattr(self, "sc_assist_next", None),
-            getattr(self, "sc_assist_prev", None),
-            getattr(self, "sc_assist_skip", None),
-            getattr(self, "sc_assist_merge", None),
-            getattr(self, "sc_assist_merge_del", None),
-        ):
-            if sc:
-                try:
-                    sc.setEnabled(True)
-                except Exception:
-                    pass
-        if self.assisted_active_idx < 0:
-            self._set_active_assisted_idx(self._next_pending_interaction())
-
-    def _exit_assisted_mode(self):
-        self._discard_correction_session("assisted_mode_exit")
-        self.interaction_mode = None
-        self.assisted_points = []
-        self.assisted_active_idx = -1
-        self._assisted_review_done = False
-        self._assisted_loop_range = None
-        self._forced_segment = None
-        try:
-            self.timeline.set_interaction_points([])
-        except Exception:
-            pass
-        try:
-            self.timeline.set_highlight_labels([])
-        except Exception:
-            pass
-        try:
-            self.panel.clear_candidate_priority()
-        except Exception:
-            pass
-        try:
-            self.btn_assisted.setChecked(False)
-            self.btn_extra.setEnabled(True)
-        except Exception:
-            pass
-        try:
-            self.sc_review_next.setEnabled(True)
-            self.sc_review_prev.setEnabled(True)
-        except Exception:
-            pass
-        for sc in (
-            getattr(self, "sc_assist_left", None),
-            getattr(self, "sc_assist_right", None),
-            getattr(self, "sc_assist_confirm", None),
-            getattr(self, "sc_assist_down", None),
-            getattr(self, "sc_assist_next", None),
-            getattr(self, "sc_assist_prev", None),
-            getattr(self, "sc_assist_skip", None),
-            getattr(self, "sc_assist_merge", None),
-            getattr(self, "sc_assist_merge_del", None),
-        ):
-            if sc:
-                try:
-                    sc.setEnabled(False)
-                except Exception:
-                    pass
-        self._set_interaction_status("Interaction: idle")
-        self._update_scribble_proposal_ui()
-
-    def on_assisted_clicked(self):
-        if self.btn_assisted.isChecked():
-            self._enter_assisted_mode()
-        else:
-            self._exit_assisted_mode()
 
     # ----- Scribble interaction helpers -----
     def _scribble_window_bounds(self, start: int, end: int) -> Tuple[int, int]:
@@ -16340,6 +15269,21 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
 
         if not changed:
+            if self._proposal_boundary_already_satisfied(st, frame_i, cuts, proposal):
+                self._discard_correction_session("scribble_accept_existing_boundary")
+                left_txt = applied_left or str(left_label or seg_label or "?")
+                right_txt = applied_right or str(right_label or seg_label or "?")
+                return self._finalize_accepted_boundary_suggestion(
+                    proposal,
+                    frame_i=int(frame_i),
+                    left_label=str(left_txt),
+                    right_label=str(right_txt),
+                    changed=False,
+                    status_text=(
+                        f"Accepted boundary suggestion at F{frame_i}: already satisfied ({left_txt} | {right_txt})."
+                    ),
+                    interaction_status=f"Boundary suggestion accepted at F{frame_i}",
+                )
             self._record_scribble_proposal_feedback(
                 proposal,
                 accepted=False,
@@ -16420,49 +15364,16 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         left_txt = applied_left or str(left_label or seg_label or "?")
         right_txt = applied_right or str(right_label or seg_label or "?")
-        active_session = str(
-            proposal.get("session_id") or getattr(self, "_active_scribble_session_id", "") or ""
-        ).strip()
-        if active_session:
-            accepted_proposal = dict(proposal)
-            accepted_proposal["boundary_frame"] = int(frame_i)
-            accepted_proposal["left_label"] = str(applied_left)
-            accepted_proposal["right_label"] = str(applied_right)
-            self._replace_scribble_session_with_marker(
-                active_session,
-                proposal=accepted_proposal,
-                accepted=True,
-            )
-        self._active_scribble_session_id = ""
-        self._last_scribble_result = None
-        self._store_active_view_scribble_state()
-        try:
-            self.timeline.set_scribble_items(self._scribble_items.items)
-        except Exception:
-            pass
-        self._update_scribble_proposal_ui()
-        self._refresh_query_planner_hint()
-        auto_advanced = False
-        next_decision = self._boundary_query_decision()
-        if isinstance(next_decision, QueryDecision):
-            next_cand = next_decision.candidate
-            next_focus = int(
-                next_cand.payload.get(
-                    "boundary_frame",
-                    (int(next_cand.start_frame) + int(next_cand.end_frame)) // 2,
-                )
-                or 0
-            )
-            if abs(int(next_focus) - int(frame_i)) > 2:
-                auto_advanced = self._focus_query_decision(
-                    next_decision, status_prefix="Next boundary"
-                )
-        if not auto_advanced:
-            self._set_status(
-                f"Accepted scribble proposal at F{frame_i}: {left_txt} | {right_txt}"
-            )
-            self._set_interaction_status(f"Boundary Scribble accepted at F{frame_i}")
-        return True
+        return self._finalize_accepted_boundary_suggestion(
+            proposal,
+            frame_i=int(frame_i),
+            left_label=str(applied_left),
+            right_label=str(applied_right),
+            changed=True,
+            status_text=f"Accepted scribble proposal at F{frame_i}: {left_txt} | {right_txt}",
+            interaction_status=f"Boundary Scribble accepted at F{frame_i}",
+            record_feedback=False,
+        )
 
     def enter_scribble_mode(self) -> None:
         if self.extra_mode:
@@ -16470,13 +15381,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self,
                 "Interaction",
                 "Exit Manual Segmentation before starting Boundary Scribble mode.",
-            )
-            return
-        if self.interaction_mode == "assisted":
-            QMessageBox.information(
-                self,
-                "Interaction",
-                "Exit Assisted Review before starting Boundary Scribble mode.",
             )
             return
         if self._is_psr_task():
@@ -16490,7 +15394,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.interaction_mode = "scribble"
         try:
             self.timeline.set_scribble_mode(True)
-            self.timeline.set_scribble_items(self._scribble_items.items)
+            self._sync_timeline_scribble_items()
         except Exception:
             pass
         self._update_scribble_proposal_ui()
@@ -16505,7 +15409,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.interaction_mode = None
         try:
             self.timeline.set_scribble_mode(False)
-            self.timeline.set_scribble_items(self._scribble_items.items)
+            self._sync_timeline_scribble_items()
         except Exception:
             pass
         self._update_scribble_proposal_ui()
@@ -16699,7 +15603,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._scribble_items.add(scribble)
         try:
-            self.timeline.set_scribble_items(self._scribble_items.items)
+            self._sync_timeline_scribble_items()
         except Exception:
             pass
         if (
@@ -16931,7 +15835,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._last_scribble_result = result
         self._store_active_view_scribble_state()
         try:
-            self.timeline.set_scribble_items(self._scribble_items.items)
+            self._sync_timeline_scribble_items()
         except Exception:
             pass
         boundary_frame = result.get("boundary_frame") if isinstance(result, dict) else None
@@ -17034,7 +15938,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._last_scribble_result = None
         self._store_active_view_scribble_state()
         try:
-            self.timeline.set_scribble_items(self._scribble_items.items)
+            self._sync_timeline_scribble_items()
         except Exception:
             pass
         self._update_scribble_proposal_ui()
@@ -17115,15 +16019,24 @@ class ActionWindow(FrameControlMixin, QWidget):
         frames = self._extra_frames()
         return AnnotationStore.frames_to_runs(frames)
 
-    def _sync_extra_cuts_from_store(self):
-        runs = AnnotationStore.frames_to_runs(self._extra_frames())
-        self.extra_cuts = [s for s, _ in runs]
+    def _set_extra_cuts(self, cuts: Iterable[Any]) -> None:
+        cleaned = []
+        for cut in cuts or []:
+            try:
+                cleaned.append(max(0, int(cut)))
+            except Exception:
+                continue
+        self.extra_cuts = sorted(set(cleaned))
         self.extra_last_frame = None
         try:
             self.timeline.set_extra_cuts(self.extra_cuts)
             self.timeline.set_segment_cuts(self.extra_cuts)
         except Exception:
             pass
+
+    def _sync_extra_cuts_from_store(self):
+        runs = AnnotationStore.frames_to_runs(self._extra_frames())
+        self._set_extra_cuts([s for s, _ in runs])
 
     def _flash_extra_overlay(self, frame: int):
         """Show a brief on-video overlay indicating the boundary frame."""
@@ -17648,7 +16561,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not isinstance(segs, list):
             print("[EXTRA] Invalid sidecar: 'segments' must be a list.")
             return
-        self.extra_cuts = []
+        loaded_cuts = []
         for seg in segs:
             if not isinstance(seg, dict):
                 continue
@@ -17663,10 +16576,184 @@ class ActionWindow(FrameControlMixin, QWidget):
                 continue
             for f in range(s, e + 1):
                 self.extra_store.add(extra.name, f)
-            self._record_extra_cut(s)
+            loaded_cuts.append(s)
+        self._set_extra_cuts(loaded_cuts)
 
     def _extra_target_stores(self) -> List[AnnotationStore]:
         return [self.extra_store]
+
+    def _resolve_action_label_name(self, raw_name: Any) -> str:
+        text = str(raw_name or "").strip()
+        if not text:
+            return ""
+        if is_extra_label(text):
+            return EXTRA_LABEL_NAME
+        exact = {}
+        folded = {}
+        for lb in self.labels:
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name:
+                continue
+            exact.setdefault(name, name)
+            folded.setdefault(name.casefold(), name)
+        if text in exact:
+            return exact[text]
+        return folded.get(text.casefold(), text)
+
+    def _ensure_label_defs_for_names(self, names: Iterable[Any]) -> None:
+        existing = {
+            str(getattr(lb, "name", "") or "").strip().casefold()
+            for lb in self.labels
+            if str(getattr(lb, "name", "") or "").strip()
+        }
+        next_id = -1
+        for idx, lb in enumerate(self.labels):
+            try:
+                next_id = max(next_id, int(getattr(lb, "id", idx)))
+            except Exception:
+                continue
+        changed = False
+        for raw_name in names:
+            name = self._resolve_action_label_name(raw_name)
+            if not name or is_extra_label(name):
+                continue
+            key = name.casefold()
+            if key in existing:
+                continue
+            next_id += 1
+            self.labels.append(
+                LabelDef(
+                    name=name,
+                    color_name=self._auto_color_key_for_id(next_id),
+                    id=next_id,
+                )
+            )
+            existing.add(key)
+            changed = True
+        if changed:
+            try:
+                self.panel.refresh()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalized_label_key(name: Any) -> str:
+        return str(name or "").strip().casefold()
+
+    def _proposal_boundary_already_satisfied(
+        self,
+        st: Optional[AnnotationStore],
+        frame_i: int,
+        cuts: Optional[Set[int]],
+        proposal: Optional[Dict[str, Any]],
+    ) -> bool:
+        if st is None or not isinstance(proposal, dict):
+            return False
+        try:
+            frame_val = int(frame_i)
+        except Exception:
+            return False
+        fc = max(1, self._get_frame_count())
+        if frame_val < 0 or frame_val >= fc:
+            return False
+        cut_set = {int(c) for c in (cuts or set()) if c is not None}
+        left_actual = ""
+        right_actual = ""
+        try:
+            if frame_val - 1 >= 0:
+                left_actual = self._resolve_action_label_name(st.label_at(frame_val - 1))
+        except Exception:
+            left_actual = ""
+        try:
+            right_actual = self._resolve_action_label_name(st.label_at(frame_val))
+        except Exception:
+            right_actual = ""
+        boundary_present = bool(
+            frame_val in cut_set
+            or (left_actual and right_actual and left_actual != right_actual)
+        )
+        if not boundary_present:
+            return False
+        expected_left = self._resolve_action_label_name(proposal.get("left_label"))
+        expected_right = self._resolve_action_label_name(proposal.get("right_label"))
+        if (
+            expected_left
+            and self._normalized_label_key(left_actual)
+            != self._normalized_label_key(expected_left)
+        ):
+            return False
+        if (
+            expected_right
+            and self._normalized_label_key(right_actual)
+            != self._normalized_label_key(expected_right)
+        ):
+            return False
+        return True
+
+    def _finalize_accepted_boundary_suggestion(
+        self,
+        proposal: Dict[str, Any],
+        *,
+        frame_i: int,
+        left_label: str = "",
+        right_label: str = "",
+        changed: bool,
+        status_text: str,
+        interaction_status: str,
+        record_feedback: bool = True,
+    ) -> bool:
+        if record_feedback:
+            self._record_scribble_proposal_feedback(
+                proposal,
+                accepted=True,
+                reason="accepted" if changed else "accepted_existing_boundary",
+                changed=bool(changed),
+            )
+        active_session = str(
+            proposal.get("session_id")
+            or getattr(self, "_active_scribble_session_id", "")
+            or ""
+        ).strip()
+        if active_session:
+            accepted_proposal = dict(proposal)
+            accepted_proposal["boundary_frame"] = int(frame_i)
+            if left_label:
+                accepted_proposal["left_label"] = str(left_label)
+            if right_label:
+                accepted_proposal["right_label"] = str(right_label)
+            self._replace_scribble_session_with_marker(
+                active_session,
+                proposal=accepted_proposal,
+                accepted=True,
+            )
+        self._active_scribble_session_id = ""
+        self._last_scribble_result = None
+        self._store_active_view_scribble_state()
+        try:
+            self._sync_timeline_scribble_items()
+        except Exception:
+            pass
+        self._update_scribble_proposal_ui()
+        self._refresh_query_planner_hint()
+        auto_advanced = False
+        next_decision = self._boundary_query_decision()
+        if isinstance(next_decision, QueryDecision):
+            next_cand = next_decision.candidate
+            next_focus = int(
+                next_cand.payload.get(
+                    "boundary_frame",
+                    (int(next_cand.start_frame) + int(next_cand.end_frame)) // 2,
+                )
+                or 0
+            )
+            if abs(int(next_focus) - int(frame_i)) > 2:
+                auto_advanced = self._focus_query_decision(
+                    next_decision, status_prefix="Next boundary"
+                )
+        if not auto_advanced:
+            self._set_status(status_text)
+            self._set_interaction_status(interaction_status)
+        return True
 
     def _align_labels_to_manual_segments(self) -> bool:
         """Assign a single label to each manual segment using majority labels from prelabel store."""
@@ -17696,13 +16783,14 @@ class ActionWindow(FrameControlMixin, QWidget):
                 s, e = e, s
             counts = {}
             for f in range(s, e + 1):
-                lb = source_store.label_at(f)
+                lb = self._resolve_action_label_name(source_store.label_at(f))
                 if not lb or is_extra_label(lb):
                     continue
                 counts[lb] = counts.get(lb, 0) + 1
             if not counts:
                 continue
             target_label = max(counts.items(), key=lambda x: x[1])[0]
+            self._ensure_label_defs_for_names([target_label])
             for f in range(s, e + 1):
                 cur = self.store.label_at(f)
                 if cur == target_label:
@@ -17729,17 +16817,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self,
                 "Interaction",
                 "Exit Boundary Scribble mode before starting Manual Segmentation.",
-            )
-            try:
-                self.btn_extra.setChecked(False)
-            except Exception:
-                pass
-            return
-        if self.interaction_mode == "assisted":
-            QMessageBox.information(
-                self,
-                "Interaction",
-                "Exit Assisted Review before starting Manual Segmentation.",
             )
             try:
                 self.btn_extra.setChecked(False)
@@ -17777,9 +16854,7 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def exit_extra_mode(self):
         # finalize any ongoing segment before exiting
-        end_frame = getattr(
-            self.player, "crop_end", getattr(self.player, "current_frame", None)
-        )
+        end_frame = getattr(self.player, "current_frame", None)
         self._finalize_extra_segment(end_frame)
         # align labels to manual segments using existing predictions
         try:
@@ -17824,17 +16899,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         return super().eventFilter(obj, event)
 
     def on_extra_clicked(self):
-        if self.interaction_mode == "assisted":
-            QMessageBox.information(
-                self,
-                "Interaction",
-                "Assisted Review is active. Please exit it before switching to Manual Segmentation.",
-            )
-            try:
-                self.btn_extra.setChecked(False)
-            except Exception:
-                pass
-            return
         if not self.extra_mode:
             self.enter_extra_mode()
         else:
@@ -18034,7 +17098,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._auto_boundary_source = ""
 
         classes, segs, topk_map = self._load_prediction_output(txt_path, json_path)
-        # cache top-k candidates for assisted label review
+        # cache top-k candidates for later label-query suggestions
         self._assisted_candidates = topk_map
 
         if not segs:
@@ -18465,17 +17529,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._set_frame_controls(frame)
         except Exception:
             pass
-        if self.interaction_mode == "assisted" and self._assisted_loop_range:
-            start, end = self._assisted_loop_range
-            if frame >= end:
-                try:
-                    self._sync_views_to_frame(start, preview_only=False)
-                    self._sync_other_views(start)
-                    self.timeline.set_current_frame(start, follow=True)
-                    self._update_overlay_for_frame(start)
-                except Exception:
-                    pass
-                return
         if self.extra_mode:
             self._append_extra_progress(frame)
         self._sync_other_views(frame)
@@ -18490,8 +17543,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         if view_idx != self.active_view_idx:
             self._set_primary_view(view_idx)
         self._timeline_auto_follow = True
-        if self.interaction_mode == "assisted":
-            self._activate_assisted_at_frame(frame)
         if self.extra_mode:
             self._split_extra_at(frame)
         self._sync_views_to_frame(frame, preview_only=False)
@@ -18694,21 +17745,9 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.on_extra_clicked()
             return
 
-        if text.startswith("Assisted Review"):
-            if self.interaction_mode == "scribble":
-                self.exit_scribble_mode()
-            try:
-                self.btn_assisted.setChecked(not self.btn_assisted.isChecked())
-            except Exception:
-                pass
-            self.on_assisted_clicked()
-            return
-
         if text.startswith("Exit Interaction"):
             if self.extra_mode:
                 self.exit_extra_mode()
-            if self.interaction_mode == "assisted":
-                self._exit_assisted_mode()
             if self.interaction_mode == "scribble":
                 self.exit_scribble_mode()
 
@@ -19934,12 +18973,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._last_scribble_result = None
         self._last_query_decision = None
         self._pending_label_review = None
-        self.assisted_points = []
-        self.assisted_active_idx = -1
-        self._assisted_review_done = False
-        self._assisted_loop_range = None
         self._assisted_candidates = {}
-        self._assisted_source_segments = []
         self._has_auto_segments = False
         self._auto_boundary_candidates = []
         self._auto_boundary_source = ""
@@ -19963,27 +18997,6 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.anomaly_types = []
         self._ensure_anomaly_types()
         self._rebuild_anomaly_type_panel()
-        try:
-            if self._assisted_loop_timer:
-                self._assisted_loop_timer.stop()
-        except Exception:
-            pass
-        for sc in (
-            getattr(self, "sc_assist_left", None),
-            getattr(self, "sc_assist_right", None),
-            getattr(self, "sc_assist_confirm", None),
-            getattr(self, "sc_assist_down", None),
-            getattr(self, "sc_assist_next", None),
-            getattr(self, "sc_assist_prev", None),
-            getattr(self, "sc_assist_skip", None),
-            getattr(self, "sc_assist_merge", None),
-            getattr(self, "sc_assist_merge_del", None),
-        ):
-            if sc:
-                try:
-                    sc.setEnabled(False)
-                except Exception:
-                    pass
         self.current_annotation_path = None
         self.currentFeatureDir = None
         self._label_text_bank_cache = {}
@@ -20014,7 +19027,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._psr_load_view_state(self.views[self.active_view_idx])
         try:
             self.btn_extra.setChecked(False)
-            self.btn_assisted.setChecked(False)
         except Exception:
             pass
         try:
@@ -20251,21 +19263,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                 if pending_label_review:
                     self._update_scribble_proposal_ui()
                     self._refresh_query_planner_hint()
-                if self.interaction_mode == "assisted":
-                    try:
-                        self._build_assisted_points_from_store(
-                            preserve_status=True,
-                            active_hint=("label", int(forced.get("start", 0))),
-                        )
-                        self._update_assisted_visuals()
-                    except Exception:
-                        pass
-        if self.interaction_mode == "assisted" and not handled_forced:
-            pt = self._active_assisted_point()
-            if pt and pt.get("type") == "label" and 0 <= idx < len(self.labels):
-                lb = self.labels[idx]
-                if lb and lb.name:
-                    self._apply_assisted_label_choice(lb.name)
         if 0 <= idx < len(self.labels):
             lb = self.labels[idx]
             checked = self.label_entity_map.get(lb.name, set())
@@ -20310,8 +19307,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                     self.panel.select_label_by_name(name)
                 except Exception:
                     pass
-                if self.interaction_mode == "assisted":
-                    self._activate_assisted_at_frame(frame)
                 self._log("timeline_label_click", label=name, frame=frame)
                 break
 
@@ -20469,6 +19464,97 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._log(
             "entity_visibility_change", entities=",".join(sorted(self.visible_entities))
         )
+
+    def _ensure_entity_exists(self, base_name: str = "global") -> str:
+        name = str(base_name or "global").strip() or "global"
+        existing = [str(getattr(ent, "name", "") or "").strip() for ent in self.entities]
+        existing = [n for n in existing if n]
+        if name not in existing:
+            next_id = max([int(e.id) for e in self.entities], default=-1) + 1
+            self.entities.append(EntityDef(name=name, id=next_id))
+        for view in getattr(self, "views", []) or []:
+            view.setdefault("entity_stores", {}).setdefault(name, AnnotationStore())
+            view.setdefault("phase_stores", {}).setdefault(name, AnnotationStore())
+            self._ensure_anomaly_type_stores_for_entity(
+                name, view.setdefault("anomaly_type_stores", {})
+            )
+        self.entity_stores.setdefault(name, AnnotationStore())
+        self.phase_stores.setdefault(name, AnnotationStore())
+        self._ensure_anomaly_type_stores_for_entity(name, self.anomaly_type_stores)
+        return name
+
+    def _promote_coarse_to_fine_if_needed(self) -> bool:
+        if str(getattr(self, "mode", "") or "") != "Fine":
+            return False
+        if not getattr(self, "views", None):
+            return False
+        has_fine_data = False
+        for view in self.views:
+            for st in (view.get("entity_stores") or {}).values():
+                if getattr(st, "frame_to_label", None):
+                    has_fine_data = True
+                    break
+            if has_fine_data:
+                break
+        if has_fine_data:
+            return False
+        has_coarse_data = any(
+            getattr((view.get("store") or None), "frame_to_label", None)
+            for view in self.views
+        )
+        if not has_coarse_data:
+            return False
+
+        entity_names = [
+            str(getattr(ent, "name", "") or "").strip() for ent in self.entities if str(getattr(ent, "name", "") or "").strip()
+        ]
+        target_name = ""
+        active_name = str(getattr(self, "_active_entity_name", "") or "").strip()
+        if active_name and active_name in entity_names:
+            target_name = active_name
+        elif len(entity_names) == 1:
+            target_name = entity_names[0]
+        else:
+            target_name = self._ensure_entity_exists("global")
+        if not target_name:
+            target_name = self._ensure_entity_exists("global")
+        else:
+            target_name = self._ensure_entity_exists(target_name)
+
+        for view in self.views:
+            coarse_store = view.get("store")
+            if not getattr(coarse_store, "frame_to_label", None):
+                continue
+            entity_store = view.setdefault("entity_stores", {}).setdefault(
+                target_name, AnnotationStore()
+            )
+            if getattr(entity_store, "frame_to_label", None):
+                continue
+            cloned = self._clone_store(coarse_store)
+            entity_store.frame_to_label = dict(cloned.frame_to_label)
+            entity_store.label_to_frames = {
+                key: list(vals) for key, vals in cloned.label_to_frames.items()
+            }
+            view.setdefault("phase_stores", {}).setdefault(target_name, AnnotationStore())
+            self._ensure_anomaly_type_stores_for_entity(
+                target_name, view.setdefault("anomaly_type_stores", {})
+            )
+
+        for lb in self.labels:
+            if is_extra_label(lb.name):
+                continue
+            self.label_entity_map.setdefault(lb.name, set()).add(target_name)
+        if target_name not in self.visible_entities:
+            self.visible_entities.append(target_name)
+        self._active_entity_name = target_name
+        if self.views and 0 <= self.active_view_idx < len(self.views):
+            self.entity_stores = self.views[self.active_view_idx].get("entity_stores", {})
+            self.phase_stores = self.views[self.active_view_idx].get("phase_stores", {})
+            self.anomaly_type_stores = self.views[self.active_view_idx].get(
+                "anomaly_type_stores", {}
+            )
+        self._log("promote_coarse_to_fine", entity=target_name)
+        return True
 
     def _label_mapping_signature(
         self, labels: Optional[List[LabelDef]] = None
@@ -20639,6 +19725,8 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _on_mode_changed(self, text: str):
         self.mode = text
         self._apply_default_label_template(text, reason="mode_switch")
+        if self.mode == "Fine":
+            self._promote_coarse_to_fine_if_needed()
         self._update_phase_panel_visibility()
         if self.mode != "Fine":
             self._phase_selected = None
@@ -20838,11 +19926,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         else:
             self.entities_panel.setVisible(True)
             for lb in self.labels:
-                selected = self.label_entity_map.get(lb.name, set())
                 if is_extra_label(lb.name):
-                    row_sources.append((lb, self.extra_store, ""))
-                    extra_sources.append((lb, self.extra_store, ""))
                     continue
+                selected = self.label_entity_map.get(lb.name, set())
                 for ename in selected:
                     st = self.entity_stores.setdefault(ename, AnnotationStore())
                     row_sources.append((lb, st, f"[{ename}] "))
@@ -20861,9 +19947,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 group_sources = []
                 for lb in self.labels:
                     if is_extra_label(lb.name):
-                        group_sources.append((lb, self.extra_store, ""))
-                    else:
-                        group_sources.append((lb, st, ""))
+                        continue
+                    group_sources.append((lb, st, ""))
                 groups.append(
                     (
                         ename,
@@ -20925,7 +20010,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Timeline",
                     main_sources,
                     {
-                        "show_extra_overlay": False,
                         "segment_cuts": coarse_cuts,
                         "show_segment_cuts": True,
                     },
@@ -20934,7 +20018,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Manual Segmentation",
                     extra_sources,
                     {
-                        "show_extra_overlay": True,
+                        "split_on_extra_cuts": True,
                         "editable": False,
                         "show_segment_cuts": False,
                     },
@@ -21552,6 +20636,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         # ensure interaction row exists (keeps live painting when importing legacy JSON)
         self._ensure_extra_label()
+        loaded_extra_cuts: Set[int] = set()
 
         for ann in canonical.get("annotations", []):
             try:
@@ -21568,11 +20653,16 @@ class ActionWindow(FrameControlMixin, QWidget):
                     continue
                 e_abs = min(e_abs, view_end)
             target = self.extra_store if is_extra_label(name) else self.store
+            if target is self.extra_store:
+                loaded_extra_cuts.add(int(s_abs))
             for f in range(s_abs, e_abs + 1):
                 if (not target.is_occupied(f)) or (target.label_at(f) == name):
                     target.add(name, f)
 
-        self._sync_extra_cuts_from_store()
+        if loaded_extra_cuts:
+            self._set_extra_cuts(loaded_extra_cuts)
+        else:
+            self._sync_extra_cuts_from_store()
         self._rebuild_timeline_sources()
         try:
             self.timeline.refresh_all_rows()
@@ -22104,16 +21194,20 @@ class ActionWindow(FrameControlMixin, QWidget):
             for t in self.anomaly_types
             if t.get("name")
         ]
-        action_labels = [
-            {"id": int(lb.id), "name": lb.name}
-            for lb in sorted(self.labels, key=lambda x: x.id)
-        ]
-        label_id_by_name = {lb.name: int(lb.id) for lb in self.labels}
-
         segments = []
         view_entities = view.get("entity_stores", {})
         has_entity_data = any(st and st.frame_to_label for st in view_entities.values())
         is_fine = (self.mode == "Fine") or has_entity_data
+        export_labels = [
+            lb
+            for lb in sorted(self.labels, key=lambda x: x.id)
+            if not (is_fine and is_extra_label(lb.name))
+        ]
+        action_labels = [
+            {"id": int(lb.id), "name": lb.name}
+            for lb in export_labels
+        ]
+        label_id_by_name = {lb.name: int(lb.id) for lb in export_labels}
 
         if not is_fine:
             # coarse: use global store
@@ -23744,6 +22838,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 next_eid += 1
 
         labels_added = False
+        loaded_extra_cuts: Set[int] = set()
 
         def _label_name_from_segment(seg: Dict[str, Any]) -> str:
             nonlocal labels_added
@@ -23804,6 +22899,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 target = self.extra_store if is_extra_label(name) else view_store
                 if ename and self.mode == "Fine":
                     target = view_entities.setdefault(ename, AnnotationStore())
+                if target is self.extra_store:
+                    loaded_extra_cuts.add(int(s))
 
                 for f in range(s, e + 1):
                     if (not target.is_occupied(f)) or (target.label_at(f) == name):
@@ -23832,7 +22929,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                                 )
                                 self._apply_label_range(astore, s, e, names[idx])
 
-        self._sync_extra_cuts_from_store()
+        if loaded_extra_cuts:
+            self._set_extra_cuts(loaded_extra_cuts)
+        else:
+            self._sync_extra_cuts_from_store()
         # refresh UI
         if self.views and 0 <= self.active_view_idx < len(self.views):
             self.entity_stores = self.views[self.active_view_idx].get(

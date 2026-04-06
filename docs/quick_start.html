@@ -48,29 +48,78 @@
       border: 1px solid #e8ebef;
       background: #fff;
     }
+    .shot h2 {
+      margin: 0 0 8px;
+      font-size: 22px;
+      line-height: 1.25;
+    }
+    .shot p {
+      margin: 0 0 10px;
+    }
+    .shot ul {
+      margin: 0 0 14px 20px;
+      padding: 0;
+      color: #344054;
+    }
+    .shot li + li {
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>IMPACT-Scribe Quick Start</h1>
     <p>
-      This version is image-first on purpose: each step is written directly on a real screenshot so the guide stays legible without juggling separate captions.
+      This version keeps the explanation text separate from the screenshots so the UI details stay large and readable.
     </p>
 
     <div class="shot">
-      <img src="assets/quick_start/step_01_open_help.png" alt="Step 1. Open the guide from the information icon">
+      <h2>Step 1. Load a video or baseline</h2>
+      <p>Start from the top action bar. Open a session, load a video, or import an existing segmentation before review begins.</p>
+      <ul>
+        <li>Use the action menu for Open Session, Load Video, or Import JSON.</li>
+      </ul>
+      <img src="assets/quick_start/step_01_load_baseline.png" alt="Step 1. Load a video or baseline">
     </div>
 
     <div class="shot">
-      <img src="assets/quick_start/step_02_loaded_timeline.png" alt="Step 2. Start from a loaded timeline">
+      <h2>Step 2. Inspect the loaded workspace</h2>
+      <p>Once the baseline is loaded, review the current video frame together with the action timeline before making edits.</p>
+      <ul>
+        <li>The video panel gives visual context for the current frame.</li>
+        <li>The timeline is the baseline segmentation you will review and refine.</li>
+      </ul>
+      <img src="assets/quick_start/step_02_loaded_workspace.png" alt="Step 2. Inspect the loaded workspace">
     </div>
 
     <div class="shot">
-      <img src="assets/quick_start/step_03_draw_and_refine.png" alt="Step 3. Draw one uncertain scribble and refine the split">
+      <h2>Step 3. Click Suggest Query</h2>
+      <p>When the baseline is ready, ask the planner which lightweight boundary or label question to review next.</p>
+      <ul>
+        <li>Click Suggest Query to generate the next focused review target.</li>
+      </ul>
+      <img src="assets/quick_start/step_03_suggest_query.png" alt="Step 3. Click Suggest Query">
     </div>
 
     <div class="shot">
-      <img src="assets/quick_start/step_04_accept_and_cleanup.png" alt="Step 4. Accept the split and use right click to delete a stroke or marker">
+      <h2>Step 4. Review the suggestion</h2>
+      <p>After you click Suggest Query, the footer summarizes the next lightweight boundary or label question.</p>
+      <ul>
+        <li>Read the suggested boundary or label target before editing.</li>
+        <li>Accept and Reject live in the bottom-right action area.</li>
+      </ul>
+      <img src="assets/quick_start/step_04_review_suggestion.png" alt="Step 4. Review the suggestion">
+    </div>
+
+    <div class="shot">
+      <h2>Step 5. Refine the boundary and accept</h2>
+      <p>Draw one uncertain stroke across the suspicious split. If the proposal is close, drag the red line and accept the suggestion.</p>
+      <ul>
+        <li>Start with one uncertain stroke across the suspicious boundary region.</li>
+        <li>If the split is slightly off, drag the red proposal line before accepting it.</li>
+        <li>Use Start Scribble for local refinement, then Accept in the bottom-right to write it back.</li>
+      </ul>
+      <img src="assets/quick_start/step_05_refine_and_accept.png" alt="Step 5. Refine the boundary and accept">
     </div>
   </div>
 </body>

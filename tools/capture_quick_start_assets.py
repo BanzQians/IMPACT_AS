@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ.setdefault(
+    "IMPACT_SCRIBE_SETTINGS_DIR",
+    str(REPO_ROOT / ".runtime" / "impact_scribe_settings"),
+)
+Path(os.environ["IMPACT_SCRIBE_SETTINGS_DIR"]).mkdir(parents=True, exist_ok=True)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -15,11 +21,15 @@ _bootstrap_qt_runtime()
 
 from PyQt5.QtCore import QPoint, QRect
 from PyQt5.QtGui import QColor, QImage, QPainter
-from PyQt5.QtWidgets import QApplication, QMessageBox, QWidget
+from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox, QWidget
 from PIL import Image, ImageDraw, ImageFont
 
+from core.query_planner import QueryCandidate, QueryDecision, QueryType
 from ui.main_window import MainWindow
 from utils.op_logger import OperationLogger
+
+LEFT_GUTTER = 340
+RIGHT_GUTTER = 340
 
 
 @dataclass
@@ -35,6 +45,12 @@ def _suppress_dialogs() -> None:
     QMessageBox.information = staticmethod(lambda *args, **kwargs: QMessageBox.Ok)
     QMessageBox.warning = staticmethod(lambda *args, **kwargs: QMessageBox.Ok)
     QMessageBox.question = staticmethod(lambda *args, **kwargs: QMessageBox.Yes)
+    QInputDialog.getInt = staticmethod(
+        lambda *args, **kwargs: (int(kwargs.get("value", 0) or 0), True)
+    )
+    QInputDialog.getText = staticmethod(
+        lambda *args, **kwargs: (str(kwargs.get("text", "") or ""), True)
+    )
 
 
 def _annotation_max_end(path: Path) -> int:
@@ -92,7 +108,31 @@ def _crop_image(image: QImage, rect: QRect) -> QImage:
     return image.copy(clipped)
 
 
-def _stack_images(top: QImage, bottom: QImage, *, gap: int = 22) -> tuple[QImage, int]:
+def _union_rect(rects: list[QRect]) -> QRect:
+    valid = [QRect(item) for item in rects if item is not None and not item.isNull()]
+    if not valid:
+        return QRect()
+    out = QRect(valid[0])
+    for item in valid[1:]:
+        out = out.united(item)
+    return out
+
+
+def _fit_rect(rect: QRect, width: int, height: int, *, margin: int = 10) -> QRect:
+    max_w = max(32, int(width) - 2 * int(margin))
+    max_h = max(24, int(height) - 2 * int(margin))
+    fitted_w = min(int(rect.width()), max_w)
+    fitted_h = min(int(rect.height()), max_h)
+    max_x = max(int(margin), int(width) - fitted_w - int(margin))
+    max_y = max(int(margin), int(height) - fitted_h - int(margin))
+    fitted_x = min(max(int(rect.x()), int(margin)), max_x)
+    fitted_y = min(max(int(rect.y()), int(margin)), max_y)
+    return QRect(fitted_x, fitted_y, fitted_w, fitted_h)
+
+
+def _stack_images(
+    top: QImage, bottom: QImage, *, gap: int = 22
+) -> tuple[QImage, QPoint, QPoint]:
     width = max(top.width(), bottom.width())
     height = int(top.height()) + int(gap) + int(bottom.height())
     canvas = QImage(width, height, QImage.Format_ARGB32)
@@ -104,7 +144,11 @@ def _stack_images(top: QImage, bottom: QImage, *, gap: int = 22) -> tuple[QImage
     painter.drawImage(top_x, 0, top)
     painter.drawImage(bottom_x, top.height() + gap, bottom)
     painter.end()
-    return canvas, int(top.height() + gap)
+    return (
+        canvas,
+        QPoint(top_x, 0),
+        QPoint(bottom_x, int(top.height() + gap)),
+    )
 
 
 def _qimage_to_pil(image: QImage) -> Image.Image:
@@ -218,11 +262,40 @@ def _annotate_image(
     title: str,
     subtitle: str,
     callouts: list[GuideCallout],
+    embed_text: bool = True,
 ) -> None:
+    if not embed_text:
+        canvas = _qimage_to_pil(base)
+        draw = ImageDraw.Draw(canvas)
+        for item in callouts:
+            target = QRect(item.target)
+            color = tuple(int(v) for v in item.color.getRgb()[:3])
+            draw.rounded_rectangle(
+                [
+                    target.left() - 3,
+                    target.top() - 3,
+                    target.right() + 3,
+                    target.bottom() + 3,
+                ],
+                radius=12,
+                outline=(color[0], color[1], color[2], 255),
+                width=5,
+            )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(str(out_path))
+        return
+
     header_h = 96
     base_pil = _qimage_to_pil(base)
-    canvas = Image.new("RGBA", (base_pil.width, base_pil.height + header_h), (247, 248, 250, 255))
-    canvas.paste(base_pil, (0, header_h))
+    canvas = Image.new(
+        "RGBA",
+        (
+            base_pil.width + LEFT_GUTTER + RIGHT_GUTTER,
+            base_pil.height + header_h,
+        ),
+        (247, 248, 250, 255),
+    )
+    canvas.paste(base_pil, (LEFT_GUTTER, header_h))
     draw = ImageDraw.Draw(canvas)
 
     title_font = _load_font(28, bold=True)
@@ -238,11 +311,14 @@ def _annotate_image(
     )
 
     for item in callouts:
+        bubble = _fit_rect(
+            item.bubble.translated(0, header_h), canvas.width, canvas.height
+        )
         shifted = GuideCallout(
             number=int(item.number),
             text=str(item.text),
-            target=item.target.translated(0, header_h),
-            bubble=item.bubble.translated(0, header_h),
+            target=item.target.translated(LEFT_GUTTER, header_h),
+            bubble=bubble,
             color=QColor(item.color),
         )
         _draw_callout(draw, shifted)
@@ -251,13 +327,28 @@ def _annotate_image(
     canvas.save(str(out_path))
 
 
+def _left_bubble(y: int, *, width: int = 300, height: int = 62) -> QRect:
+    return QRect(18, int(y), int(width), int(height))
+
+
+def _right_bubble(
+    base_width: int, y: int, *, width: int = 320, height: int = 62
+) -> QRect:
+    return QRect(
+        LEFT_GUTTER + int(base_width) + 18,
+        int(y),
+        int(width),
+        int(height),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Capture annotated real UI screenshots for the in-app Quick Start guide."
     )
     parser.add_argument(
         "--sample-json",
-        default="test_data/20250507_1144_color_native_test.json",
+        default="test_data/20250410_1418_color_front_clipped.json",
         help="Sample annotation json used to populate the timeline.",
     )
     parser.add_argument(
@@ -273,7 +364,6 @@ def main() -> int:
         raise SystemExit(f"Sample json not found: {sample_json}")
 
     _suppress_dialogs()
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
     app = QApplication.instance() or QApplication([])
     app.setQuitOnLastWindowClosed(False)
@@ -284,44 +374,47 @@ def main() -> int:
     app.processEvents()
 
     action = win.action_window
-    if action.views:
-        max_end = _annotation_max_end(sample_json)
-        action.views[0]["end"] = int(max_end)
-        action.player.crop_end = int(max_end)
-
-    main_shot = win.grab().toImage()
-    quick_rect = _widget_rect_in(win.btn_quick_start, win)
-    quick_crop = _clip_rect(
-        QRect(
-            max(0, int(quick_rect.x()) - 320),
-            max(0, int(quick_rect.y()) - 14),
-            430,
-            64,
-        ),
-        main_shot.width(),
-        main_shot.height(),
+    action_shot = action.grab().toImage()
+    controls_rect = _widget_rect_in(action.ctrl_scroll, action)
+    step1_crop = _clip_rect(
+        controls_rect.adjusted(-14, -10, 14, 10),
+        action_shot.width(),
+        action_shot.height(),
     )
-    quick_image = _crop_image(main_shot, quick_crop)
-    quick_target = quick_rect.translated(-quick_crop.x(), -quick_crop.y())
+    step1_image = _crop_image(action_shot, step1_crop)
+    actions_target = _widget_rect_in(action.combo_actions, action).translated(
+        -step1_crop.x(), -step1_crop.y()
+    )
     _annotate_image(
-        quick_image,
-        out_path=out_dir / "step_01_open_help.png",
-        title="Step 1. Open Quick Start any time",
-        subtitle="The guide stays available while you work, so new users do not have to remember hidden commands.",
+        step1_image,
+        out_path=out_dir / "step_01_load_baseline.png",
+        title="Step 1. Load a video or baseline",
+        subtitle="Start from the top action bar. Open a session, load a video, or import an existing segmentation before review begins.",
         callouts=[
             GuideCallout(
                 1,
-                "Click this information icon to reopen the guide whenever you need it.",
-                quick_target,
-                QRect(18, 4, 280, 56),
-            )
+                "Use this action menu for Open Session, Load Video, or Import JSON.",
+                actions_target,
+                _left_bubble(10),
+            ),
         ],
+        embed_text=False,
     )
 
+    sample_video = sample_json.with_suffix(".mp4")
+    if sample_video.is_file():
+        ok_video = action._load_primary_video(str(sample_video))
+        if not ok_video:
+            raise SystemExit(f"Failed to load sample video: {sample_video}")
+        app.processEvents()
     ok = action._load_json_annotations(path=str(sample_json))
     if not ok:
         raise SystemExit(f"Failed to load sample annotations: {sample_json}")
     app.processEvents()
+    if action.views:
+        max_end = _annotation_max_end(sample_json)
+        action.views[0]["end"] = int(max_end)
+        action.player.crop_end = int(max_end)
     segments = action._segments_from_store_for_interaction()
     if not segments or len(segments) < 2:
         raise SystemExit("Need at least two loaded segments to capture the scribble workflow.")
@@ -330,34 +423,134 @@ def main() -> int:
     action.timeline.set_current_frame(boundary_frame, follow=True)
     app.processEvents()
 
-    timeline_image = action.timeline.grab().toImage()
-    row = action._active_scribble_row()
-    if row is None:
-        raise SystemExit("Could not resolve the active timeline row.")
-    row_rect = _widget_rect_in(row, action.timeline)
-    row_rect = row_rect.adjusted(-6, -6, 6, 6)
-    boundary_x_timeline = int(
-        _widget_rect_in(row, action.timeline).x() + row.frame_to_x_float(float(boundary_frame))
+    workspace_shot = action.grab().toImage()
+    player_rect = _widget_rect_in(action.player, action).adjusted(-6, -6, 6, 6)
+    timeline_rect = _widget_rect_in(action.timeline, action).adjusted(-6, -6, 6, 6)
+    step2_crop = _clip_rect(
+        _union_rect([player_rect, timeline_rect]).adjusted(-12, -12, 12, 12),
+        workspace_shot.width(),
+        workspace_shot.height(),
     )
+    workspace_image = _crop_image(workspace_shot, step2_crop)
     _annotate_image(
-        timeline_image,
-        out_path=out_dir / "step_02_loaded_timeline.png",
-        title="Step 2. Start from a loaded timeline",
-        subtitle="Boundary scribble is a repair workflow. Load coarse annotations or prelabels first, then refine the suspicious splits.",
+        workspace_image,
+        out_path=out_dir / "step_02_loaded_workspace.png",
+        title="Step 2. Inspect the loaded workspace",
+        subtitle="Once the baseline is loaded, review the current video frame together with the action timeline before making edits.",
         callouts=[
             GuideCallout(
                 2,
-                "Work inside the timeline after you have imported a baseline segmentation.",
-                row_rect,
-                QRect(18, 14, 330, 62),
+                "The video panel gives you the visual context for the current frame.",
+                player_rect.translated(-step2_crop.x(), -step2_crop.y()),
+                _left_bubble(18),
             ),
             GuideCallout(
                 3,
-                "The current playhead gives you a local frame reference while you inspect the boundary.",
-                QRect(boundary_x_timeline - 10, row_rect.y(), 20, row_rect.height()),
-                QRect(max(390, boundary_x_timeline + 24), 26, 330, 62),
+                "The timeline is the baseline segmentation you will review and refine.",
+                timeline_rect.translated(-step2_crop.x(), -step2_crop.y()),
+                _right_bubble(workspace_image.width(), 22),
             ),
         ],
+        embed_text=False,
+    )
+
+    controls_host = action.ctrl_scroll.widget()
+    suggest_rect_content = _widget_rect_in(action.btn_query_suggest, controls_host)
+    try:
+        hbar = action.ctrl_scroll.horizontalScrollBar()
+        if hbar is not None:
+            hbar.setValue(max(0, int(suggest_rect_content.x()) - 180))
+            app.processEvents()
+    except Exception:
+        pass
+    controls_loaded = action.ctrl_scroll.grab().toImage()
+    suggest_rect = _widget_rect_in(action.btn_query_suggest, action.ctrl_scroll)
+    interaction_rect = _widget_rect_in(action.combo_interaction, action.ctrl_scroll)
+    clear_rect = _widget_rect_in(action.btn_scribble_clear, action.ctrl_scroll)
+    step3_crop = _clip_rect(
+        _union_rect([interaction_rect, clear_rect, suggest_rect]).adjusted(-90, -18, 90, 18),
+        controls_loaded.width(),
+        controls_loaded.height(),
+    )
+    suggest_image = _crop_image(controls_loaded, step3_crop)
+    _annotate_image(
+        suggest_image,
+        out_path=out_dir / "step_03_suggest_query.png",
+        title="Step 3. Click Suggest Query",
+        subtitle="When the baseline is ready, ask the planner which lightweight boundary or label question to review next.",
+        callouts=[
+            GuideCallout(
+                4,
+                "Click Suggest Query to generate the next focused review target.",
+                suggest_rect.translated(-step3_crop.x(), -step3_crop.y()),
+                _right_bubble(suggest_image.width(), 14),
+            ),
+        ],
+        embed_text=False,
+    )
+
+    if not action._suggest_next_query():
+        left = dict(segments[0] or {})
+        right = dict(segments[1] or {})
+        fallback_boundary = int(right.get("start", left.get("end", 0)) or 0)
+        fallback_decision = QueryDecision(
+            query_type=QueryType.BOUNDARY_SCRIBBLE,
+            candidate=QueryCandidate(
+                query_id=f"quickstart:boundary:{fallback_boundary}",
+                query_type=QueryType.BOUNDARY_SCRIBBLE,
+                start_frame=max(0, int(fallback_boundary) - 15),
+                end_frame=int(fallback_boundary) + 15,
+                score_terms={
+                    "uncertainty": 0.85,
+                    "disagreement": 0.0,
+                    "multiview": 0.0,
+                    "state_conflict": 0.0,
+                    "propagation_gain": 0.6,
+                    "history": 1.0,
+                },
+                estimated_cost=0.55,
+                payload={
+                    "boundary_frame": int(fallback_boundary),
+                    "left_label": str(left.get("label", "") or "?"),
+                    "right_label": str(right.get("label", "") or "?"),
+                    "query_score": 0.85,
+                },
+            ),
+            utility=0.85,
+        )
+        if not action._focus_query_decision(fallback_decision, status_prefix="Suggested"):
+            raise SystemExit("Could not generate a query suggestion for the Quick Start guide.")
+    app.processEvents()
+
+    query_image = action.query_footer_card.grab().toImage()
+    hint_target = _widget_rect_in(action.lbl_query_hint, action.query_footer_card)
+    button_target = _union_rect(
+        [
+            _widget_rect_in(action.btn_query_refine, action.query_footer_card),
+            _widget_rect_in(action.btn_scribble_accept, action.query_footer_card),
+            _widget_rect_in(action.btn_query_reject, action.query_footer_card),
+        ]
+    )
+    _annotate_image(
+        query_image,
+        out_path=out_dir / "step_04_review_suggestion.png",
+        title="Step 4. Review the suggestion",
+        subtitle="After you click Suggest Query, the footer summarizes the next lightweight boundary or label question.",
+        callouts=[
+            GuideCallout(
+                5,
+                "Read the suggested boundary or label target here before you edit anything.",
+                hint_target,
+                _left_bubble(14, width=320),
+            ),
+            GuideCallout(
+                6,
+                "Accept and Reject are here in the bottom-right action area.",
+                button_target,
+                _right_bubble(query_image.width(), 18),
+            ),
+        ],
+        embed_text=False,
     )
 
     action.enter_scribble_mode()
@@ -379,68 +572,44 @@ def main() -> int:
     row_h = row.height()
     stroke_target = QRect(max(0, stroke_x1 - 18), 10, max(44, stroke_x2 - stroke_x1 + 36), max(28, row_h - 20))
     boundary_target = QRect(max(0, boundary_x - 9), 0, 18, row_h)
-    _annotate_image(
-        row_image,
-        out_path=out_dir / "step_03_draw_and_refine.png",
-        title="Step 3. Draw one uncertain scribble",
-        subtitle="The first stroke proposes a split. If the split is slightly off, drag the red line directly instead of starting over.",
-        callouts=[
-            GuideCallout(
-                4,
-                "Draw one freehand uncertain stroke across the suspicious split.",
-                stroke_target,
-                QRect(18, 6, 330, 58),
-            ),
-            GuideCallout(
-                5,
-                "If the split is close but not exact, drag the red proposal line to the better frame.",
-                boundary_target,
-                QRect(max(380, boundary_x + 24), 8, 360, 58),
-            ),
-        ],
-    )
-
-    ctrl_parent = action.btn_scribble_accept.parentWidget()
-    if ctrl_parent is None:
-        raise SystemExit("Could not locate the interaction controls container.")
-    ctrl_image_full = ctrl_parent.grab().toImage()
-    interaction_rect = action.combo_interaction.geometry()
-    status_rect = action.lbl_interaction_status.geometry()
-    ctrl_crop = _clip_rect(
-        QRect(
-            max(0, interaction_rect.x() - 48),
-            0,
-            min(ctrl_image_full.width(), status_rect.right() + 24) - max(0, interaction_rect.x() - 48),
-            ctrl_image_full.height(),
-        ),
-        ctrl_image_full.width(),
-        ctrl_image_full.height(),
-    )
-    ctrl_image = _crop_image(ctrl_image_full, ctrl_crop)
-    accept_rect = action.btn_scribble_accept.geometry().translated(-ctrl_crop.x(), -ctrl_crop.y())
-    row_again = row.grab().toImage()
-    composite, row_offset = _stack_images(ctrl_image, row_again, gap=18)
-    delete_target = QRect(max(0, stroke_x1 - 16), row_offset + 10, max(40, stroke_x2 - stroke_x1 + 32), max(28, row_h - 20))
-    accept_target = accept_rect.adjusted(-4, -2, 4, 2)
+    footer_image = action.query_footer_card.grab().toImage()
+    composite, footer_origin, row_origin = _stack_images(footer_image, row_image, gap=18)
+    accept_target = _widget_rect_in(
+        action.btn_scribble_accept, action.query_footer_card
+    ).adjusted(-4, -2, 4, 2)
+    refine_target = _widget_rect_in(
+        action.btn_query_refine, action.query_footer_card
+    ).adjusted(-4, -2, 4, 2)
+    accept_target = accept_target.translated(footer_origin.x(), footer_origin.y())
+    refine_target = refine_target.translated(footer_origin.x(), footer_origin.y())
+    stroke_target = stroke_target.translated(row_origin.x(), row_origin.y())
+    boundary_target = boundary_target.translated(row_origin.x(), row_origin.y())
     _annotate_image(
         composite,
-        out_path=out_dir / "step_04_accept_and_cleanup.png",
-        title="Step 4. Accept, then keep moving",
-        subtitle="Accept writes the split back to the sequence. Right-click still removes a stroke or marker if you want to undo the local idea.",
+        out_path=out_dir / "step_05_refine_and_accept.png",
+        title="Step 5. Refine the boundary and accept",
+        subtitle="Draw one uncertain stroke across the suspicious split. If the proposal is close, drag the red line and accept the suggestion.",
         callouts=[
             GuideCallout(
-                6,
-                "Click Accept Proposal to commit the current split and continue to the next boundary.",
-                accept_target,
-                QRect(20, 44, 360, 58),
+                7,
+                "Start with one uncertain stroke across the suspicious boundary region.",
+                stroke_target,
+                _left_bubble(row_origin.y() + 8, width=320),
             ),
             GuideCallout(
-                7,
-                "Right-click a stroke or marker to delete it without leaving scribble mode.",
-                delete_target,
-                QRect(max(450, stroke_x2 + 40), row_offset + 10, 330, 58),
+                8,
+                "If the split is slightly off, drag the red proposal line before accepting it.",
+                boundary_target,
+                _right_bubble(composite.width(), row_origin.y() + 10, width=320),
+            ),
+            GuideCallout(
+                9,
+                "Use Start Scribble here for local refinement, then Accept in the bottom-right to write it back.",
+                _union_rect([accept_target, refine_target]),
+                _right_bubble(composite.width(), 14, width=320),
             ),
         ],
+        embed_text=False,
     )
 
     print(f"[quick_start] wrote annotated screenshots to {out_dir}")

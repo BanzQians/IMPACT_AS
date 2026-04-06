@@ -191,6 +191,11 @@ class MainWindow(QWidget):
             dlg = QuickStartDialog(self)
             dlg.destroyed.connect(lambda *_: setattr(self, "_quick_start_dialog", None))
             self._quick_start_dialog = dlg
+        try:
+            if dlg.windowState() & Qt.WindowMinimized:
+                dlg.showNormal()
+        except Exception:
+            pass
         dlg.show()
         try:
             dlg.raise_()

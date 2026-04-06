@@ -5,7 +5,6 @@ from typing import List, Tuple
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -37,25 +36,31 @@ class _GuideImageLabel(QLabel):
         self._last_target_width = -1
         self.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         self.setScaledContents(False)
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMinimumHeight(120)
         self._refresh_scaled()
 
     def _available_width(self) -> int:
         widget = self.parentWidget()
         while widget is not None:
-            try:
-                width = int(widget.contentsRect().width())
-            except Exception:
-                width = 0
-            if width > 80:
-                return width
+            if isinstance(widget, QScrollArea):
+                try:
+                    viewport_width = int(widget.viewport().contentsRect().width())
+                    if viewport_width > 80:
+                        return max(0, viewport_width - 24)
+                except Exception:
+                    pass
             widget = widget.parentWidget()
         try:
             width = int(self.contentsRect().width())
         except Exception:
             width = 0
-        return width
+        if width <= 80 and self.parentWidget() is not None:
+            try:
+                width = int(self.parentWidget().contentsRect().width())
+            except Exception:
+                width = 0
+        return max(0, width - 12)
 
     def _refresh_scaled(self) -> None:
         if self._source.isNull():
@@ -64,8 +69,9 @@ class _GuideImageLabel(QLabel):
             return
         available_width = max(0, self._available_width())
         if available_width <= 0:
-            available_width = min(int(self._source.width()), 920)
-        width = max(320, min(int(self._source.width()), available_width))
+            available_width = min(int(self._source.width()), 960)
+        max_upscale_width = max(1280, int(round(self._source.width() * 2.2)))
+        width = max(320, min(int(available_width), max_upscale_width))
         if width == self._last_target_width and self.pixmap() is not None:
             return
         scaled = self._source.scaledToWidth(width, Qt.SmoothTransformation)
@@ -83,6 +89,7 @@ class _GuideStepCard(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.NoFrame)
         self.setObjectName("quickStartCard")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
@@ -114,8 +121,8 @@ class _GuideStepCard(QFrame):
         layout.addWidget(self.image, 1)
 
 
-class QuickStartDialog(QDialog):
-    """Modeless in-app quick start viewer with separate text and screenshots."""
+class QuickStartDialog(QWidget):
+    """Standalone quick start window with separate text and screenshots."""
 
     _STEPS: List[QuickStartStep] = [
         QuickStartStep(
@@ -165,10 +172,22 @@ class QuickStartDialog(QDialog):
     ]
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        owner = parent.window() if parent is not None else None
+        super().__init__(None)
+        self._owner = owner
         self.setWindowTitle("IMPACT-Scribe Quick Start")
+        self.setWindowFlag(Qt.Window, True)
+        self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, True)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setMinimumSize(960, 720)
         self.resize(1220, 900)
         self._guide_images: List[_GuideImageLabel] = []
+        if self._owner is not None:
+            try:
+                self._owner.destroyed.connect(self.close)
+            except Exception:
+                pass
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)

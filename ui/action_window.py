@@ -1,6 +1,5 @@
 from typing import List, Dict, Tuple, Optional, Any, Set, Callable, Iterable, Sequence
 from collections import Counter
-from bisect import bisect_left, bisect_right
 from PyQt5.QtWidgets import (
     QHBoxLayout,
     QPushButton,
@@ -3601,8 +3600,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         end = int(frame_end)
         if end < start:
             start, end = end, start
-        left = bisect_left(frame_map, start)
-        right = bisect_right(frame_map, end) - 1
+        left = bisect.bisect_left(frame_map, start)
+        right = bisect.bisect_right(frame_map, end) - 1
         if 0 <= left <= right < len(frame_map):
             return int(left), int(right)
         if left >= len(frame_map):

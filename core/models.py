@@ -175,8 +175,6 @@ class AnnotationStore:
             return
         # ensure target list exists
         lst = self.label_to_frames.setdefault(new, [])
-        import bisect
-
         for f in frames:
             # update the reverse map
             self.frame_to_label[f] = new

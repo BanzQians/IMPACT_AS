@@ -46,6 +46,8 @@ class BackgroundRefinerTrainer(QThread):
         window_radius: int = 24,
         hidden_dim: int = 128,
         dropout: float = 0.1,
+        boundary_loss_weight: float = 1.0,
+        label_loss_weight: float = 1.0,
         state_loss_weight: float = 0.5,
         consistency_loss_weight: float = 0.3,
         action_loss_weight: float = 0.0,
@@ -67,6 +69,8 @@ class BackgroundRefinerTrainer(QThread):
         self.window_radius = max(1, int(window_radius))
         self.hidden_dim = max(16, int(hidden_dim))
         self.dropout = max(0.0, float(dropout))
+        self.boundary_loss_weight = max(0.0, float(boundary_loss_weight))
+        self.label_loss_weight = max(0.0, float(label_loss_weight))
         self.state_loss_weight = max(0.0, float(state_loss_weight))
         self.consistency_loss_weight = max(0.0, float(consistency_loss_weight))
         self.action_loss_weight = max(0.0, float(action_loss_weight))
@@ -126,6 +130,8 @@ class BackgroundRefinerTrainer(QThread):
         input_dim = 0
         hidden_dim = int(self.hidden_dim)
         dropout = float(self.dropout)
+        boundary_weight = float(self.boundary_loss_weight)
+        label_weight = float(self.label_loss_weight)
         action_weight = float(self.action_loss_weight)
         struct_weight = float(self.struct_loss_weight)
         query_weight = float(self.query_loss_weight)
@@ -137,6 +143,8 @@ class BackgroundRefinerTrainer(QThread):
             input_dim = int(ckpt.get("input_dim", 0))
             hidden_dim = int(ckpt.get("hidden_dim", hidden_dim) or hidden_dim)
             dropout = float(ckpt.get("dropout", dropout) or dropout)
+            boundary_weight = float(ckpt.get("boundary_loss_weight", boundary_weight) or boundary_weight)
+            label_weight = float(ckpt.get("label_loss_weight", label_weight) or label_weight)
             action_weight = float(ckpt.get("action_loss_weight", action_weight) or 0.0)
             struct_weight = float(ckpt.get("struct_loss_weight", struct_weight) or 0.0)
             query_weight = float(ckpt.get("query_loss_weight", query_weight) or 0.0)
@@ -332,7 +340,9 @@ class BackgroundRefinerTrainer(QThread):
                     "side_valid": t_side_valid[idx],
                     "action_valid": t_action_valid[idx],
                 }
-                loss = _compute_boundary_loss(out, batch, criterion, device) + _compute_side_loss(
+                loss = float(boundary_weight) * _compute_boundary_loss(
+                    out, batch, criterion, device
+                ) + float(label_weight) * _compute_side_loss(
                     out, batch, criterion, device
                 )
                 if num_states > 0 and left_states:
@@ -413,6 +423,8 @@ class BackgroundRefinerTrainer(QThread):
         new_ckpt["input_dim"] = int(input_dim)
         new_ckpt["hidden_dim"] = int(hidden_dim)
         new_ckpt["dropout"] = float(dropout)
+        new_ckpt["boundary_loss_weight"] = float(boundary_weight)
+        new_ckpt["label_loss_weight"] = float(label_weight)
         new_ckpt["action_loss_weight"] = float(action_weight)
         new_ckpt["struct_loss_weight"] = float(struct_weight)
         new_ckpt["query_loss_weight"] = float(query_weight)

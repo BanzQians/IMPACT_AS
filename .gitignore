@@ -12,7 +12,9 @@ tmp_*
 
 # Data / experiments
 test_data/
-external/
+
+# External: large model caches (keep action_seg_ot tracked)
+external/huggingface/
 
 # OS
 .DS_Store
@@ -23,7 +25,6 @@ __pycache__/
 
 # ===== Local data / outputs =====
 .cvhci_local/
-external/
 test_data/
 e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002/
 e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002.tar.gz
@@ -32,6 +33,14 @@ e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002.tar.gz
 *.pt
 *.pth
 *.ckpt
+
+# Exception: ASOT weights needed for pre-labeling
+!external/action_seg_ot/weights/*.pth
+!external/action_seg_ot/weights/*.ckpt
+!external/pytorch-i3d/models/*.pt
+
+# Exception: starter checkpoint for local refiner cold start
+!configs/models/starter_local_refiner.pt
 *.avi
 *.mp4
 *.log

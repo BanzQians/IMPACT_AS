@@ -838,7 +838,9 @@ def _compute_trace_conflict_penalty(
         else state_after
     )
     seq_len = int(out["boundary_logits"].shape[1])
-    penalties: List[float] = []
+    # Compute per-sample severity weights (detached, from rule-based analysis),
+    # then multiply with differentiable model outputs so gradients flow back.
+    severity_weights = torch.zeros(int(valid.shape[0]), device=device)
     right_label = batch.get("right_label")
 
     for idx in torch.nonzero(valid, as_tuple=False).view(-1).tolist():
@@ -881,10 +883,33 @@ def _compute_trace_conflict_penalty(
             severity += 0.35
         if right_state_i != int(s_after):
             severity += 0.35
-        penalties.append(float(min(2.0, severity)))
-    if not penalties:
+        severity_weights[idx] = float(min(2.0, severity))
+
+    if not valid.any() or float(severity_weights[valid].sum().item()) <= 0.0:
         return torch.tensor(0.0, device=device)
-    return torch.tensor(float(sum(penalties) / len(penalties)), device=device)
+
+    # Attach gradients: use boundary_logits entropy as differentiable proxy.
+    # Samples with high severity are penalised more — the model is encouraged
+    # to sharpen its boundary prediction and reduce state conflicts.
+    boundary_log_probs = torch.log_softmax(out["boundary_logits"], dim=1)
+    boundary_probs = torch.softmax(out["boundary_logits"], dim=1)
+    entropy = -(boundary_probs * boundary_log_probs).sum(dim=1)  # (B,)
+
+    # Also penalise state-head confidence for conflicting predictions
+    state_penalty = torch.zeros_like(entropy)
+    if "left_state_logits" in out:
+        left_state_ce = torch.nn.functional.cross_entropy(
+            out["left_state_logits"], state_before.clamp(min=0), reduction="none"
+        )
+        state_penalty = state_penalty + left_state_ce
+    if "right_state_logits" in out:
+        right_state_ce = torch.nn.functional.cross_entropy(
+            out["right_state_logits"], state_after.clamp(min=0), reduction="none"
+        )
+        state_penalty = state_penalty + right_state_ce
+
+    per_sample = severity_weights * (entropy + state_penalty)
+    return per_sample[valid].mean()
 
 
 def _compute_consistency_loss(

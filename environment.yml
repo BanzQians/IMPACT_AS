@@ -16,5 +16,6 @@ dependencies:
       - opencv-python>=4.8.0.76,<4.12
       - torch
       - torchvision
+      - pytorch-lightning>=2.0.0
       - ultralytics>=8.0.0
       - mediapipe>=0.10.9

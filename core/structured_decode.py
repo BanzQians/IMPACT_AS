@@ -185,6 +185,7 @@ def decode_frame_labels_with_constraints(
     current_label_score: float = 1.0,
     alternate_label_score: float = 0.16,
     anchor_boost: float = 0.55,
+    anchor_context_frames: int = 3,
 ) -> Tuple[Dict[int, str], Dict[str, object]]:
     current = {
         int(frame): str(label)
@@ -268,7 +269,8 @@ def decode_frame_labels_with_constraints(
         boundary = item.boundary_frame
         if boundary is not None:
             b = int(boundary)
-            anchor_regions.append((max(int(s), b - 3), min(int(e), b + 3)))
+            acf = max(1, int(anchor_context_frames))
+            anchor_regions.append((max(int(s), b - acf), min(int(e), b + acf)))
         left = str(item.left_label or "").strip()
         right = str(item.right_label or "").strip()
         ctx = max(4, int(max(1, e - s + 1) * 0.35))

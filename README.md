@@ -1,28 +1,33 @@
 # IMPACT_AS
 
-IMPACT_AS is a PyQt5 desktop annotation tool for action segmentation and assembly-state review.
+IMPACT_AS (IMPACT-Scribe) is a PyQt5 desktop tool for interactive action segmentation review and assembly-state annotation. It combines machine-generated baselines with a query-driven correction loop that learns from every user interaction.
 
-## Current user-facing workflows
+## Key Features
 
-- Action Segmentation
-- Assembly State annotation and review (`PSR / ASR / ASD`)
+### Interactive Review
+- Multi-view video sessions (up to 5 synchronized cameras)
+- Coarse and fine action timelines with direct drag-to-annotate
+- ASOT-based pre-labeling for initial baseline segmentation
+- Query-driven review via `Suggest Query` with boundary and label suggestions
+- Temporal scribble interaction for boundary refinement
+- Structured decoding with configurable anchor context
 
-The current main window no longer exposes the older Transcript or HOI workspaces. The repository now focuses on the action-segmentation workbench and the assembly-state workflow built on top of it.
+### Three-Layer Correction Learning
+The system improves continuously as the user corrects the segmentation:
 
-## Action Segmentation in this version
+1. **Immediate** — Label prototype store: online running-mean embeddings per label with cosine-similarity scoring. Updated on every segment confirmation.
+2. **Periodic** — LoRA local refiner (`tools/train_local_refiner.py`): lightweight boundary model fine-tuned on accumulated scribble corrections. Supports 8 loss components: boundary, side, consistency, action, query utility, trace conflict, structured, and L2 regularization.
+3. **Offline** — Stage C distillation (`tools/distill_global_model.py`): global model fine-tuning using confirmed pseudo-labels and structured decode constraints.
 
-The current Action Segmentation workspace supports:
+### Query Utility Learning
+The query planner includes a `TrainableQueryUtilityModel` (numpy linear regression) that learns to predict which queries are most valuable based on correction outcomes. Trained via `tools/train_query_model.py`.
 
-- multi-view video sessions
-- coarse and fine action timelines
-- manual segmentation and boundary editing
-- ASOT-based pre-labeling for an initial baseline segmentation
-- query-driven review with `Suggest Query`
-- actionable `Label Review` suggestions with `Accept`, `Reject`, or manual label override
-- `Boundary Scribble` review, including direct boundary accept/reject or scribble-based refinement
-- optional validation logs and operation logs
+### Escape Labels
+Three reserved labels — **Unknown**, **Other**, **Background** — are always available in the label palette. They are excluded from query scoring and handled specially in structured decode, allowing users to mark uncertain segments without affecting the learning loop.
 
-This repository also includes the current IMPACT-Scribe-oriented interaction modules under `core/` and `ui/`, such as query planning, temporal scribble handling, structured decoding, and local boundary refinement.
+### Assembly State Review
+- PSR / ASR / ASD annotation workflows
+- State conflict detection integrated into query scoring
 
 ## Quick Start
 
@@ -56,36 +61,44 @@ Optional operation logging:
 
 If you only need the minimum pip package list, it remains available in `requirements.txt`.
 
-## Typical action-segmentation flow
+## Typical Workflow
 
 1. Open a video or session.
 2. Generate a baseline with `ASOT Pre-label`, or import an existing segment file.
-3. Use `Suggest Query` to step through lightweight review targets.
-4. Resolve `Label Review` items by accepting, rejecting, or choosing another label in the label panel.
-5. Resolve `Boundary` items by directly accepting/rejecting the proposed split, or entering `Boundary Scribble` to refine it.
-6. Save the updated annotation JSON and optional logs.
+3. Use `Suggest Query` to step through review targets ranked by utility.
+4. Resolve **Label Review** items by accepting, rejecting, or choosing another label.
+5. Resolve **Boundary** items by accepting/rejecting the proposed split, or entering `Boundary Scribble` to refine.
+6. The system updates label prototypes and accumulates training data after each correction.
+7. Periodically run LoRA fine-tuning for improved boundary predictions.
+8. Optionally run Stage C distillation for offline global model improvement.
+9. Save the updated annotation JSON and optional logs.
 
-## Quick Start guide in the UI
+## Project Structure
 
-The main window includes a `Quick Start` entry that opens the in-app guide for the current review workflow, including baseline generation, query suggestions, label review, and boundary scribble usage.
+- `app.py` — application entry point
+- `run.sh` — local launcher for the in-repo Conda environment
+- `ui/` — GUI windows, panels, dialogs, and timeline widgets
+- `core/` — query planning, scribble logic, structured decoding, background training, and state helpers
+  - `query_planner.py` — query scoring, utility model, escape label filtering
+  - `structured_decode.py` — constrained frame-label decoding with anchor context
+  - `background_trainer.py` — LoRA-based background refiner with configurable loss weights
+- `tools/` — training, feature extraction, baseline inference, and evaluation scripts
+  - `train_local_refiner.py` — local boundary model training (8 loss components)
+  - `train_query_model.py` — query utility model training from correction history
+  - `distill_global_model.py` — Stage C pseudo-label distillation
+- `utils/` — constants, escape label helpers, and shared utilities
+- `tests/` — unit tests for the learning module (90 tests)
+- `docs/` — design documents, user study guides, and workflow notes
 
-## Project structure
-
-- `app.py`: application entry point
-- `run.sh`: local launcher for the in-repo Conda environment
-- `ui/`: GUI windows, panels, dialogs, and timeline widgets
-- `core/`: query planning, scribble logic, structured decoding, and state helpers
-- `tools/`: feature extraction, baseline inference, conversion, repair, and evaluation scripts
-- `docs/`: project notes and workflow documentation
-
-## Outputs and logs
+## Outputs and Logs
 
 The tool can generate:
 
-- annotation JSON outputs
-- optional operation logs: `*.ops.log.csv`
-- validation summaries: `*.validation.log.txt`
-- imported or generated baseline segment files for review workflows
+- Annotation JSON outputs
+- Confirmed pseudo-label exports (per-frame labels + confirmed windows)
+- Optional operation logs: `*.ops.log.csv`
+- Validation summaries: `*.validation.log.txt`
+- LoRA checkpoints and query model snapshots
 
 ## License
 

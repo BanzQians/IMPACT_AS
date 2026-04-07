@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 _ESCAPE_LABELS = frozenset({"unknown", "other", "background"})
 
@@ -694,9 +697,20 @@ class TrainableQueryUtilityModel:
             b -= lr * grad_b
         self.weights = w
         self.bias = b
+        was_ready = self.ready
         self.ready = True
         preds = feats @ w + b
         mse = float(np.mean((preds - targets) ** 2))
+        if not was_ready:
+            _log.info(
+                "TrainableQueryUtilityModel now ready (n=%d, mse=%.4f)",
+                n, mse,
+            )
+        else:
+            _log.debug(
+                "TrainableQueryUtilityModel re-trained (n=%d, mse=%.4f)",
+                n, mse,
+            )
         return mse
 
     def snapshot(self) -> Dict[str, Any]:

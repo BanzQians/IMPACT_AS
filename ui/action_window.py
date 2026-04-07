@@ -15667,6 +15667,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             end=int(e),
             label=str(label_name),
         )
+        # Update label prototype from confirmed segment embedding
+        emb = self._segment_embedding_for_span(s, e)
+        if emb is not None:
+            self._update_label_prototype(label_name, emb)
         return True
 
     def _prompt_uncertainty_margin(self):
@@ -18295,6 +18299,21 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not auto_advanced:
             self._set_status(status_text)
             self._set_interaction_status(interaction_status)
+        # Update label prototypes for both sides of the confirmed boundary
+        try:
+            win_s = int(proposal.get("window_start", 0) or 0)
+            win_e = int(proposal.get("window_end", 0) or 0)
+            bf = int(frame_i)
+            if left_label and bf > win_s:
+                left_emb = self._segment_embedding_for_span(win_s, bf - 1)
+                if left_emb is not None:
+                    self._update_label_prototype(left_label, left_emb)
+            if right_label and win_e > bf:
+                right_emb = self._segment_embedding_for_span(bf, win_e)
+                if right_emb is not None:
+                    self._update_label_prototype(right_label, right_emb)
+        except Exception:
+            pass
         return True
 
     def _align_labels_to_manual_segments(self) -> bool:

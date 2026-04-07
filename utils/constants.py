@@ -44,6 +44,18 @@ def is_extra_label(name: str) -> bool:
     return txt in EXTRA_ALIASES or txt.lower() == "extra"
 
 
+# Escape labels: always-available labels for ambiguous or unlabelled regions (§21.10)
+RESERVED_ESCAPE_LABELS = ("Unknown", "Other", "Background")
+_ESCAPE_LOWER = frozenset(s.lower() for s in RESERVED_ESCAPE_LABELS)
+
+
+def is_escape_label(name: str) -> bool:
+    """Return True if *name* is one of the reserved escape labels."""
+    if name is None:
+        return False
+    return str(name).strip().lower() in _ESCAPE_LOWER
+
+
 def color_from_key(key: str) -> QColor:
     """Accept preset key or 'custom:#RRGGBB'."""
     if key.startswith("custom:"):

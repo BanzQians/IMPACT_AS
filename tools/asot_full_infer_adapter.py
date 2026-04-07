@@ -16,7 +16,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -124,21 +124,97 @@ def load_classes(path: Optional[str], num_classes: int) -> List[str]:
     return names[:num_classes]
 
 
+def _forward_backbone_repr(
+    model: VideoSSL,
+    seq_x: torch.Tensor,
+    *,
+    mode: str = "auto",
+) -> Tuple[torch.Tensor, str]:
+    requested = str(mode or "auto").strip().lower() or "auto"
+    if requested not in {"auto", "full", "mlp"}:
+        requested = "auto"
+    full_error: Optional[Exception] = None
+    if requested in {"auto", "full"}:
+        try:
+            reprs = model(seq_x)
+            while reprs.dim() > 3:
+                reprs = reprs.squeeze(0)
+            if reprs.dim() == 2:
+                reprs = reprs.unsqueeze(0)
+            if reprs.dim() != 3:
+                raise ValueError(f"unexpected ASOT forward output shape: {tuple(reprs.shape)}")
+            return reprs, "full"
+        except Exception as ex:
+            full_error = ex
+            if requested == "full":
+                raise
+    try:
+        base = seq_x.squeeze(0)
+        reprs = model.mlp(base) if hasattr(model, "mlp") else base
+        if reprs.dim() == 2:
+            reprs = reprs.unsqueeze(0)
+        if reprs.dim() != 3:
+            raise ValueError(f"unexpected MLP output shape: {tuple(reprs.shape)}")
+        return reprs, "mlp"
+    except Exception as ex:
+        if full_error is not None:
+            raise RuntimeError(
+                f"ASOT full forward failed ({full_error}) and MLP fallback failed ({ex})"
+            ) from ex
+        raise
+
+
+def _build_distill_head(meta: Dict[str, Any]) -> Optional[torch.nn.Module]:
+    state = meta.get("distill_head_state_dict")
+    if not isinstance(state, dict) or not state:
+        return None
+    first = state.get("0.weight")
+    last = state.get("2.weight")
+    if first is None or last is None or not hasattr(first, "shape") or not hasattr(last, "shape"):
+        return None
+    hidden_dim = int(first.shape[0])
+    input_dim = int(first.shape[1])
+    output_dim = int(last.shape[0])
+    head = torch.nn.Sequential(
+        torch.nn.Linear(input_dim, hidden_dim),
+        torch.nn.ReLU(inplace=True),
+        torch.nn.Linear(hidden_dim, output_dim),
+    )
+    head.load_state_dict(state, strict=False)
+    return head
+
+
 def build_model(ckpt_path: str) -> Tuple[VideoSSL, Dict]:
     obj = torch.load(ckpt_path, map_location="cpu")
     hp = extract_hparams(obj)
-    state = (
-        obj.get("state_dict") if isinstance(obj, dict) and "state_dict" in obj else obj
-    )
+    distill_meta: Dict[str, Any] = {}
+    if isinstance(obj, dict) and "base_hparams" in obj and not hp and isinstance(obj.get("base_hparams"), dict):
+        hp = dict(obj.get("base_hparams") or {})
+    if isinstance(obj, dict) and "model_state_dict" in obj:
+        state = obj.get("model_state_dict")
+    elif isinstance(obj, dict) and "state_dict" in obj:
+        state = obj.get("state_dict")
+    else:
+        state = obj
     if state is None or not isinstance(state, dict):
         state = {}
+    if isinstance(obj, dict) and "distill_head_state_dict" in obj:
+        distill_meta = {
+            "distill_head_state_dict": obj.get("distill_head_state_dict"),
+            "idx_to_label": obj.get("idx_to_label"),
+            "num_classes": obj.get("num_classes"),
+            "backbone_mode": obj.get("backbone_mode", "auto"),
+            "distill_input_dim": obj.get("distill_input_dim"),
+        }
 
     # Try Lightning's helper first.
-    try:
-        model = VideoSSL.load_from_checkpoint(ckpt_path)
-        return model, hp
-    except Exception:
-        pass
+    if not distill_meta:
+        try:
+            model = VideoSSL.load_from_checkpoint(ckpt_path)
+            setattr(model, "_distill_adapter_meta", distill_meta)
+            return model, hp
+        except Exception:
+            pass
 
     kwargs = {}
     if isinstance(hp, dict):
@@ -154,6 +230,7 @@ def build_model(ckpt_path: str) -> Tuple[VideoSSL, Dict]:
 
     model = VideoSSL(**kwargs)
     model.load_state_dict(state, strict=False)
+    setattr(model, "_distill_adapter_meta", distill_meta)
     return model, hp
 
 
@@ -259,95 +336,143 @@ def main():
         x = x.t().unsqueeze(0)  # B=1, D, T
     x = x.to(device)
 
+    distill_meta = getattr(model, "_distill_adapter_meta", {}) or {}
+    distill_head = _build_distill_head(distill_meta)
+    if distill_head is not None:
+        distill_head.to(device).eval()
+
     with torch.no_grad():
-        soft = model(x)
-        while soft.dim() > 3:
-            soft = soft.squeeze(0)
-        if soft.dim() == 2:
-            soft = soft.unsqueeze(0)
-        probs = torch.softmax(soft, dim=-1)
-        pred_idx = probs.argmax(dim=-1).squeeze(0).cpu().numpy()
+        if distill_head is not None:
+            backbone_repr, used_backbone_mode = _forward_backbone_repr(
+                model,
+                x,
+                mode=str(distill_meta.get("backbone_mode", "auto")),
+            )
+            semantic_logits = distill_head(backbone_repr.squeeze(0))
+            probs = torch.softmax(semantic_logits, dim=-1)
+            pred_idx = probs.argmax(dim=-1).cpu().numpy()
+            semantic_mode = True
+        else:
+            soft = model(x)
+            while soft.dim() > 3:
+                soft = soft.squeeze(0)
+            if soft.dim() == 2:
+                soft = soft.unsqueeze(0)
+            probs = torch.softmax(soft, dim=-1)
+            pred_idx = probs.argmax(dim=-1).squeeze(0).cpu().numpy()
+            semantic_mode = False
+            used_backbone_mode = ""
 
     cluster_pred_idx = majority_smooth(pred_idx, k=args.smooth_k).astype(np.int32, copy=False)
     cluster_probs_np = probs.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # [T, C]
 
     # Determine number of classes from model clusters if present.
     num_classes = (
-        model.n_clusters
-        if hasattr(model, "n_clusters")
-        else int(hp.get("n_clusters", cluster_pred_idx.max() + 1))
-    )
-
-    # Prefer class_names provided by user; else try mapping.txt relative to features_dir; else default.
-    default_classes = os.path.join(ASOT_ROOT, "class_names.txt")
-    cand_map = [
-        os.path.join(features_dir, "..", "mapping", "mapping.txt"),
-        os.path.join(features_dir, "../..", "mapping", "mapping.txt"),
-    ]
-    if class_txt:
-        print(f"[INFO] Using class_names: {class_txt}")
-        classes = load_classes(class_txt, num_classes=num_classes)
-        class_bank_path = class_txt
-    else:
-        chosen = ""
-        for c in cand_map:
-            c = os.path.abspath(c)
-            if os.path.isfile(c):
-                chosen = c
-                break
-        if chosen:
-            print(f"[INFO] Using class_names: {chosen}")
-        else:
-            print(f"[INFO] Using default class_names: {default_classes}")
-        classes = load_classes(chosen or default_classes, num_classes=num_classes)
-        class_bank_path = chosen or default_classes
-
-    pred_idx = np.asarray(cluster_pred_idx, dtype=np.int32)
-    probs_np = np.asarray(cluster_probs_np, dtype=np.float32)
-    remap_path = resolve_asot_label_remap_path(
-        explicit_path=(args.label_remap_json or ""),
-        class_names_path=(class_bank_path or ""),
-        features_dir=features_dir,
-        repo_root=REPO_ROOT,
-    )
-    remap_meta: Dict[str, object] = {
-        "label_remap_applied": False,
-        "label_remap_path": "",
-        "label_remap_clusters_applied": 0,
-        "cluster_count": int(num_classes),
-        "semantic_class_count": int(len(classes)),
-    }
-    if remap_path:
-        semantic_classes = load_classes(class_bank_path, len(classes)) if class_bank_path else list(classes)
-        remap = load_asot_label_remap(
-            remap_path,
-            semantic_classes or classes,
-            num_clusters=num_classes,
+        int(distill_meta.get("num_classes", cluster_pred_idx.max() + 1))
+        if semantic_mode
+        else (
+            model.n_clusters
+            if hasattr(model, "n_clusters")
+            else int(hp.get("n_clusters", cluster_pred_idx.max() + 1))
         )
-        if remap:
-            classes = list(remap.get("semantic_classes") or semantic_classes or classes)
-            probs_np = aggregate_cluster_probs_to_semantic_probs(
-                cluster_probs_np,
-                remap.get("cluster_to_semantic_idx") or [],
-                len(classes),
+    )
+
+    if semantic_mode:
+        idx_to_label = (
+            dict(distill_meta.get("idx_to_label") or {})
+            if isinstance(distill_meta.get("idx_to_label"), dict)
+            else {}
+        )
+        classes = [
+            str(idx_to_label.get(idx, f"cls_{idx}") or f"cls_{idx}")
+            for idx in range(int(num_classes))
+        ]
+        class_bank_path = ""
+        print(
+            f"[INFO] Using distilled semantic head ({int(num_classes)} classes, backbone={used_backbone_mode})"
+        )
+        pred_idx = np.asarray(cluster_pred_idx, dtype=np.int32)
+        probs_np = np.asarray(cluster_probs_np, dtype=np.float32)
+        remap_meta: Dict[str, object] = {
+            "label_remap_applied": False,
+            "label_remap_path": "",
+            "label_remap_clusters_applied": 0,
+            "cluster_count": int(num_classes),
+            "semantic_class_count": int(len(classes)),
+            "distilled_semantic_head": True,
+            "backbone_mode": str(used_backbone_mode or distill_meta.get("backbone_mode", "auto")),
+        }
+    else:
+        # Prefer class_names provided by user; else try mapping.txt relative to features_dir; else default.
+        default_classes = os.path.join(ASOT_ROOT, "class_names.txt")
+        cand_map = [
+            os.path.join(features_dir, "..", "mapping", "mapping.txt"),
+            os.path.join(features_dir, "../..", "mapping", "mapping.txt"),
+        ]
+        if class_txt:
+            print(f"[INFO] Using class_names: {class_txt}")
+            classes = load_classes(class_txt, num_classes=num_classes)
+            class_bank_path = class_txt
+        else:
+            chosen = ""
+            for c in cand_map:
+                c = os.path.abspath(c)
+                if os.path.isfile(c):
+                    chosen = c
+                    break
+            if chosen:
+                print(f"[INFO] Using class_names: {chosen}")
+            else:
+                print(f"[INFO] Using default class_names: {default_classes}")
+            classes = load_classes(chosen or default_classes, num_classes=num_classes)
+            class_bank_path = chosen or default_classes
+
+        pred_idx = np.asarray(cluster_pred_idx, dtype=np.int32)
+        probs_np = np.asarray(cluster_probs_np, dtype=np.float32)
+        remap_path = resolve_asot_label_remap_path(
+            explicit_path=(args.label_remap_json or ""),
+            class_names_path=(class_bank_path or ""),
+            features_dir=features_dir,
+            repo_root=REPO_ROOT,
+        )
+        remap_meta = {
+            "label_remap_applied": False,
+            "label_remap_path": "",
+            "label_remap_clusters_applied": 0,
+            "cluster_count": int(num_classes),
+            "semantic_class_count": int(len(classes)),
+        }
+        if remap_path:
+            semantic_classes = load_classes(class_bank_path, len(classes)) if class_bank_path else list(classes)
+            remap = load_asot_label_remap(
+                remap_path,
+                semantic_classes or classes,
+                num_clusters=num_classes,
             )
-            pred_idx = remap_cluster_ids_to_semantic_ids(
-                cluster_pred_idx,
-                remap.get("cluster_to_semantic_idx") or [],
-                len(classes),
-            )
-            remap_meta = {
-                "label_remap_applied": True,
-                "label_remap_path": str(remap.get("path") or remap_path),
-                "label_remap_clusters_applied": int(remap.get("clusters_applied", 0) or 0),
-                "cluster_count": int(num_classes),
-                "semantic_class_count": int(len(classes)),
-            }
-            print(
-                "[INFO] Applied ASOT label remap: "
-                f"{os.path.basename(str(remap_meta['label_remap_path']))} "
-                f"({int(remap_meta['label_remap_clusters_applied'])} mapped clusters)"
-            )
+            if remap:
+                classes = list(remap.get("semantic_classes") or semantic_classes or classes)
+                probs_np = aggregate_cluster_probs_to_semantic_probs(
+                    cluster_probs_np,
+                    remap.get("cluster_to_semantic_idx") or [],
+                    len(classes),
+                )
+                pred_idx = remap_cluster_ids_to_semantic_ids(
+                    cluster_pred_idx,
+                    remap.get("cluster_to_semantic_idx") or [],
+                    len(classes),
+                )
+                remap_meta = {
+                    "label_remap_applied": True,
+                    "label_remap_path": str(remap.get("path") or remap_path),
+                    "label_remap_clusters_applied": int(remap.get("clusters_applied", 0) or 0),
+                    "cluster_count": int(num_classes),
+                    "semantic_class_count": int(len(classes)),
+                }
+                print(
+                    "[INFO] Applied ASOT label remap: "
+                    f"{os.path.basename(str(remap_meta['label_remap_path']))} "
+                    f"({int(remap_meta['label_remap_clusters_applied'])} mapped clusters)"
+                )
     if args.min_seg_len and int(args.min_seg_len) > 1:
         pred_idx = apply_min_seg_len(pred_idx, probs_np, int(args.min_seg_len))
 
@@ -371,8 +496,13 @@ def main():
             for i in topk_idx
         ]
 
+    aux_name = f"{args.out_prefix}_cluster_per_frame.npy"
+    aux_kind = "cluster"
+    if semantic_mode:
+        aux_name = f"{args.out_prefix}_semantic_per_frame.npy"
+        aux_kind = "semantic"
     np.save(
-        os.path.join(features_dir, f"{args.out_prefix}_cluster_per_frame.npy"),
+        os.path.join(features_dir, aux_name),
         np.asarray(cluster_pred_idx, dtype=np.int32),
     )
     np.save(os.path.join(features_dir, f"{args.out_prefix}_per_frame.npy"), pred_idx)
@@ -386,6 +516,8 @@ def main():
                 "segments": segments,
                 "classes": classes,
                 "meta": remap_meta,
+                "aux_per_frame_file": aux_name,
+                "aux_per_frame_kind": aux_kind,
             },
             f,
             ensure_ascii=False,

@@ -180,3 +180,71 @@ class ASOTInferWorker(QObject):
             self.done.emit("", "")
         finally:
             _write_worker_log(self.log_path, log_lines, self.progress.emit)
+
+
+class DistillGlobalWorker(QObject):
+    progress = pyqtSignal(str)
+    done = pyqtSignal(str)  # checkpoint path or ""
+
+    def __init__(
+        self,
+        pseudo_labels: str,
+        features_dir: str,
+        ckpt: str,
+        output: str,
+        *,
+        epochs: int = 10,
+        lr: float = 1e-4,
+        struct_loss_weight: float = 0.3,
+        tool_path: str = "distill_global_model.py",
+        extra_args=None,
+        log_path: Optional[str] = None,
+    ):
+        super().__init__()
+        self.pseudo_labels = str(pseudo_labels or "")
+        self.features_dir = str(features_dir or "")
+        self.ckpt = str(ckpt or "")
+        self.output = str(output or "")
+        self.epochs = max(1, int(epochs))
+        self.lr = float(lr)
+        self.struct_loss_weight = float(struct_loss_weight)
+        self.tool_path = str(tool_path or "distill_global_model.py")
+        self.extra_args = list(extra_args or [])
+        default_log_dir = os.path.dirname(self.output) or self.features_dir or ACTION_REPO_ROOT
+        self.log_path = log_path or os.path.join(default_log_dir, "distill_global_model.log")
+
+    def run(self):
+        log_lines = []
+        try:
+            cmd = build_runner_cmd(
+                repo_root=ACTION_REPO_ROOT,
+                profile="asot",
+                script_path=self.tool_path,
+                script_args=[
+                    "--pseudo_labels",
+                    self.pseudo_labels,
+                    "--features_dir",
+                    self.features_dir,
+                    "--ckpt",
+                    self.ckpt,
+                    "--output",
+                    self.output,
+                    "--epochs",
+                    str(self.epochs),
+                    "--lr",
+                    str(self.lr),
+                    "--struct_loss_weight",
+                    str(self.struct_loss_weight),
+                ],
+                python_executable=sys.executable,
+            )
+            if self.extra_args:
+                cmd += list(self.extra_args)
+            returncode, log_lines = _run_streaming_command(cmd, self.progress.emit)
+            ok = (returncode == 0) and bool(self.output) and os.path.isfile(self.output)
+            self.done.emit(self.output if ok else "")
+        except Exception as ex:
+            self.progress.emit(f"[ERROR] {ex}")
+            self.done.emit("")
+        finally:
+            _write_worker_log(self.log_path, log_lines, self.progress.emit)

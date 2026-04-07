@@ -133,6 +133,7 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
         self._device = None
         self._input_dim = 0
         self._window_radius = 0
+        self._num_states = 0
         self._idx_to_label: Dict[int, str] = {}
         self._load_error = ""
         self._load_checkpoint()
@@ -222,6 +223,37 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
             },
         )
 
+    def reload_checkpoint(self, checkpoint_path: Optional[str] = None) -> bool:
+        """Hot-reload a checkpoint (or LoRA overlay). Returns True on success."""
+        prev_state = {
+            "checkpoint_path": self.checkpoint_path,
+            "model": self._model,
+            "torch": self._torch,
+            "device": self._device,
+            "input_dim": self._input_dim,
+            "window_radius": self._window_radius,
+            "num_states": self._num_states,
+            "idx_to_label": dict(self._idx_to_label),
+            "load_error": self._load_error,
+        }
+        if checkpoint_path:
+            self.checkpoint_path = os.path.abspath(
+                os.path.expanduser(str(checkpoint_path).strip())
+            )
+        self._load_checkpoint()
+        if self.ready:
+            return True
+        self.checkpoint_path = prev_state["checkpoint_path"]
+        self._model = prev_state["model"]
+        self._torch = prev_state["torch"]
+        self._device = prev_state["device"]
+        self._input_dim = int(prev_state["input_dim"])
+        self._window_radius = int(prev_state["window_radius"])
+        self._num_states = int(prev_state["num_states"])
+        self._idx_to_label = dict(prev_state["idx_to_label"])
+        self._load_error = str(prev_state["load_error"] or "")
+        return False
+
     def _load_checkpoint(self) -> None:
         if not self.checkpoint_path or not os.path.isfile(self.checkpoint_path):
             self._load_error = f"checkpoint_not_found:{self.checkpoint_path}"
@@ -237,6 +269,11 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
             input_dim = int(ckpt.get("input_dim", 0) or 0)
             hidden_dim = int(ckpt.get("hidden_dim", 0) or 0)
             dropout = float(ckpt.get("dropout", 0.1) or 0.0)
+            num_states = int(ckpt.get("num_states", 0) or 0)
+            if num_states <= 0:
+                state_to_idx = ckpt.get("state_to_idx") or {}
+                if isinstance(state_to_idx, dict):
+                    num_states = len(state_to_idx)
             idx_to_label_raw = ckpt.get("idx_to_label") or {}
             if not isinstance(idx_to_label_raw, dict) or not idx_to_label_raw:
                 raise KeyError("checkpoint missing idx_to_label")
@@ -252,8 +289,17 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
                 len(idx_to_label),
                 int(hidden_dim),
                 float(dropout),
+                num_states=int(num_states),
             )
-            model.load_state_dict(state_dict, strict=True)
+            model.load_state_dict(state_dict, strict=False)
+            # Apply LoRA overlay if present in checkpoint
+            lora_sd = ckpt.get("lora_state_dict")
+            lora_rank = int(ckpt.get("lora_rank", 0) or 0)
+            if isinstance(lora_sd, dict) and lora_sd and lora_rank > 0:
+                lora_alpha = float(ckpt.get("lora_alpha", 1.0) or 1.0)
+                inject_lora(model, rank=lora_rank, alpha=lora_alpha)
+                load_lora_state_dict(model, lora_sd)
+                merge_lora(model)
             device = _resolve_torch_device(torch, self.device_request)
             model.to(device)
             model.eval()
@@ -262,12 +308,14 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
             self._model = model
             self._input_dim = int(input_dim)
             self._window_radius = int(ckpt.get("window_radius", 0) or 0)
+            self._num_states = int(num_states)
             self._idx_to_label = dict(idx_to_label)
             self._load_error = ""
         except Exception as ex:
             self._model = None
             self._torch = None
             self._device = None
+            self._num_states = 0
             self._load_error = f"{type(ex).__name__}:{ex}"
 
     def _build_model_inputs(
@@ -389,11 +437,139 @@ def _resolve_torch_device(torch: Any, requested: str):
     return torch.device(device_name)
 
 
+class LoRALinear:
+    """Low-Rank Adaptation wrapper for nn.Linear layers.
+
+    Injects trainable low-rank matrices A and B alongside a frozen base Linear,
+    so that the effective weight becomes  W + (B @ A) * scaling.
+    """
+
+    @staticmethod
+    def wrap(linear, rank: int = 4, alpha: float = 1.0):
+        """Replace *linear* (nn.Linear) in-place attributes, returning it."""
+        torch = _import_torch()
+        nn = torch.nn
+        in_f, out_f = linear.in_features, linear.out_features
+        rank = max(1, min(rank, min(in_f, out_f)))
+        scaling = alpha / rank
+
+        linear.lora_A = nn.Parameter(torch.zeros(rank, in_f))
+        linear.lora_B = nn.Parameter(torch.zeros(out_f, rank))
+        nn.init.kaiming_uniform_(linear.lora_A, a=5 ** 0.5)
+        # B starts at zero so initial output is unchanged
+        linear.lora_scaling = scaling
+        linear.lora_rank = rank
+
+        # freeze base weight
+        linear.weight.requires_grad_(False)
+        if linear.bias is not None:
+            linear.bias.requires_grad_(False)
+
+        # monkey-patch forward
+        _orig_forward = linear.forward
+
+        def _lora_forward(x, _base=_orig_forward, _lin=linear):
+            base_out = _base(x)
+            lora_out = (x @ _lin.lora_A.T) @ _lin.lora_B.T
+            return base_out + lora_out * _lin.lora_scaling
+
+        linear.forward = _lora_forward
+        linear._lora_orig_forward = _orig_forward
+        return linear
+
+    @staticmethod
+    def merge(linear):
+        """Fold LoRA weights into the base weight and remove LoRA params."""
+        if not hasattr(linear, "lora_A"):
+            return linear
+        torch = _import_torch()
+        with torch.no_grad():
+            delta = (linear.lora_B @ linear.lora_A) * linear.lora_scaling
+            linear.weight.add_(delta)
+        # restore original forward
+        if hasattr(linear, "_lora_orig_forward"):
+            linear.forward = linear._lora_orig_forward
+            del linear._lora_orig_forward
+        for attr in ("lora_A", "lora_B", "lora_scaling", "lora_rank"):
+            if hasattr(linear, attr):
+                delattr(linear, attr)
+        linear.weight.requires_grad_(True)
+        if linear.bias is not None:
+            linear.bias.requires_grad_(True)
+        return linear
+
+    @staticmethod
+    def has_lora(linear) -> bool:
+        return hasattr(linear, "lora_A") and hasattr(linear, "lora_B")
+
+
+def inject_lora(model, rank: int = 4, alpha: float = 1.0, target_modules: Optional[Sequence[str]] = None):
+    """Inject LoRA into all nn.Linear layers of *model* (or only named targets).
+
+    Returns list of (name, module) pairs that were wrapped.
+    """
+    torch = _import_torch()
+    nn = torch.nn
+    wrapped = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if LoRALinear.has_lora(module):
+            continue
+        if target_modules is not None:
+            leaf = name.rsplit(".", 1)[-1] if "." in name else name
+            if leaf not in target_modules and name not in target_modules:
+                continue
+        LoRALinear.wrap(module, rank=rank, alpha=alpha)
+        wrapped.append((name, module))
+    return wrapped
+
+
+def merge_lora(model):
+    """Merge all LoRA weights back into base weights across *model*."""
+    torch = _import_torch()
+    nn = torch.nn
+    merged = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and LoRALinear.has_lora(module):
+            LoRALinear.merge(module)
+            merged.append(name)
+    return merged
+
+
+def collect_lora_state_dict(model) -> Dict[str, Any]:
+    """Return a state dict containing only LoRA parameters."""
+    torch = _import_torch()
+    lora_sd = {}
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+            prefix = name + "." if name else ""
+            lora_sd[prefix + "lora_A"] = module.lora_A.detach().cpu().clone()
+            lora_sd[prefix + "lora_B"] = module.lora_B.detach().cpu().clone()
+    return lora_sd
+
+
+def load_lora_state_dict(model, lora_sd: Dict[str, Any]) -> int:
+    """Load LoRA parameters from a state dict into an already-injected model."""
+    torch = _import_torch()
+    loaded = 0
+    for name, module in model.named_modules():
+        prefix = name + "." if name else ""
+        key_a = prefix + "lora_A"
+        key_b = prefix + "lora_B"
+        if key_a in lora_sd and key_b in lora_sd and hasattr(module, "lora_A"):
+            module.lora_A.data.copy_(lora_sd[key_a])
+            module.lora_B.data.copy_(lora_sd[key_b])
+            loaded += 1
+    return loaded
+
+
 def _build_tiny_local_boundary_model(
     input_dim: int,
     num_classes: int,
     hidden_dim: int,
     dropout: float,
+    num_states: int = 0,
 ):
     torch = _import_torch()
     nn = torch.nn
@@ -420,6 +596,18 @@ def _build_tiny_local_boundary_model(
                 nn.ReLU(inplace=True),
                 nn.Linear(int(hidden_dim), int(num_classes)),
             )
+            self.num_states = int(num_states)
+            if self.num_states > 0:
+                self.left_state_head = nn.Sequential(
+                    nn.Linear(ctx_dim, int(hidden_dim)),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(int(hidden_dim), int(self.num_states)),
+                )
+                self.right_state_head = nn.Sequential(
+                    nn.Linear(ctx_dim, int(hidden_dim)),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(int(hidden_dim), int(self.num_states)),
+                )
 
         @staticmethod
         def _masked_mean(
@@ -461,10 +649,14 @@ def _build_tiny_local_boundary_model(
             context = torch.cat(
                 [left_pool, right_pool, uncertain_pool, global_pool], dim=1
             )
-            return {
+            out = {
                 "boundary_logits": boundary_logits,
                 "left_logits": self.left_head(context),
                 "right_logits": self.right_head(context),
             }
+            if self.num_states > 0:
+                out["left_state_logits"] = self.left_state_head(context)
+                out["right_state_logits"] = self.right_state_head(context)
+            return out
 
     return TinyLocalBoundaryModel()

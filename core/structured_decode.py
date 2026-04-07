@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
+_RESERVED_ESCAPE_LABELS = ("Unknown", "Other", "Background")
+_ESCAPE_LABELS = frozenset(label.lower() for label in _RESERVED_ESCAPE_LABELS)
+
 
 @dataclass
 class ConfirmedWindow:
@@ -106,11 +109,23 @@ def count_anchor_violations(
 def _dedup_labels(labels: Iterable[str]) -> List[str]:
     out: List[str] = []
     seen = set()
+    seen_escape = set()
     for raw in labels or []:
         label = str(raw or "").strip()
-        if not label or label in seen:
+        if not label:
+            continue
+        lower = label.lower()
+        if lower in _ESCAPE_LABELS:
+            seen_escape.add(lower)
+            continue
+        if label in seen:
             continue
         seen.add(label)
+        out.append(label)
+    for label in _RESERVED_ESCAPE_LABELS:
+        lower = label.lower()
+        if lower not in seen_escape:
+            seen_escape.add(lower)
         out.append(label)
     return out
 

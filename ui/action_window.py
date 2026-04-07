@@ -53,6 +53,7 @@ from ui.timeline import TimelineArea
 from ui.entities_panel import EntitiesPanel
 from ui.action_workers import (
     ASOTInferWorker,
+    DistillGlobalWorker,
     FeatureExtractWorker,
     load_feature_extractor_module,
 )
@@ -69,6 +70,8 @@ from utils.constants import (
     EXTRA_LABEL_NAME,
     EXTRA_ALIASES,
     is_extra_label,
+    is_escape_label,
+    RESERVED_ESCAPE_LABELS,
     SNAP_RADIUS_FRAMES,
     EDGE_SNAP_FRAMES,
     CURRENT_FRAME_SNAP_RADIUS_FRAMES,
@@ -115,7 +118,12 @@ from core.psr_state import (
 )
 from core.label_text_bank import ensure_label_text_bank, load_label_text_bank_map
 from core.procedure_trace import analyze_trace_conflicts
-from core.action_corrections import CorrectionBuffer
+from core.action_corrections import (
+    AdaptationSample,
+    AdaptationSampleBuffer,
+    CorrectionBuffer,
+)
+from core.background_trainer import BackgroundRefinerTrainer
 from core.temporal_scribble import (
     ScribbleKind,
     TemporalScribble,
@@ -137,6 +145,8 @@ from core.query_planner import (
     QueryUtilityModel,
     ProposalConfidenceCalibrator,
     choose_query,
+    estimate_observed_query_utility,
+    observed_query_utility_from_summary,
     score_candidate,
     summarize_correction_observation,
 )
@@ -171,6 +181,17 @@ except Exception:
     sip = None
 import numpy as np
 from utils.op_logger import OperationLogger
+
+
+def _default_local_refiner_checkpoint_candidates(repo_root: str) -> List[str]:
+    root = os.path.abspath(
+        os.path.expanduser(str(repo_root or os.path.join(os.path.dirname(__file__), "..")))
+    )
+    return [
+        os.path.join(root, "configs", "models", "starter_local_refiner.pt"),
+        os.path.join(root, "configs", "models", "local_refiner_starter.pt"),
+        os.path.join(root, "configs", "models", "impact_scribe_local_refiner.pt"),
+    ]
 
 # ----- Fine mode extras (phase/anomaly/verb-noun vocab) -----
 PHASE_LABEL_DEFS = [
@@ -293,6 +314,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._action_label_bank_source: str = ""
         self._correction_buffer = CorrectionBuffer()
+        self._adaptation_buffer = AdaptationSampleBuffer(max_size=200)
+        self._background_refiner_trainer: Optional[BackgroundRefinerTrainer] = None
+        self._background_refiner_used_samples: int = 0
+        self._background_refiner_context_key: str = ""
+        self._distill_thread: Optional[QThread] = None
+        self._distill_worker: Optional[DistillGlobalWorker] = None
+        self._distill_temp_pseudo_paths: List[str] = []
         self._confirmed_correction_records: List[Dict[str, Any]] = []
         self._pending_finalized_records: List[Dict[str, Any]] = []
         self.op_logger = logger or OperationLogger(False)
@@ -555,6 +583,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Export JSON...",
                     "Export JSON (selected views to folders)...",
                     "Export to Seed Dataset...",
+                    "Export Confirmed Pseudo Labels...",
+                    "Distill Global Model...",
                 ],
             ),
             (
@@ -587,6 +617,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 [
                     "Import Review Log...",
                     "Open Review Panel",
+                    "Train Query Utility Model...",
                 ],
             ),
         ]
@@ -2417,6 +2448,227 @@ class ActionWindow(FrameControlMixin, QWidget):
             }
         return None
 
+    def _confirmed_boundary_frames_for_export(
+        self, records: Optional[Iterable[Dict[str, Any]]] = None
+    ) -> List[int]:
+        rows = (
+            list(records)
+            if records is not None
+            else list(self._rebuild_confirmed_correction_records_for_active_view())
+        )
+        frames: Set[int] = set()
+        for rec in rows:
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("point_type", "") or "").strip().lower() != "boundary":
+                continue
+            raw_frame = rec.get("boundary_frame")
+            if raw_frame is None:
+                continue
+            try:
+                frames.add(int(raw_frame))
+            except Exception:
+                continue
+        return sorted(frames)
+
+    def _confirmed_windows_for_export(
+        self,
+        *,
+        view: Dict[str, Any],
+        store: Optional[AnnotationStore],
+        view_start: int,
+        view_end: int,
+    ) -> List[Dict[str, Any]]:
+        records = list(self._rebuild_confirmed_correction_records_for_active_view())
+        windows: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("point_type", "") or "").strip().lower() != "label":
+                continue
+            label = str(rec.get("label", "") or "").strip()
+            if not label:
+                continue
+            try:
+                start = int(rec.get("feedback_start", 0) or 0)
+                end = int(rec.get("feedback_end", start) or start)
+            except Exception:
+                continue
+            if end < start:
+                start, end = end, start
+            start = max(int(view_start), start)
+            end = min(int(view_end), end)
+            if end < start:
+                continue
+            key = ("label", int(start), int(end), label)
+            if key in seen:
+                continue
+            seen.add(key)
+            windows.append(
+                {
+                    "start_frame": int(start),
+                    "end_frame": int(end),
+                    "boundary_frame": None,
+                    "left_label": label,
+                    "right_label": label,
+                }
+            )
+
+        if store is None:
+            return windows
+        segments = self._segments_for_correction_store(
+            store,
+            start=int(view_start),
+            end=int(view_end),
+            cut_frames=self._active_trim_cuts_for_descriptor({"kind": "store"}),
+        )
+        confirmed_frames = set(self._confirmed_boundary_frames_for_export(records))
+        if not confirmed_frames or len(segments) < 2:
+            return windows
+        for idx in range(len(segments) - 1):
+            left = dict(segments[idx] or {})
+            right = dict(segments[idx + 1] or {})
+            try:
+                boundary = int(right.get("start", left.get("end", 0)) or 0)
+                start = int(left.get("start", boundary) or boundary)
+                end = int(right.get("end", boundary) or boundary)
+            except Exception:
+                continue
+            if boundary not in confirmed_frames:
+                continue
+            left_label = str(left.get("label", "") or "").strip()
+            right_label = str(right.get("label", "") or "").strip()
+            if not left_label and not right_label:
+                continue
+            key = ("boundary", int(start), int(end), int(boundary), left_label, right_label)
+            if key in seen:
+                continue
+            seen.add(key)
+            windows.append(
+                {
+                    "start_frame": int(start),
+                    "end_frame": int(end),
+                    "boundary_frame": int(boundary),
+                    "left_label": left_label,
+                    "right_label": right_label,
+                }
+            )
+        return windows
+
+    def _confirmed_frame_labels_for_export(
+        self,
+        *,
+        confirmed_windows: Sequence[Dict[str, Any]],
+        view_start: int,
+        view_end: int,
+    ) -> List[Optional[str]]:
+        total = max(0, int(view_end) - int(view_start) + 1)
+        labels: List[Optional[str]] = [None] * total
+        for win in confirmed_windows or []:
+            if not isinstance(win, dict):
+                continue
+            try:
+                start = int(win.get("start_frame", 0) or 0)
+                end = int(win.get("end_frame", start) or start)
+            except Exception:
+                continue
+            if end < start:
+                start, end = end, start
+            start = max(int(view_start), start)
+            end = min(int(view_end), end)
+            if end < start:
+                continue
+            boundary = win.get("boundary_frame")
+            left_label = str(win.get("left_label", "") or "").strip()
+            right_label = str(win.get("right_label", "") or "").strip()
+            fill_label = left_label or right_label
+            if boundary is None:
+                if not fill_label:
+                    continue
+                for frame in range(int(start), int(end) + 1):
+                    labels[int(frame - view_start)] = str(fill_label)
+                continue
+            try:
+                boundary_i = int(boundary)
+            except Exception:
+                boundary_i = int(start)
+            boundary_i = max(int(start), min(int(boundary_i), int(end)))
+            if left_label:
+                for frame in range(int(start), int(boundary_i)):
+                    labels[int(frame - view_start)] = str(left_label)
+            if right_label:
+                for frame in range(int(boundary_i), int(end) + 1):
+                    labels[int(frame - view_start)] = str(right_label)
+        return labels
+
+    def _build_confirmed_pseudo_label_payload(
+        self,
+        *,
+        view: Dict[str, Any],
+        store: Optional[AnnotationStore],
+        view_start: int,
+        view_end: int,
+    ) -> Tuple[Optional[Dict[str, Any]], int, int]:
+        confirmed_windows = self._confirmed_windows_for_export(
+            view=view,
+            store=store,
+            view_start=int(view_start),
+            view_end=int(view_end),
+        )
+        per_frame_labels = self._confirmed_frame_labels_for_export(
+            confirmed_windows=confirmed_windows,
+            view_start=int(view_start),
+            view_end=int(view_end),
+        )
+        confirmed_frame_mask = [item is not None for item in per_frame_labels]
+        labelled = sum(1 for x in per_frame_labels if x is not None)
+        total = len(per_frame_labels)
+        if labelled == 0 and not confirmed_windows:
+            return None, 0, total
+        payload = {
+            "video_path": str(getattr(self, "video_path", "") or ""),
+            "view_start": int(view_start),
+            "view_end": int(view_end),
+            "per_frame_labels": per_frame_labels,
+            "confirmed_frame_mask": confirmed_frame_mask,
+            "confirmed_windows": confirmed_windows,
+            "export_scope": "confirmed_only",
+            "label_to_idx": {
+                name: idx
+                for idx, name in enumerate(
+                    [
+                        *sorted(
+                            {
+                                str(lbl)
+                                for lbl in per_frame_labels
+                                if lbl is not None and not is_escape_label(str(lbl))
+                            }
+                            | {
+                                str(win.get(key) or "").strip()
+                                for win in confirmed_windows
+                                for key in ("left_label", "right_label")
+                                if str(win.get(key) or "").strip()
+                                and not is_escape_label(str(win.get(key) or "").strip())
+                            }
+                            | {
+                                str(getattr(lb, "name", "") or "").strip()
+                                for lb in self.labels
+                                if str(getattr(lb, "name", "") or "").strip()
+                                and not is_extra_label(str(getattr(lb, "name", "") or "").strip())
+                                and not is_escape_label(str(getattr(lb, "name", "") or "").strip())
+                            }
+                        ),
+                        *[name for name in RESERVED_ESCAPE_LABELS],
+                    ]
+                )
+            },
+            "labelled_frames": int(labelled),
+            "total_frames": int(total),
+        }
+        return payload, int(labelled), int(total)
+
     def _correction_boundary_match_radius(self) -> int:
         try:
             radius = int(self._interaction_cfg.get("boundary", {}).get("window_size", 10))
@@ -2973,12 +3225,46 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _note_correction_step(self, count: int = 1) -> None:
         self._correction_buffer.note_step(count)
 
+    def _attach_query_candidate_meta(self, meta_update: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(meta_update, dict):
+            return {}
+        decision = getattr(self, "_last_query_decision", None)
+        if not isinstance(decision, QueryDecision):
+            return meta_update
+        candidate = decision.candidate
+        query_type = str(meta_update.get("query_type") or "").strip().lower()
+        if query_type and query_type != str(candidate.query_type.value):
+            return meta_update
+        start = int(meta_update.get("feedback_start", meta_update.get("frame", candidate.start_frame)) or candidate.start_frame)
+        end = int(meta_update.get("feedback_end", meta_update.get("frame", candidate.end_frame)) or candidate.end_frame)
+        if end < start:
+            start, end = end, start
+        overlaps = not (int(end) < int(candidate.start_frame) or int(start) > int(candidate.end_frame))
+        boundary_frame = meta_update.get("boundary_frame")
+        if boundary_frame is not None:
+            try:
+                frame_i = int(boundary_frame)
+                overlaps = overlaps or (int(candidate.start_frame) <= frame_i <= int(candidate.end_frame))
+            except Exception:
+                pass
+        if not overlaps:
+            return meta_update
+        meta_update.setdefault("score_terms", self._jsonify_data(dict(candidate.score_terms or {})))
+        meta_update.setdefault("estimated_cost", float(candidate.estimated_cost))
+        meta_update.setdefault(
+            "query_candidate_payload",
+            self._jsonify_data(dict(candidate.payload or {})),
+        )
+        meta_update.setdefault("query_candidate_id", str(candidate.query_id))
+        return meta_update
+
     def _commit_correction_session(self, **meta_update) -> Dict[str, Any]:
         records = self._rebuild_confirmed_correction_records_for_active_view()
         if meta_update:
             meta_update = dict(meta_update)
         else:
             meta_update = {}
+        meta_update = self._attach_query_candidate_meta(meta_update)
         meta_update["persisted"] = False
         summary = self._correction_buffer.commit(records=records, meta_update=meta_update)
         self._on_correction_session_finalized(summary)
@@ -3060,10 +3346,86 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._proposal_confidence_calibrator = ProposalConfidenceCalibrator()
         if not self._query_learning_enabled():
             return
+        model_path = os.path.abspath(
+            os.path.expanduser(
+                str(self._query_learning_cfg().get("utility_model_path", "") or "").strip()
+            )
+        )
+        if model_path and os.path.isfile(model_path):
+            try:
+                with open(model_path, "r", encoding="utf-8") as f:
+                    self._query_utility_model.load_snapshot(json.load(f))
+            except Exception:
+                pass
         for item in list(getattr(self._correction_buffer, "history", []) or []):
             if not isinstance(item, dict):
                 continue
             self._replay_correction_summary_into_learning(item)
+
+    def _default_query_model_output_path(self) -> str:
+        anchor = str(getattr(self, "current_annotation_path", "") or "").strip()
+        if not anchor and getattr(self, "video_path", None):
+            anchor = str(self.video_path or "").strip()
+        if anchor:
+            base_dir = os.path.dirname(os.path.abspath(anchor))
+            base_name = os.path.splitext(os.path.basename(anchor))[0] or "query_model"
+        else:
+            base_dir = os.path.abspath(os.getcwd())
+            base_name = str(self.current_video_id or "query_model").strip() or "query_model"
+        return os.path.join(base_dir, f"{base_name}.query_model.json")
+
+    def _train_query_utility_model(self) -> None:
+        history = [
+            dict(item)
+            for item in list(getattr(self._correction_buffer, "history", []) or [])
+            if isinstance(item, dict)
+        ]
+        if not history:
+            QMessageBox.information(self, "Info", "No correction history is available yet.")
+            return
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Query Utility Model",
+            self._default_query_model_output_path(),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not out_path:
+            return
+        model = QueryUtilityModel()
+        loaded = 0
+        for summary in history:
+            model.update_from_summary(summary)
+            loaded += 1
+        obs_count = len(getattr(model._linear_model, "_observations", []) or [])
+        if obs_count < 3:
+            QMessageBox.information(
+                self,
+                "Insufficient history",
+                "At least 3 valid correction observations are required to train the query utility model.",
+            )
+            return
+        try:
+            mse = float(model.fit(lr=0.01, epochs=50))
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(model.snapshot(), f, ensure_ascii=False, indent=2)
+        except Exception as ex:
+            QMessageBox.warning(self, "Error", f"Query utility training failed:\n{ex}")
+            return
+        learning_cfg = self._algo_cfg.setdefault("query_learning", {})
+        if isinstance(learning_cfg, dict):
+            learning_cfg["utility_model_path"] = os.path.abspath(out_path)
+        self._rebuild_query_learning_models_from_history()
+        self._set_status(
+            f"Query utility model saved: {os.path.basename(out_path)} "
+            f"(obs={obs_count}, mse={mse:.4f})"
+        )
+        self._log(
+            "train_query_utility_model",
+            path=os.path.abspath(out_path),
+            summaries=loaded,
+            observations=obs_count,
+            mse=float(mse),
+        )
 
     def _on_correction_session_finalized(
         self, summary: Optional[Dict[str, Any]]
@@ -3371,11 +3733,25 @@ class ActionWindow(FrameControlMixin, QWidget):
         target_label = str(label_name or "").strip()
         current_label = str(payload.get("current_label", "") or "").strip()
         suggested_label = str(payload.get("suggested_label", "") or "").strip()
+        start = int(payload.get("start_frame", 0) or 0)
+        end = int(payload.get("end_frame", start) or start)
+        if end < start:
+            start, end = end, start
         if not target_label:
             self._set_status("The selected label review suggestion is empty.")
             self._update_scribble_proposal_ui()
             return False
         if target_label == current_label:
+            accept_rec = self._build_accept_record_for_point(
+                {
+                    "type": "label",
+                    "start": int(start),
+                    "end": int(end),
+                    "label": str(current_label),
+                }
+            )
+            if accept_rec is not None:
+                self._store_explicit_confirm_record(accept_rec)
             self._record_label_review_feedback(
                 payload,
                 accepted=False,
@@ -3390,10 +3766,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
             self._set_interaction_status("Label Review: kept current label")
             return False
-        start = int(payload.get("start_frame", 0) or 0)
-        end = int(payload.get("end_frame", start) or start)
-        if end < start:
-            start, end = end, start
         self._begin_correction_session(
             "label_review",
             query_type=str(QueryType.LABEL_REVIEW.value),
@@ -5428,7 +5800,11 @@ class ActionWindow(FrameControlMixin, QWidget):
         return decision
 
     def _query_multiview_disagreement(self, start: int, end: int, *labels: str) -> float:
-        target = {str(label).strip() for label in labels if str(label).strip()}
+        target = {
+            str(label).strip()
+            for label in labels
+            if str(label).strip() and not is_escape_label(str(label).strip())
+        }
         if not target or not self._multiview_sync_active():
             return 0.0
         sample_frames = sorted({int(start), int((start + end) * 0.5), int(end)})
@@ -5443,7 +5819,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 continue
             for frame in sample_frames:
                 other_label = str(other_store.label_at(int(frame)) or "").strip()
-                if not other_label:
+                if not other_label or is_escape_label(other_label):
                     continue
                 values.append(0.0 if other_label in target else 1.0)
         if not values:
@@ -5488,11 +5864,17 @@ class ActionWindow(FrameControlMixin, QWidget):
         for idx in range(max(0, len(segments) - 1)):
             left = dict(segments[idx] or {})
             right = dict(segments[idx + 1] or {})
+            left_name = str(left.get("label", "") or "").strip()
+            right_name = str(right.get("label", "") or "").strip()
+            if (left_name and is_escape_label(left_name)) or (
+                right_name and is_escape_label(right_name)
+            ):
+                continue
             boundary_frame = int(right.get("start", left.get("end", 0)) or 0)
             query_score, terms = self._boundary_query_score(
                 frame=boundary_frame,
-                left_label=str(left.get("label", "") or ""),
-                right_label=str(right.get("label", "") or ""),
+                left_label=left_name,
+                right_label=right_name,
                 raw_score=self._boundary_energy_at_frame(boundary_frame),
             )
             start = max(view_start, int(boundary_frame - window_radius))
@@ -5511,11 +5893,12 @@ class ActionWindow(FrameControlMixin, QWidget):
                 score_terms={
                     "uncertainty": float(terms.get("uncertainty", query_score) or 0.0),
                     "disagreement": float(terms.get("confusion", 0.0) or 0.0),
+                    "energy": float(terms.get("energy", 0.0) or 0.0),
                     "multiview": self._query_multiview_disagreement(
                         start,
                         end,
-                        str(left.get("label", "") or ""),
-                        str(right.get("label", "") or ""),
+                        left_name,
+                        right_name,
                     ),
                     "state_conflict": 0.0,
                     "propagation_gain": float(
@@ -5528,9 +5911,13 @@ class ActionWindow(FrameControlMixin, QWidget):
                 estimated_cost=0.55,
                 payload={
                     "boundary_frame": int(boundary_frame),
-                    "left_label": str(left.get("label", "") or ""),
-                    "right_label": str(right.get("label", "") or ""),
+                    "left_label": left_name,
+                    "right_label": right_name,
                     "query_score": float(query_score),
+                    "contains_escape_label": bool(
+                        (left_name and is_escape_label(left_name))
+                        or (right_name and is_escape_label(right_name))
+                    ),
                 },
             )
             if self._query_candidate_recently_handled(candidate):
@@ -5539,6 +5926,8 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         for idx, seg in enumerate(segments):
             current_label = str(seg.get("label", "") or "").strip()
+            if is_escape_label(current_label):
+                continue
             span_start = int(seg.get("start", 0) or 0)
             span_end = int(seg.get("end", span_start) or span_start)
             label_candidates, source = self._label_candidates_with_source(seg)
@@ -5551,7 +5940,12 @@ class ActionWindow(FrameControlMixin, QWidget):
             seen_labels: Set[str] = set()
             for cand_name, cand_score in label_candidates:
                 name_txt = str(cand_name or "").strip()
-                if not name_txt or name_txt == current_label or name_txt in seen_labels:
+                if (
+                    not name_txt
+                    or name_txt == current_label
+                    or name_txt in seen_labels
+                    or is_escape_label(name_txt)
+                ):
                     continue
                 seen_labels.add(name_txt)
                 actionable_candidates.append((name_txt, cand_score))
@@ -6810,8 +7204,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "Export JSON...",
                 "Export JSON (selected views to folders)...",
                 "Export to Seed Dataset...",
+                "Export Confirmed Pseudo Labels...",
+                "Distill Global Model...",
                 "Import label map (TXT)...",
                 "Export label map (TXT)...",
+                "Train Query Utility Model...",
             }
         else:
             hidden = {
@@ -8460,6 +8857,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             return
         comp_id = id_map[key]
         self._psr_recompute_cache()
+        view_start, view_end = self._psr_view_range()
+        state_conflicts_before = self._count_state_conflicts_in_span(view_start, view_end)
         try:
             cur_frame = int(getattr(self.player, "current_frame", 0))
         except Exception:
@@ -8470,16 +8869,106 @@ class ActionWindow(FrameControlMixin, QWidget):
         restore_frame = None
         restore_state = None
         if scope == "all":
-            self._psr_apply_state_to_all_segments(comp_id, state_val)
+            start = int(view_start)
+            end = int(view_end)
+            old_label = ""
+            self._begin_correction_session(
+                "state_repair",
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                component_id=comp_id,
+                feedback_start=int(start),
+                feedback_end=int(end),
+                new_state=self._psr_state_label(state_val),
+                selection_scope="all",
+            )
+            changed_spans = self._psr_apply_state_to_all_segments(comp_id, state_val)
+            if not changed_spans:
+                self._discard_correction_session("state_noop")
+                return
+            changed_starts = [int(span_start) for span_start, _ in changed_spans]
+            changed_frame_count = sum(
+                max(1, int(span_end) - int(span_start) + 1)
+                for span_start, span_end in changed_spans
+            )
+            self._note_correction_step(len(changed_spans))
+            self._psr_recompute_cache()
+            state_conflicts_after = self._count_state_conflicts_in_span(view_start, view_end)
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                component_id=comp_id,
+                old_state=str(old_label or ""),
+                new_state=self._psr_state_label(state_val),
+                feedback_start=int(min(span_start for span_start, _ in changed_spans)),
+                feedback_end=int(max(span_end for _, span_end in changed_spans)),
+                changed_frame_count=int(changed_frame_count),
+                state_conflicts_before=int(state_conflicts_before),
+                state_conflicts_after=int(state_conflicts_after),
+                selection_scope="all",
+                accepted=True,
+            )
+            query_utility = observed_query_utility_from_summary(summary)
+            collected = self._queue_adaptation_samples_from_state_repair(
+                changed_starts,
+                query_utility=query_utility,
+            )
+            if collected:
+                self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
             return
         if scope == "from_here":
             seg_start = int(seg.get("start", cur_frame)) if seg else cur_frame
-            self._psr_apply_state_from_here(comp_id, state_val, seg_start)
+            self._begin_correction_session(
+                "state_repair",
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                component_id=comp_id,
+                feedback_start=int(seg_start),
+                feedback_end=int(view_end),
+                new_state=self._psr_state_label(state_val),
+                selection_scope="from_here",
+            )
+            changed_spans = self._psr_apply_state_from_here(comp_id, state_val, seg_start)
+            if not changed_spans:
+                self._discard_correction_session("state_noop")
+                return
+            changed_starts = [int(span_start) for span_start, _ in changed_spans]
+            changed_frame_count = sum(
+                max(1, int(span_end) - int(span_start) + 1)
+                for span_start, span_end in changed_spans
+            )
+            self._note_correction_step(len(changed_spans))
+            self._psr_recompute_cache()
+            state_conflicts_after = self._count_state_conflicts_in_span(view_start, view_end)
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                component_id=comp_id,
+                new_state=self._psr_state_label(state_val),
+                feedback_start=int(min(span_start for span_start, _ in changed_spans)),
+                feedback_end=int(max(span_end for _, span_end in changed_spans)),
+                changed_frame_count=int(changed_frame_count),
+                state_conflicts_before=int(state_conflicts_before),
+                state_conflicts_after=int(state_conflicts_after),
+                selection_scope="from_here",
+                accepted=True,
+            )
+            query_utility = observed_query_utility_from_summary(summary)
+            collected = self._queue_adaptation_samples_from_state_repair(
+                changed_starts,
+                query_utility=query_utility,
+            )
+            if collected:
+                self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
             return
         if scope == "segment" and seg:
             seg_start = int(seg.get("start", cur_frame))
             seg_end = int(seg.get("end", seg_start))
             target_frame = seg_start
+            start = int(seg_start)
+            end = int(seg_end)
             if seg.get("label") is None:
                 seg_comp = seg.get("component_id")
                 if seg_comp is None or str(seg_comp) == str(comp_id):
@@ -8494,6 +8983,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 restore_frame = int(next_frame)
         else:
             target_frame = self._psr_run_start_for_frame(cur_frame)
+            start = int(target_frame)
+            end = int(target_frame)
         comp_idx = None
         for idx, comp in enumerate(self.psr_components or []):
             if str(comp.get("id")) == str(comp_id):
@@ -8511,9 +9002,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 old_label = self._psr_state_label(current_state[comp_idx])
         elif gap_match:
             old_label = "Gap"
+        changed_spans = [(int(start), int(end))]
         if scope in (None, "segment"):
-            start = int(seg.get("start", target_frame)) if seg else int(target_frame)
-            end = int(seg.get("end", start)) if seg else int(target_frame)
             self._psr_record_validation_entry(
                 "state_change",
                 comp_id,
@@ -8529,6 +9019,17 @@ class ActionWindow(FrameControlMixin, QWidget):
                 restore_state = self._psr_state_value(
                     next_state_vec[comp_idx], fallback=0
                 )
+        self._begin_correction_session(
+            "state_repair",
+            query_type=str(QueryType.STATE_REPAIR.value),
+            point_type="state_repair_accept",
+            component_id=comp_id,
+            old_state=str(old_label or ""),
+            new_state=self._psr_state_label(state_val),
+            feedback_start=int(start),
+            feedback_end=int(end),
+            selection_scope=str(scope or "segment"),
+        )
         self._psr_push_undo("state_change")
         # Use non-sticky events + explicit tail restore to avoid unexpected
         # segmentation bursts after panel edits.
@@ -8554,6 +9055,31 @@ class ActionWindow(FrameControlMixin, QWidget):
             frame=target_frame,
             state=state_val,
         )
+        self._note_correction_step(len(changed_spans))
+        self._psr_recompute_cache()
+        state_conflicts_after = self._count_state_conflicts_in_span(view_start, view_end)
+        summary = self._commit_correction_session(
+            query_type=str(QueryType.STATE_REPAIR.value),
+            point_type="state_repair_accept",
+            component_id=comp_id,
+            old_state=str(old_label or ""),
+            new_state=self._psr_state_label(state_val),
+            feedback_start=int(start),
+            feedback_end=int(end),
+            changed_frame_count=int(max(1, int(end) - int(start) + 1)),
+            state_conflicts_before=int(state_conflicts_before),
+            state_conflicts_after=int(state_conflicts_after),
+            selection_scope=str(scope or "segment"),
+            accepted=True,
+        )
+        query_utility = observed_query_utility_from_summary(summary)
+        collected = self._queue_adaptation_samples_from_state_repair(
+            [int(span_start) for span_start, _ in changed_spans],
+            query_utility=query_utility,
+        )
+        if collected:
+            self._save_scribble_sidecar_if_possible()
+        self._maybe_start_background_refiner_training()
 
     def _psr_apply_timeline_editability(self) -> None:
         try:
@@ -8722,6 +9248,19 @@ class ActionWindow(FrameControlMixin, QWidget):
             deltas = consume()
             if not deltas:
                 return
+            changed_spans = [(int(s), int(e)) for s, e, _old, _new in self._iter_delta_spans(deltas)]
+            if not changed_spans:
+                return
+            view_start, view_end = self._psr_view_range()
+            state_conflicts_before = self._count_state_conflicts_in_span(view_start, view_end)
+            self._begin_correction_session(
+                "state_repair",
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                feedback_start=int(min(s for s, _ in changed_spans)),
+                feedback_end=int(max(e for _, e in changed_spans)),
+                selection_scope="timeline_single",
+            )
             self._psr_record_validation_from_deltas(
                 None, deltas, action="timeline_edit"
             )
@@ -8740,8 +9279,33 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._psr_mark_dirty()
             self._psr_refresh_state_timeline(force=True)
             self._psr_update_component_panel()
+            self._note_correction_step(len(changed_spans))
+            self._psr_recompute_cache()
+            state_conflicts_after = self._count_state_conflicts_in_span(view_start, view_end)
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                feedback_start=int(min(s for s, _ in changed_spans)),
+                feedback_end=int(max(e for _, e in changed_spans)),
+                changed_frame_count=int(self._delta_frame_count(deltas)),
+                state_conflicts_before=int(state_conflicts_before),
+                state_conflicts_after=int(state_conflicts_after),
+                selection_scope="timeline_single",
+                accepted=True,
+            )
+            query_utility = observed_query_utility_from_summary(summary)
+            collected = self._queue_adaptation_samples_from_state_repair(
+                [int(s) for s, _ in changed_spans],
+                query_utility=query_utility,
+            )
+            if collected:
+                self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
             return
         changed = False
+        all_spans: List[Tuple[int, int]] = []
+        view_start, view_end = self._psr_view_range()
+        state_conflicts_before = self._count_state_conflicts_in_span(view_start, view_end)
         for comp_id, store in list(self._psr_state_stores.items()):
             if not store:
                 continue
@@ -8752,8 +9316,22 @@ class ActionWindow(FrameControlMixin, QWidget):
             if not deltas:
                 continue
             if not changed:
+                spans = [(int(s), int(e)) for s, e, _old, _new in self._iter_delta_spans(deltas)]
+                if not spans:
+                    continue
+                self._begin_correction_session(
+                    "state_repair",
+                    query_type=str(QueryType.STATE_REPAIR.value),
+                    point_type="state_repair_accept",
+                    component_id=comp_id,
+                    feedback_start=int(min(s for s, _ in spans)),
+                    feedback_end=int(max(e for _, e in spans)),
+                    selection_scope="timeline_multi",
+                )
                 self._psr_push_undo("timeline_edit")
             changed = True
+            spans = [(int(s), int(e)) for s, e, _old, _new in self._iter_delta_spans(deltas)]
+            all_spans.extend(spans)
             self._psr_record_validation_from_deltas(
                 comp_id, deltas, action="timeline_edit"
             )
@@ -8781,38 +9359,78 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._psr_mark_dirty()
             self._psr_refresh_state_timeline(force=True)
             self._psr_update_component_panel()
+            self._note_correction_step(len(all_spans))
+            self._psr_recompute_cache()
+            state_conflicts_after = self._count_state_conflicts_in_span(view_start, view_end)
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.STATE_REPAIR.value),
+                point_type="state_repair_accept",
+                feedback_start=int(min(s for s, _ in all_spans)),
+                feedback_end=int(max(e for _, e in all_spans)),
+                changed_frame_count=int(
+                    sum(max(1, int(e) - int(s) + 1) for s, e in all_spans)
+                ),
+                state_conflicts_before=int(state_conflicts_before),
+                state_conflicts_after=int(state_conflicts_after),
+                selection_scope="timeline_multi",
+                accepted=True,
+            )
+            query_utility = observed_query_utility_from_summary(summary)
+            collected = self._queue_adaptation_samples_from_state_repair(
+                [int(s) for s, _ in all_spans],
+                query_utility=query_utility,
+            )
+            if collected:
+                self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
         return
 
     def _psr_apply_state_from_here(
         self, component_id: Any, state_val: int, start_frame: int
-    ) -> None:
+    ) -> List[Tuple[int, int]]:
         if component_id is None:
-            return
+            return []
         self._psr_recompute_cache()
         runs = self._psr_build_state_runs()
         if not runs:
-            return
-        self._psr_push_undo("state_change")
+            return []
         comp_idx = None
         for idx, comp in enumerate(self.psr_components or []):
             if str(comp.get("id")) == str(component_id):
                 comp_idx = idx
                 break
+        changed_spans: List[Tuple[int, int]] = []
+        for run in runs:
+            try:
+                frame = int(run.get("start_frame", 0))
+                end = int(run.get("end_frame", frame))
+            except Exception:
+                continue
+            if frame < int(start_frame):
+                continue
+            state_vec = run.get("state", [])
+            if comp_idx is None or comp_idx >= len(state_vec):
+                continue
+            old_val = self._psr_state_value(state_vec[comp_idx], fallback=0)
+            if int(old_val) == int(state_val):
+                continue
+            changed_spans.append((int(frame), int(end)))
+        if not changed_spans:
+            return []
+        self._psr_push_undo("state_change")
         if comp_idx is not None and self.validation_enabled:
-            for run in runs:
-                try:
-                    frame = int(run.get("start_frame", 0))
-                    end = int(run.get("end_frame", frame))
-                except Exception:
-                    continue
-                if frame < int(start_frame):
-                    continue
-                state_vec = run.get("state", [])
+            for frame, end in changed_spans:
+                state_vec = next(
+                    (
+                        run.get("state", [])
+                        for run in runs
+                        if int(run.get("start_frame", 0) or 0) == int(frame)
+                    ),
+                    [],
+                )
                 if comp_idx >= len(state_vec):
                     continue
                 old_val = self._psr_state_value(state_vec[comp_idx], fallback=0)
-                if int(old_val) == int(state_val):
-                    continue
                 self._psr_record_validation_entry(
                     "apply_from",
                     component_id,
@@ -8846,12 +9464,38 @@ class ActionWindow(FrameControlMixin, QWidget):
             frame=start_frame,
             state=state_val,
         )
+        return changed_spans
 
     def _psr_apply_state_to_all_segments(
         self, component_id: Any, state_val: int
-    ) -> None:
+    ) -> List[Tuple[int, int]]:
         if component_id is None:
-            return
+            return []
+        self._psr_recompute_cache()
+        runs = self._psr_build_state_runs()
+        if not runs:
+            return []
+        comp_idx = None
+        for idx, comp in enumerate(self.psr_components or []):
+            if str(comp.get("id")) == str(component_id):
+                comp_idx = idx
+                break
+        changed_spans: List[Tuple[int, int]] = []
+        for run in runs:
+            try:
+                frame = int(run.get("start_frame", 0))
+                end = int(run.get("end_frame", frame))
+            except Exception:
+                continue
+            state_vec = run.get("state", [])
+            if comp_idx is None or comp_idx >= len(state_vec):
+                continue
+            old_val = self._psr_state_value(state_vec[comp_idx], fallback=0)
+            if int(old_val) == int(state_val):
+                continue
+            changed_spans.append((int(frame), int(end)))
+        if not changed_spans:
+            return []
         self._psr_push_undo("state_change")
         self._psr_manual_events = [
             ev
@@ -8859,28 +9503,19 @@ class ActionWindow(FrameControlMixin, QWidget):
             if str(ev.get("component_id")) != str(component_id)
         ]
         self._psr_mark_dirty()
-        self._psr_recompute_cache()
-        runs = self._psr_build_state_runs()
-        if not runs:
-            return
-        comp_idx = None
-        for idx, comp in enumerate(self.psr_components or []):
-            if str(comp.get("id")) == str(component_id):
-                comp_idx = idx
-                break
         if comp_idx is not None and self.validation_enabled:
-            for run in runs:
-                try:
-                    frame = int(run.get("start_frame", 0))
-                    end = int(run.get("end_frame", frame))
-                except Exception:
-                    continue
-                state_vec = run.get("state", [])
+            for frame, end in changed_spans:
+                state_vec = next(
+                    (
+                        run.get("state", [])
+                        for run in runs
+                        if int(run.get("start_frame", 0) or 0) == int(frame)
+                    ),
+                    [],
+                )
                 if comp_idx >= len(state_vec):
                     continue
                 old_val = self._psr_state_value(state_vec[comp_idx], fallback=0)
-                if int(old_val) == int(state_val):
-                    continue
                 self._psr_record_validation_entry(
                     "apply_all",
                     component_id,
@@ -8904,6 +9539,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             state=state_val,
             runs=len(runs),
         )
+        return changed_spans
 
     def _psr_component_id_from_row(self, row) -> Optional[Any]:
         if row is None:
@@ -12215,6 +12851,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         *,
         refresh_panel: bool = False,
     ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        self._ensure_escape_labels()
         verbs = self._normalize_fine_vocab_items(self.fine_verbs)
         nouns = self._normalize_fine_vocab_items(self.fine_nouns)
         verb_map = {str(v["name"]): int(v["id"]) for v in verbs if v.get("name")}
@@ -13035,6 +13672,79 @@ class ActionWindow(FrameControlMixin, QWidget):
             return "Gray"
         return palette_keys[lid % len(palette_keys)]
 
+    def _ensure_escape_labels(self) -> None:
+        """Keep reserved escape labels present, canonicalized, and ordered last."""
+        regular: List[LabelDef] = []
+        escape_by_key: Dict[str, LabelDef] = {}
+        used_ids: Set[int] = set()
+        seen_regular: Set[str] = set()
+        for lb in list(self.labels or []):
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name:
+                continue
+            try:
+                lid = int(getattr(lb, "id", -1))
+            except Exception:
+                lid = -1
+            if is_escape_label(name):
+                key = name.lower()
+                if key in escape_by_key:
+                    continue
+                escape_by_key[key] = LabelDef(
+                    name=name,
+                    color_name=str(getattr(lb, "color_name", "") or "Gray"),
+                    id=lid,
+                )
+                if lid >= 0:
+                    used_ids.add(lid)
+                continue
+            if name in seen_regular:
+                continue
+            seen_regular.add(name)
+            regular.append(
+                LabelDef(
+                    name=name,
+                    color_name=str(getattr(lb, "color_name", "") or "Gray"),
+                    id=lid,
+                )
+            )
+            if lid >= 0:
+                used_ids.add(lid)
+
+        next_id = max(used_ids, default=-1) + 1
+        normalized = list(regular)
+        normalized_ids: Set[int] = set()
+        for item in normalized:
+            try:
+                lid = int(getattr(item, "id", -1))
+            except Exception:
+                lid = -1
+            if lid >= 0:
+                normalized_ids.add(lid)
+        for canonical in RESERVED_ESCAPE_LABELS:
+            key = canonical.lower()
+            lb = escape_by_key.get(key)
+            color_name = "Gray"
+            lid = -1
+            if lb is not None:
+                color_name = str(getattr(lb, "color_name", "") or "Gray")
+                try:
+                    lid = int(getattr(lb, "id", -1))
+                except Exception:
+                    lid = -1
+            if lid < 0 or lid in normalized_ids:
+                lid = next_id
+                next_id += 1
+            normalized_ids.add(lid)
+            normalized.append(
+                LabelDef(
+                    name=canonical,
+                    color_name=color_name,
+                    id=lid,
+                )
+            )
+        self.labels = normalized
+
     @staticmethod
     def _cfg_int(value: Any, default: int, lo: int = 0, hi: int = 10000) -> int:
         try:
@@ -13134,6 +13844,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         scribble_cfg.setdefault("checkpoint", "")
         scribble_cfg.setdefault("device", "auto")
         scribble_cfg.setdefault("prefer_checkpoint", True)
+        scribble_cfg.setdefault("hidden_dim", 128)
+        scribble_cfg.setdefault("dropout", 0.1)
+        scribble_cfg.setdefault("state_loss_weight", 0.5)
+        scribble_cfg.setdefault("consistency_loss_weight", 0.3)
+        scribble_cfg.setdefault("action_loss_weight", 0.0)
+        scribble_cfg.setdefault("struct_loss_weight", 0.0)
+        scribble_cfg.setdefault("query_loss_weight", 0.0)
 
         decode_cfg = cfg.setdefault("structured_decode", {})
         if not isinstance(decode_cfg, dict):
@@ -13152,11 +13869,31 @@ class ActionWindow(FrameControlMixin, QWidget):
         learning_cfg.setdefault("enabled", True)
         learning_cfg.setdefault("second_correction_radius", 20)
         learning_cfg.setdefault("proposal_feedback_enabled", True)
+        learning_cfg.setdefault("utility_model_path", "")
+
+        adaptation_cfg = cfg.setdefault("scribble_adaptation", {})
+        if not isinstance(adaptation_cfg, dict):
+            adaptation_cfg = {}
+            cfg["scribble_adaptation"] = adaptation_cfg
+        adaptation_cfg.setdefault("enabled", True)
+        adaptation_cfg.setdefault("min_samples", 8)
+        adaptation_cfg.setdefault("max_buffer", 200)
+        adaptation_cfg.setdefault("epochs", 6)
+        adaptation_cfg.setdefault("lr", 5e-4)
+        adaptation_cfg.setdefault("lora_rank", 4)
+        adaptation_cfg.setdefault("lora_alpha", 1.0)
+        adaptation_cfg.setdefault("output_dir", "")
 
     def _scribble_local_refiner_cfg(self) -> Dict[str, Any]:
         self._ensure_algo_cfg_defaults()
         cfg = getattr(self, "_algo_cfg", {})
         section = cfg.get("scribble_local_refiner", {})
+        return dict(section) if isinstance(section, dict) else {}
+
+    def _scribble_adaptation_cfg(self) -> Dict[str, Any]:
+        self._ensure_algo_cfg_defaults()
+        cfg = getattr(self, "_algo_cfg", {})
+        section = cfg.get("scribble_adaptation", {})
         return dict(section) if isinstance(section, dict) else {}
 
     def _resolve_scribble_local_refiner_checkpoint(self) -> str:
@@ -13183,6 +13920,13 @@ class ActionWindow(FrameControlMixin, QWidget):
                 for match in sorted(glob.glob(pattern)):
                     candidates.append(os.path.abspath(match))
 
+        for raw in _default_local_refiner_checkpoint_candidates(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+        ):
+            path = os.path.abspath(os.path.expanduser(str(raw or "").strip()))
+            if path:
+                candidates.append(path)
+
         for path in candidates:
             if path and os.path.isfile(path):
                 return path
@@ -13208,6 +13952,473 @@ class ActionWindow(FrameControlMixin, QWidget):
         checkpoint_path = self._resolve_scribble_local_refiner_checkpoint()
         if str(checkpoint_path or "") != str(getattr(self, "_scribble_local_refiner_path", "") or ""):
             self._scribble_local_refiner = self._make_scribble_local_refiner()
+
+    def _sync_adaptation_buffer_limit(self) -> None:
+        cfg = self._scribble_adaptation_cfg()
+        try:
+            max_size = max(1, int(cfg.get("max_buffer", 200) or 200))
+        except Exception:
+            max_size = 200
+        buffer = getattr(self, "_adaptation_buffer", None)
+        if not isinstance(buffer, AdaptationSampleBuffer):
+            self._adaptation_buffer = AdaptationSampleBuffer(max_size=max_size)
+            return
+        buffer.max_size = int(max_size)
+        if len(buffer.samples) > max_size:
+            buffer.samples = buffer.samples[-max_size:]
+
+    def _current_refiner_context_key(self) -> str:
+        if self.current_annotation_path:
+            return os.path.abspath(str(self.current_annotation_path))
+        if self.current_video_id:
+            return str(self.current_video_id)
+        return ""
+
+    def _adaptation_base_checkpoint(self) -> str:
+        current = os.path.abspath(
+            os.path.expanduser(
+                str(getattr(self, "_scribble_local_refiner_path", "") or "").strip()
+            )
+        )
+        if current and os.path.isfile(current):
+            return current
+        resolved = self._resolve_scribble_local_refiner_checkpoint()
+        return str(resolved or "") if resolved and os.path.isfile(resolved) else ""
+
+    def _adaptation_output_dir(self, base_checkpoint: str) -> str:
+        cfg = self._scribble_adaptation_cfg()
+        raw = os.path.abspath(
+            os.path.expanduser(str(cfg.get("output_dir", "") or "").strip())
+        )
+        if raw:
+            return raw
+        checkpoint_dir = os.path.dirname(str(base_checkpoint or "").strip())
+        if checkpoint_dir:
+            return checkpoint_dir
+        features_dir = self._resolve_features_dir_for_snap()
+        if features_dir:
+            return str(features_dir)
+        return os.path.join(tempfile.gettempdir(), "impact_scribe_refiner")
+
+    def _current_refiner_label_to_idx(self) -> Dict[str, int]:
+        refiner = getattr(self, "_scribble_local_refiner", None)
+        idx_to_label = {}
+        if isinstance(refiner, CheckpointLocalBoundaryRefiner) and refiner.ready:
+            idx_to_label = dict(getattr(refiner, "_idx_to_label", {}) or {})
+        out: Dict[str, int] = {}
+        for idx, label in idx_to_label.items():
+            name = str(label or "").strip()
+            if not name:
+                continue
+            try:
+                out[name] = int(idx)
+            except Exception:
+                continue
+        if out:
+            return out
+        next_idx = 0
+        for lb in self.labels or []:
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name or is_extra_label(name) or name in out:
+                continue
+            out[name] = int(next_idx)
+            next_idx += 1
+        return out
+
+    def _adaptation_state_to_idx(
+        self, samples: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, int]:
+        rows = list(samples or self._adaptation_buffer.export_examples())
+        states = sorted(
+            {
+                str(row.get("left_state", "") or "").strip()
+                for row in rows
+                if str(row.get("left_state", "") or "").strip()
+            }
+            | {
+                str(row.get("right_state", "") or "").strip()
+                for row in rows
+                if str(row.get("right_state", "") or "").strip()
+            }
+        )
+        return {name: idx for idx, name in enumerate(states)}
+
+    def _scribble_session_items(self, session_id: str) -> List[TemporalScribble]:
+        session_key = str(session_id or "").strip()
+        if not session_key:
+            return []
+        out: List[TemporalScribble] = []
+        for item in list(getattr(self._scribble_items, "items", []) or []):
+            meta = dict(getattr(item, "meta", {}) or {})
+            if bool(meta.get("accepted", False)):
+                continue
+            if str(meta.get("session_id") or "").strip() != session_key:
+                continue
+            out.append(item)
+        return out
+
+    def _adaptation_state_signature(self, frame: int) -> str:
+        try:
+            frame_i = int(frame)
+        except Exception:
+            return ""
+        try:
+            if bool(getattr(self, "_psr_cache_dirty", False)):
+                self._psr_recompute_cache()
+        except Exception:
+            pass
+        try:
+            state_vec = list(self._psr_state_for_frame(frame_i))
+        except Exception:
+            state_vec = []
+        if not state_vec:
+            return ""
+        values: List[str] = []
+        for value in state_vec:
+            values.append(str(self._psr_state_value(value, fallback=0)))
+        return "|".join(values)
+
+    def _build_adaptation_sample_from_boundary_accept(
+        self,
+        proposal: Optional[Dict[str, Any]],
+        *,
+        frame_i: int,
+        left_label: str,
+        right_label: str,
+        query_utility: Optional[float] = None,
+    ) -> Optional[AdaptationSample]:
+        if not isinstance(proposal, dict):
+            return None
+        session_id = str(
+            proposal.get("session_id")
+            or getattr(self, "_active_scribble_session_id", "")
+            or ""
+        ).strip()
+        scribbles = self._scribble_session_items(session_id)
+        if not scribbles:
+            return None
+        try:
+            window_start = int(proposal.get("window_start"))
+            window_end = int(proposal.get("window_end"))
+        except Exception:
+            focus = [
+                item for item in scribbles if item.kind == ScribbleKind.UNCERTAIN
+            ] or list(scribbles)
+            focus_start = min(int(item.start_frame) for item in focus)
+            focus_end = max(int(item.end_frame) for item in focus)
+            window_start, window_end = self._scribble_window_bounds(
+                focus_start, focus_end
+            )
+        if window_end < window_start:
+            return None
+        window_features = self._feature_window_matrix(window_start, window_end)
+        if window_features is None:
+            return None
+        boundary_energy = self._boundary_energy_window(window_start, window_end)
+        channels = build_scribble_channels(window_start, window_end, scribbles)
+        left_state_frame = max(int(window_start), int(frame_i) - 1)
+        right_state_frame = min(int(window_end), int(frame_i))
+        return AdaptationSample(
+            window_features=np.asarray(window_features, dtype=np.float32),
+            scribble_channels={
+                "uncertain": np.asarray(
+                    channels.get(
+                        "uncertain",
+                        np.zeros(window_end - window_start + 1, dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ),
+                "left": np.asarray(
+                    channels.get(
+                        "left",
+                        np.zeros(window_end - window_start + 1, dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ),
+                "right": np.asarray(
+                    channels.get(
+                        "right",
+                        np.zeros(window_end - window_start + 1, dtype=np.float32),
+                    ),
+                    dtype=np.float32,
+                ),
+            },
+            boundary_energy=np.asarray(boundary_energy, dtype=np.float32),
+            boundary_frame=int(frame_i),
+            window_start=int(window_start),
+            window_end=int(window_end),
+            left_label=str(left_label or "").strip(),
+            right_label=str(right_label or "").strip(),
+            left_state=self._adaptation_state_signature(left_state_frame),
+            right_state=self._adaptation_state_signature(right_state_frame),
+            query_utility=float(query_utility if query_utility is not None else -1.0),
+        )
+
+    def _state_repair_action_context_labels(
+        self, frame_i: int
+    ) -> Optional[Tuple[str, str]]:
+        if self.views and 0 <= self.active_view_idx < len(self.views):
+            store = self.views[self.active_view_idx].get("store") or self.store
+        else:
+            store = getattr(self, "store", None)
+        if store is None:
+            return None
+        view_start, view_end = self._psr_view_range()
+        segments = self._segments_from_store_for_interaction(store)
+        left_seg = self._segment_for_frame_in_interaction(
+            segments,
+            max(int(view_start), int(frame_i) - 1),
+        )
+        right_seg = self._segment_for_frame_in_interaction(
+            segments,
+            min(int(view_end), int(frame_i)),
+        )
+        left_label = str((left_seg or {}).get("label", "") or "").strip()
+        right_label = str((right_seg or {}).get("label", "") or "").strip()
+        if not left_label and right_label:
+            left_label = right_label
+        if not right_label and left_label:
+            right_label = left_label
+        if not left_label or not right_label:
+            return None
+        return left_label, right_label
+
+    def _build_adaptation_sample_from_state_repair(
+        self,
+        *,
+        frame_i: int,
+        query_utility: Optional[float] = None,
+    ) -> Optional[AdaptationSample]:
+        labels = self._state_repair_action_context_labels(int(frame_i))
+        if labels is None:
+            left_label, right_label = "", ""
+        else:
+            left_label, right_label = labels
+        window_start, window_end = self._scribble_window_bounds(int(frame_i), int(frame_i))
+        if int(window_end) < int(window_start):
+            return None
+        window_features = self._feature_window_matrix(window_start, window_end)
+        if window_features is None:
+            return None
+        boundary_energy = self._boundary_energy_window(window_start, window_end)
+        length = max(1, int(window_end) - int(window_start) + 1)
+        zeros = np.zeros(length, dtype=np.float32)
+        left_state_frame = max(int(window_start), int(frame_i) - 1)
+        right_state_frame = min(int(window_end), int(frame_i))
+        return AdaptationSample(
+            window_features=np.asarray(window_features, dtype=np.float32),
+            scribble_channels={
+                "uncertain": zeros.copy(),
+                "left": zeros.copy(),
+                "right": zeros.copy(),
+            },
+            boundary_energy=np.asarray(boundary_energy, dtype=np.float32),
+            boundary_frame=int(frame_i),
+            window_start=int(window_start),
+            window_end=int(window_end),
+            left_label=str(left_label),
+            right_label=str(right_label),
+            left_state=self._adaptation_state_signature(left_state_frame),
+            right_state=self._adaptation_state_signature(right_state_frame),
+            sample_kind="state_repair_accept",
+            boundary_valid=False,
+            side_valid=False,
+            action_valid=False,
+            query_utility=float(query_utility if query_utility is not None else -1.0),
+        )
+
+    def _queue_adaptation_samples_from_state_repair(
+        self,
+        frames: Sequence[int],
+        *,
+        query_utility: Optional[float] = None,
+    ) -> bool:
+        cfg = self._scribble_adaptation_cfg()
+        if not bool(cfg.get("enabled", True)):
+            return False
+        self._sync_adaptation_buffer_limit()
+        added = False
+        for raw_frame in sorted({int(frame) for frame in frames}):
+            sample = self._build_adaptation_sample_from_state_repair(
+                frame_i=int(raw_frame),
+                query_utility=query_utility,
+            )
+            if sample is None:
+                continue
+            self._adaptation_buffer.add(sample)
+            added = True
+        return added
+
+    def _queue_adaptation_sample_from_boundary_accept(
+        self,
+        proposal: Optional[Dict[str, Any]],
+        *,
+        frame_i: int,
+        left_label: str,
+        right_label: str,
+        query_utility: Optional[float] = None,
+    ) -> bool:
+        cfg = self._scribble_adaptation_cfg()
+        if not bool(cfg.get("enabled", True)):
+            return False
+        self._sync_adaptation_buffer_limit()
+        sample = self._build_adaptation_sample_from_boundary_accept(
+            proposal,
+            frame_i=int(frame_i),
+            left_label=str(left_label or ""),
+            right_label=str(right_label or ""),
+            query_utility=query_utility,
+        )
+        if sample is None:
+            return False
+        self._adaptation_buffer.add(sample)
+        return True
+
+    def _on_background_refiner_progress(self, message: str) -> None:
+        text = str(message or "").strip()
+        if text:
+            self._set_status(text)
+
+    def _on_background_refiner_training_finished(self, checkpoint_path: str) -> None:
+        trainer = self.sender()
+        current = getattr(self, "_background_refiner_trainer", None)
+        if current is None:
+            return
+        if trainer is not None and trainer is not current:
+            return
+        used_samples = int(getattr(self, "_background_refiner_used_samples", 0) or 0)
+        context_key = str(getattr(self, "_background_refiner_context_key", "") or "")
+        self._background_refiner_trainer = None
+        self._background_refiner_used_samples = 0
+        self._background_refiner_context_key = ""
+        if context_key and context_key != self._current_refiner_context_key():
+            return
+        path = os.path.abspath(os.path.expanduser(str(checkpoint_path or "").strip()))
+        if not path or not os.path.isfile(path):
+            self._set_status("Background local refiner adaptation did not produce a checkpoint.")
+            return
+        scribble_cfg = self._algo_cfg.setdefault("scribble_local_refiner", {})
+        scribble_cfg["checkpoint"] = path
+        scribble_cfg["prefer_checkpoint"] = True
+        reloaded = False
+        refiner = getattr(self, "_scribble_local_refiner", None)
+        if isinstance(refiner, CheckpointLocalBoundaryRefiner):
+            reloaded = bool(refiner.reload_checkpoint(path))
+            self._scribble_local_refiner_error = str(refiner.load_error or "")
+        if not reloaded:
+            self._scribble_local_refiner = self._make_scribble_local_refiner()
+            reloaded = bool(
+                isinstance(self._scribble_local_refiner, CheckpointLocalBoundaryRefiner)
+                and self._scribble_local_refiner.ready
+            )
+        if reloaded:
+            self._scribble_local_refiner_path = path
+            self._scribble_local_refiner_error = ""
+            self._adaptation_buffer.discard_prefix(used_samples)
+            self._save_scribble_sidecar_if_possible()
+            self._set_status(
+                f"Background local refiner updated and hot-reloaded from {os.path.basename(path)}."
+            )
+            return
+        self._set_status(
+            f"Adapted checkpoint saved to {os.path.basename(path)}, but hot-reload failed."
+        )
+
+    def _maybe_start_background_refiner_training(self) -> bool:
+        cfg = self._scribble_adaptation_cfg()
+        if not bool(cfg.get("enabled", True)):
+            return False
+        self._sync_adaptation_buffer_limit()
+        trainer = getattr(self, "_background_refiner_trainer", None)
+        if trainer is not None:
+            try:
+                if trainer.isRunning():
+                    return False
+            except Exception:
+                pass
+        try:
+            min_samples = max(1, int(cfg.get("min_samples", 8) or 8))
+        except Exception:
+            min_samples = 8
+        if len(self._adaptation_buffer) < min_samples:
+            return False
+        self._ensure_scribble_local_refiner_ready()
+        base_checkpoint = self._adaptation_base_checkpoint()
+        label_to_idx = self._current_refiner_label_to_idx()
+        samples = self._adaptation_buffer.export_examples()
+        if not label_to_idx:
+            labels = sorted(
+                {
+                    str(row.get("left_label", "") or "").strip()
+                    for row in samples
+                    if str(row.get("left_label", "") or "").strip()
+                }
+                | {
+                    str(row.get("right_label", "") or "").strip()
+                    for row in samples
+                    if str(row.get("right_label", "") or "").strip()
+                }
+            )
+            label_to_idx = {name: idx for idx, name in enumerate(labels)}
+        if not label_to_idx:
+            return False
+        state_to_idx = self._adaptation_state_to_idx(samples)
+        try:
+            epochs = max(1, int(cfg.get("epochs", 6) or 6))
+        except Exception:
+            epochs = 6
+        try:
+            lora_rank = max(1, int(cfg.get("lora_rank", 4) or 4))
+        except Exception:
+            lora_rank = 4
+        try:
+            lora_alpha = float(cfg.get("lora_alpha", 1.0) or 1.0)
+        except Exception:
+            lora_alpha = 1.0
+        try:
+            lr = float(cfg.get("lr", 5e-4) or 5e-4)
+        except Exception:
+            lr = 5e-4
+        output_dir = self._adaptation_output_dir(base_checkpoint)
+        refiner_cfg = self._scribble_local_refiner_cfg()
+        trainer = BackgroundRefinerTrainer(
+            samples=samples,
+            base_checkpoint=base_checkpoint,
+            output_dir=output_dir,
+            label_to_idx=label_to_idx,
+            state_to_idx=state_to_idx,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            epochs=epochs,
+            lr=lr,
+            hidden_dim=self._cfg_int(refiner_cfg.get("hidden_dim", 128), 128, lo=16, hi=1024),
+            dropout=self._cfg_float(refiner_cfg.get("dropout", 0.1), 0.1, lo=0.0, hi=0.8),
+            state_loss_weight=self._cfg_float(refiner_cfg.get("state_loss_weight", 0.5), 0.5, lo=0.0, hi=5.0),
+            consistency_loss_weight=self._cfg_float(refiner_cfg.get("consistency_loss_weight", 0.3), 0.3, lo=0.0, hi=5.0),
+            action_loss_weight=self._cfg_float(refiner_cfg.get("action_loss_weight", 0.0), 0.0, lo=0.0, hi=5.0),
+            struct_loss_weight=self._cfg_float(refiner_cfg.get("struct_loss_weight", 0.0), 0.0, lo=0.0, hi=5.0),
+            query_loss_weight=self._cfg_float(refiner_cfg.get("query_loss_weight", 0.0), 0.0, lo=0.0, hi=5.0),
+            device=str(
+                self._scribble_local_refiner_cfg().get("device", "auto") or "auto"
+            ),
+            parent=self,
+        )
+        trainer.progress.connect(self._on_background_refiner_progress)
+        trainer.training_finished.connect(self._on_background_refiner_training_finished)
+        trainer.finished.connect(trainer.deleteLater)
+        self._background_refiner_trainer = trainer
+        self._background_refiner_used_samples = len(samples)
+        self._background_refiner_context_key = self._current_refiner_context_key()
+        trainer.start()
+        if base_checkpoint:
+            self._set_status(
+                f"Started background local refiner adaptation with {len(samples)} samples."
+            )
+        else:
+            self._set_status(
+                f"Started cold-start local refiner bootstrap with {len(samples)} samples."
+            )
+        return True
 
     def _timeline_snap_cfg(self) -> Dict[str, int]:
         self._ensure_algo_cfg_defaults()
@@ -13709,7 +14920,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         source: str = "model",
     ) -> float:
         current = str(current_label or "").strip()
-        candidate_names = [str(name or "").strip() for name, _score in list(candidates or [])[:4] if str(name or "").strip()]
+        if is_escape_label(current):
+            return 0.0
+        candidate_names = [
+            str(name or "").strip()
+            for name, _score in list(candidates or [])[:4]
+            if str(name or "").strip() and not is_escape_label(str(name or "").strip())
+        ]
         top = candidate_names[0] if candidate_names else ""
         scarcity_labels = [name for name in [current, top] if name]
         scarcity = max((self._label_scarcity_score(name) for name in scarcity_labels), default=0.0)
@@ -13727,6 +14944,8 @@ class ActionWindow(FrameControlMixin, QWidget):
     ) -> float:
         left = str(left_label or "").strip()
         right = str(right_label or "").strip()
+        if (left and is_escape_label(left)) or (right and is_escape_label(right)):
+            return 0.0
         scarcity = max(self._label_scarcity_score(left), self._label_scarcity_score(right))
         cross_label = 0.0
         if left and right:
@@ -13765,12 +14984,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         candidates: List[Tuple[str, Optional[float]]],
     ) -> float:
         current = str(current_label or "").strip()
-        if not current or not candidates:
+        if not current or is_escape_label(current) or not candidates:
             return 0.0
         best = 0.0
         for name, _score in list(candidates)[:3]:
             cand = str(name or "").strip()
-            if not cand or cand == current:
+            if not cand or cand == current or is_escape_label(cand):
                 continue
             best = max(
                 best,
@@ -13787,6 +15006,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         left = str(left_label or "").strip()
         right = str(right_label or "").strip()
         if not left or not right:
+            return 0.0
+        if is_escape_label(left) or is_escape_label(right):
             return 0.0
         if left == right:
             return 1.0
@@ -13835,6 +15056,16 @@ class ActionWindow(FrameControlMixin, QWidget):
         right_label: str,
         raw_score: Optional[float],
     ) -> Tuple[float, Dict[str, float]]:
+        left = str(left_label or "").strip()
+        right = str(right_label or "").strip()
+        if (left and is_escape_label(left)) or (right and is_escape_label(right)):
+            return 0.0, {
+                "uncertainty": 0.0,
+                "confusion": 0.0,
+                "energy": 0.0,
+                "merge_bonus": 0.0,
+                "training_utility": 0.0,
+            }
         cfg = self._assisted_cfg()
         energy = self._normalize_boundary_energy_for_query(frame)
         uncertainty = self._boundary_uncertainty_query_score(
@@ -13867,9 +15098,21 @@ class ActionWindow(FrameControlMixin, QWidget):
         source: str = "model",
     ) -> Tuple[float, Dict[str, float]]:
         current_label = str(seg.get("label", "") or "").strip()
-        top_label = str(candidates[0][0] or "").strip() if candidates else ""
-        top_conf = candidates[0][1] if candidates else None
-        second_conf = candidates[1][1] if len(candidates) > 1 else None
+        if is_escape_label(current_label):
+            return 0.0, {
+                "uncertainty": 0.0,
+                "disagreement": 0.0,
+                "confusion": 0.0,
+                "training_utility": 0.0,
+            }
+        filtered_candidates = [
+            (name, score)
+            for name, score in list(candidates or [])
+            if str(name or "").strip() and not is_escape_label(str(name or "").strip())
+        ]
+        top_label = str(filtered_candidates[0][0] or "").strip() if filtered_candidates else ""
+        top_conf = filtered_candidates[0][1] if filtered_candidates else None
+        second_conf = filtered_candidates[1][1] if len(filtered_candidates) > 1 else None
         uncertainty = 0.0
         if source == "embedding":
             margin_thr = self._topk_uncertainty_margin()
@@ -13914,8 +15157,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                         margin_uncert = 0.0
                 uncertainty = max(low_conf, margin_uncert)
         disagreement = 1.0 if current_label and top_label and current_label != top_label else 0.0
-        confusion = self._label_confusion_query_score(current_label, candidates)
-        utility = self._label_training_utility_score(current_label, candidates, source=source)
+        confusion = self._label_confusion_query_score(current_label, filtered_candidates)
+        utility = self._label_training_utility_score(current_label, filtered_candidates, source=source)
         cfg = self._assisted_cfg()
         wu = self._cfg_float(cfg.get("label_uncertainty_weight", 0.55), 0.55, lo=0.0, hi=1.0)
         wd = self._cfg_float(cfg.get("label_disagreement_weight", 0.20), 0.20, lo=0.0, hi=1.0)
@@ -13933,7 +15176,7 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _update_label_prototype(
         self, label: Optional[str], emb: Optional[np.ndarray]
     ) -> None:
-        if not label or emb is None:
+        if not label or emb is None or is_escape_label(label):
             return
         vec = np.asarray(emb, dtype=np.float32)
         if vec.ndim != 1:
@@ -13973,7 +15216,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         if norm > 0:
             vec = vec / norm
         for label, proto in self._label_prototypes.items():
-            if proto is None:
+            if proto is None or is_escape_label(label):
                 continue
             if proto.shape != vec.shape:
                 continue
@@ -14009,7 +15252,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         names: List[str] = []
         for lb in self.labels or []:
             name = str(getattr(lb, "name", "") or "").strip()
-            if not name or is_extra_label(name) or name in names:
+            if not name or is_extra_label(name) or is_escape_label(name) or name in names:
                 continue
             names.append(name)
         return names
@@ -14087,6 +15330,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         scores: List[Tuple[str, float]] = []
         labels = set(proto_scores) | set(text_scores)
         for label in labels:
+            if is_escape_label(label):
+                continue
             score = 0.0
             if label in proto_scores:
                 score += float(proto_weight) * float(proto_scores[label])
@@ -14304,9 +15549,17 @@ class ActionWindow(FrameControlMixin, QWidget):
         if len(candidates) < top_k:
             existing = {c[0] for c in candidates}
             for lb in self.labels:
-                if is_extra_label(lb.name) or lb.name in existing:
+                if is_extra_label(lb.name) or lb.name in existing or is_escape_label(lb.name):
                     continue
                 candidates.append((lb.name, None))
+                if len(candidates) >= top_k:
+                    break
+        if len(candidates) < top_k:
+            existing = {c[0] for c in candidates}
+            for name in RESERVED_ESCAPE_LABELS:
+                if name in existing:
+                    continue
+                candidates.append((name, None))
                 if len(candidates) >= top_k:
                     break
         return candidates[:top_k], source
@@ -15191,7 +16444,9 @@ class ActionWindow(FrameControlMixin, QWidget):
             name = str(getattr(lb, "name", "") or "").strip()
             if name and not is_extra_label(name):
                 labels.add(name)
-        return sorted(labels)
+        regular = sorted(name for name in labels if name and not is_escape_label(name))
+        escape = [name for name in RESERVED_ESCAPE_LABELS if name in labels]
+        return regular + [name for name in escape if name not in regular]
 
     def _build_soft_constraints_for_decode(
         self,
@@ -15481,7 +16736,37 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._discard_correction_session("scribble_accept_existing_boundary")
                 left_txt = applied_left or str(left_label or seg_label or "?")
                 right_txt = applied_right or str(right_label or seg_label or "?")
-                return self._finalize_accepted_boundary_suggestion(
+                span_len = max(1, int(seg_e) - int(seg_s) + 1)
+                query_utility = estimate_observed_query_utility(
+                    accepted=True,
+                    span_len=span_len,
+                    changed_frame_count=0,
+                    anchor_before=int(anchor_before),
+                    anchor_after=int(anchor_after),
+                    state_before=int(state_before),
+                    state_after=int(state_after),
+                    second_correction=False,
+                )
+                collected = self._queue_adaptation_sample_from_boundary_accept(
+                    proposal,
+                    frame_i=int(frame_i),
+                    left_label=str(left_txt),
+                    right_label=str(right_txt),
+                    query_utility=float(query_utility),
+                )
+                if str(descriptor.get("kind") or "store") == "store":
+                    accept_rec = self._build_accept_record_for_point(
+                        {
+                            "type": "boundary",
+                            "frame": int(frame_i),
+                            "left": {"label": str(left_txt)},
+                            "right": {"label": str(right_txt)},
+                        },
+                        boundary_frame=int(frame_i),
+                    )
+                    if accept_rec is not None:
+                        self._store_explicit_confirm_record(accept_rec)
+                accepted = self._finalize_accepted_boundary_suggestion(
                     proposal,
                     frame_i=int(frame_i),
                     left_label=str(left_txt),
@@ -15492,6 +16777,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                     ),
                     interaction_status=f"Boundary suggestion accepted at F{frame_i}",
                 )
+                if collected:
+                    self._save_scribble_sidecar_if_possible()
+                self._maybe_start_background_refiner_training()
+                return accepted
             self._record_scribble_proposal_feedback(
                 proposal,
                 accepted=False,
@@ -15515,7 +16804,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             reason="accepted",
             changed=True,
         )
-        self._commit_correction_session(
+        summary = self._commit_correction_session(
             query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
             point_type="boundary_scribble_accept",
             feedback_start=int(seg_s),
@@ -15572,7 +16861,27 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         left_txt = applied_left or str(left_label or seg_label or "?")
         right_txt = applied_right or str(right_label or seg_label or "?")
-        return self._finalize_accepted_boundary_suggestion(
+        query_utility = observed_query_utility_from_summary(summary)
+        collected = self._queue_adaptation_sample_from_boundary_accept(
+            proposal,
+            frame_i=int(frame_i),
+            left_label=str(left_txt),
+            right_label=str(right_txt),
+            query_utility=query_utility,
+        )
+        if str(descriptor.get("kind") or "store") == "store":
+            accept_rec = self._build_accept_record_for_point(
+                {
+                    "type": "boundary",
+                    "frame": int(frame_i),
+                    "left": {"label": str(left_txt)},
+                    "right": {"label": str(right_txt)},
+                },
+                boundary_frame=int(frame_i),
+            )
+            if accept_rec is not None:
+                self._store_explicit_confirm_record(accept_rec)
+        accepted = self._finalize_accepted_boundary_suggestion(
             proposal,
             frame_i=int(frame_i),
             left_label=str(applied_left),
@@ -15582,6 +16891,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             interaction_status=f"Boundary Scribble accepted at F{frame_i}",
             record_feedback=False,
         )
+        if collected:
+            self._save_scribble_sidecar_if_possible()
+        self._maybe_start_background_refiner_training()
+        return accepted
 
     def enter_scribble_mode(self) -> None:
         if self.extra_mode:
@@ -16628,6 +17941,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                 list(view.get("confirmed_accept_records") or [])
             ),
             "correction_history": self._jsonify_data(correction_history),
+            "adaptation_buffer": self._adaptation_buffer.to_jsonable(),
+            "local_refiner_checkpoint": str(
+                getattr(self, "_scribble_local_refiner_path", "") or ""
+            ),
         }
 
     def _save_scribble_sidecar_if_possible(
@@ -16695,10 +18012,27 @@ class ActionWindow(FrameControlMixin, QWidget):
         view["query_decision"] = self._deserialize_query_decision(
             data.get("query_decision")
         )
+        confirm_rows = data.get("confirmed_accept_records")
+        if isinstance(confirm_rows, list):
+            view["confirmed_accept_records"] = [
+                dict(item) for item in confirm_rows if isinstance(item, dict)
+            ]
         history = data.get("correction_history")
         if isinstance(history, list):
             self._correction_buffer.history = [dict(item) for item in history if isinstance(item, dict)]
             self._rebuild_query_learning_models_from_history()
+        adaptation_payload = data.get("adaptation_buffer")
+        if isinstance(adaptation_payload, dict):
+            self._sync_adaptation_buffer_limit()
+            self._adaptation_buffer.load_jsonable(adaptation_payload)
+        checkpoint_path = os.path.abspath(
+            os.path.expanduser(str(data.get("local_refiner_checkpoint", "") or "").strip())
+        )
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            scribble_cfg = self._algo_cfg.setdefault("scribble_local_refiner", {})
+            scribble_cfg["checkpoint"] = checkpoint_path
+            scribble_cfg["prefer_checkpoint"] = True
+            self._scribble_local_refiner = self._make_scribble_local_refiner()
         if int(target_idx) == int(self.active_view_idx):
             self._load_active_view_scribble_state()
 
@@ -17508,6 +18842,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self.store.add(name, f)
             self.extra_store = AnnotationStore()
             self.extra_cuts = []
+            self._ensure_escape_labels()
             result_name = str(model_name or "Model")
             self._set_status(
                 f"Loaded {result_name} results from {os.path.basename(txt_path)}"
@@ -17895,6 +19230,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         elif text.startswith("Export to Seed Dataset"):
             self._export_seed_dataset()
 
+        elif text.startswith("Export Confirmed Pseudo Labels"):
+            self._export_confirmed_pseudo_labels()
+
+        elif text.startswith("Distill Global Model"):
+            self._distill_global_model()
+
         elif text.startswith("Import label map"):
             self._import_label_map_txt()
 
@@ -17930,6 +19271,9 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         elif text.startswith("Open Review Panel"):
             self._open_review_panel()
+
+        elif text.startswith("Train Query Utility Model"):
+            self._train_query_utility_model()
 
     def _on_interaction_selected(self, idx: int):
         text = self.combo_interaction.itemText(idx)
@@ -18017,6 +19361,11 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _on_label_removed(self, idx: int):
         if 0 <= idx < len(self.labels):
             name = self.labels[idx].name
+            if is_escape_label(name):
+                self._set_status(f"{name} is reserved and cannot be removed.")
+                if getattr(self, "panel", None):
+                    self.panel.refresh()
+                return
             self.store.remove_all_of_label(name)
             if getattr(self, "prelabel_store", None):
                 try:
@@ -18036,6 +19385,16 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _on_label_renamed(self, old_name: str, new_name: str):
         if old_name == new_name:
+            return
+        if is_escape_label(old_name):
+            self._set_status(f"{old_name} is reserved and cannot be renamed.")
+            if getattr(self, "panel", None):
+                self.panel.refresh()
+            return
+        if is_escape_label(new_name):
+            self._set_status(f"{new_name} is reserved and cannot be reassigned.")
+            if getattr(self, "panel", None):
+                self.panel.refresh()
             return
         self.store.rename_label(old_name, new_name)
         if getattr(self, "prelabel_store", None):
@@ -19196,6 +20555,15 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._label_proto_counts = {}
         self._knn_memory = []
         self._correction_buffer = CorrectionBuffer()
+        self._adaptation_buffer = AdaptationSampleBuffer(
+            max_size=max(
+                1,
+                int(self._scribble_adaptation_cfg().get("max_buffer", 200) or 200),
+            )
+        )
+        self._background_refiner_trainer = None
+        self._background_refiner_used_samples = 0
+        self._background_refiner_context_key = ""
         self._confirmed_correction_records = []
         self._query_cost_model = QueryCostModel()
         self._query_utility_model = QueryUtilityModel()
@@ -20826,6 +22194,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             col = self._auto_color_key_for_id(lid)
             self.labels.append(LabelDef(name=name, color_name=col, id=lid))
             id2label[lid] = name
+        self._ensure_escape_labels()
         self.panel.refresh()
         self._rebuild_timeline_sources()
 
@@ -21571,6 +22940,224 @@ class ActionWindow(FrameControlMixin, QWidget):
                 json.dump(meta, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    def _export_confirmed_pseudo_labels(self):
+        """Export confirmed per-frame labels for Stage C global model distillation."""
+        if not getattr(self, "video_path", None):
+            QMessageBox.information(self, "Info", "Load a video first.")
+            return
+        if not self.views:
+            QMessageBox.information(self, "Info", "No views loaded.")
+            return
+        view = self.views[self.active_view_idx]
+        view_start = int(view.get("start", 0))
+        view_end = int(view.get("end", view_start))
+        store = view.get("store") or self.store
+
+        payload, labelled, total = self._build_confirmed_pseudo_label_payload(
+            view=view,
+            store=store,
+            view_start=int(view_start),
+            view_end=int(view_end),
+        )
+        if payload is None:
+            QMessageBox.information(self, "Info", "No confirmed labels to export.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Pseudo Labels for Distillation",
+            "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self._set_status(f"Pseudo-labels exported: {labelled}/{total} frames → {os.path.basename(path)}")
+        except Exception as ex:
+            QMessageBox.warning(self, "Error", f"Export failed:\n{ex}")
+
+    def _default_distilled_global_ckpt_path(self, ckpt_path: str = "") -> str:
+        anchor = str(ckpt_path or "").strip()
+        if anchor:
+            anchor = os.path.abspath(anchor)
+            base_dir = os.path.dirname(anchor)
+            base_name = os.path.splitext(os.path.basename(anchor))[0] or "distilled_global"
+        else:
+            features_dir = self._resolve_features_dir_for_snap()
+            if features_dir:
+                base_dir = os.path.abspath(features_dir)
+            elif getattr(self, "video_path", None):
+                base_dir = os.path.dirname(os.path.abspath(str(self.video_path)))
+            else:
+                base_dir = os.path.abspath(os.getcwd())
+            base_name = "distilled_global"
+        return os.path.join(base_dir, f"{base_name}_distilled.ckpt")
+
+    def _on_distill_global_model_done(self, checkpoint_path: str, pseudo_path: str = "") -> None:
+        self._distill_worker = None
+        self._distill_thread = None
+        tmp_paths = [pseudo_path]
+        queued = getattr(self, "_distill_temp_pseudo_paths", None)
+        if isinstance(queued, list):
+            tmp_paths.extend(str(item) for item in queued)
+            self._distill_temp_pseudo_paths = []
+        for path in tmp_paths:
+            path = str(path or "").strip()
+            if not path:
+                continue
+            try:
+                if os.path.isfile(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            self._set_status(
+                f"Global distillation finished: {os.path.basename(checkpoint_path)}"
+            )
+            self._log("distill_global_model", path=os.path.abspath(checkpoint_path), ok=True)
+            QMessageBox.information(
+                self,
+                "Distillation finished",
+                f"Saved distilled checkpoint:\n{checkpoint_path}",
+            )
+            return
+        self._set_status("Global distillation failed.")
+        self._log("distill_global_model", ok=False)
+        QMessageBox.warning(
+            self,
+            "Distillation failed",
+            "Global model distillation did not produce a checkpoint. Check the distillation log for details.",
+        )
+
+    def _distill_global_model(self) -> None:
+        current_thread = getattr(self, "_distill_thread", None)
+        if current_thread is not None:
+            try:
+                if current_thread.isRunning():
+                    QMessageBox.information(
+                        self,
+                        "Distillation in progress",
+                        "Global model distillation is already running.",
+                    )
+                    return
+            except Exception:
+                pass
+        if not self._ensure_python_modules_available(
+            ("torch",),
+            feature_name="global model distillation",
+            install_hint=(
+                "Install the optional ASOT dependencies first, "
+                "for example: pip install torch pytorch-lightning wandb scipy scikit-learn"
+            ),
+            unavailable_status=(
+                "Global model distillation is unavailable until the optional dependencies are installed."
+            ),
+        ):
+            return
+        if not getattr(self, "video_path", None):
+            QMessageBox.information(self, "Info", "Load a video first.")
+            return
+        if not self.views:
+            QMessageBox.information(self, "Info", "No views loaded.")
+            return
+        view = self.views[self.active_view_idx]
+        view_start = int(view.get("start", 0))
+        view_end = int(view.get("end", view_start))
+        store = view.get("store") or self.store
+        payload, labelled, total = self._build_confirmed_pseudo_label_payload(
+            view=view,
+            store=store,
+            view_start=int(view_start),
+            view_end=int(view_end),
+        )
+        if payload is None:
+            QMessageBox.information(self, "Info", "No confirmed labels to distill.")
+            return
+        features_dir = self._resolve_features_dir_for_snap()
+        if not features_dir:
+            features_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Choose features directory for distillation",
+                os.path.dirname(str(getattr(self, "video_path", "") or "").strip()) or os.getcwd(),
+            )
+        if not features_dir or not os.path.isfile(os.path.join(features_dir, "features.npy")):
+            QMessageBox.warning(
+                self,
+                "Missing features",
+                "A valid features directory with features.npy is required for distillation.",
+            )
+            return
+        default_ckpt = self._default_asot_ckpt()
+        init_dir = (
+            os.path.dirname(default_ckpt)
+            if default_ckpt
+            else os.path.join(self._root_dir, "external", "action_seg_ot")
+        )
+        ckpt, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose ASOT checkpoint for distillation",
+            init_dir,
+            "PyTorch Models (*.pth *.pt *.ckpt)",
+        )
+        if not ckpt:
+            ckpt = default_ckpt
+        if not ckpt or not os.path.isfile(ckpt):
+            QMessageBox.warning(self, "Missing checkpoint", "No ASOT checkpoint selected or found.")
+            return
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Distilled Global Checkpoint",
+            self._default_distilled_global_ckpt_path(ckpt),
+            "PyTorch Checkpoints (*.ckpt *.pth *.pt);;All Files (*)",
+        )
+        if not out_path:
+            return
+        tool_path = os.path.join(self._root_dir, "tools", "distill_global_model.py")
+        if not os.path.isfile(tool_path):
+            QMessageBox.warning(
+                self, "Missing script", f"Distillation script not found: {tool_path}"
+            )
+            return
+        fd, pseudo_path = tempfile.mkstemp(
+            prefix="impact_scribe_confirmed_",
+            suffix=".json",
+        )
+        os.close(fd)
+        try:
+            with open(pseudo_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as ex:
+            try:
+                os.unlink(pseudo_path)
+            except Exception:
+                pass
+            QMessageBox.warning(self, "Error", f"Failed to write temporary pseudo-label file:\n{ex}")
+            return
+        log_path = os.path.splitext(out_path)[0] + ".log"
+        self._distill_temp_pseudo_paths = [str(pseudo_path)]
+        self._set_status(
+            f"Starting global distillation on {labelled}/{total} confirmed frames..."
+        )
+        self._distill_thread = QThread(self)
+        self._distill_worker = DistillGlobalWorker(
+            pseudo_labels=pseudo_path,
+            features_dir=features_dir,
+            ckpt=ckpt,
+            output=out_path,
+            tool_path=tool_path,
+            log_path=log_path,
+        )
+        self._distill_worker.moveToThread(self._distill_thread)
+        self._distill_thread.started.connect(self._distill_worker.run)
+        self._distill_worker.progress.connect(self._set_status)
+        self._distill_worker.done.connect(
+            lambda p, pseudo=pseudo_path: self._on_distill_global_model_done(p, pseudo)
+        )
+        self._distill_worker.done.connect(self._distill_thread.quit)
+        self._distill_thread.finished.connect(self._distill_worker.deleteLater)
+        self._distill_thread.start()
 
     def _export_seed_dataset(self):
         if not getattr(self, "video_path", None):

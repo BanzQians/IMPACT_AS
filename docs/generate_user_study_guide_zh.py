@@ -62,6 +62,7 @@ h2 {{
   padding-bottom: 4px;
   margin-top: 28px;
   page-break-after: avoid;
+  page-break-before: auto;
 }}
 h3 {{
   font-size: 13pt;
@@ -101,6 +102,11 @@ th {{
   font-weight: bold;
 }}
 .page-break {{ page-break-before: always; }}
+img {{ page-break-inside: avoid; }}
+table {{ page-break-inside: avoid; }}
+.tip {{ page-break-inside: avoid; }}
+li {{ page-break-inside: avoid; }}
+h3 + p {{ page-break-before: avoid; }}
 .tip {{
   background: #f0f7ff;
   border-left: 4px solid #3b82f6;
@@ -181,7 +187,6 @@ th {{
 {img_tag("step_05_refine_and_accept.png", "图 5：画 Scribble、精修、接受")}
 
 <!-- 3. 核心操作流程 -->
-<div class="page-break"></div>
 <h2>3. 核心操作流程</h2>
 
 <h3>3.1 直接在时间轴上标注（基础操作）</h3>
@@ -247,7 +252,6 @@ th {{
 </p>
 
 <!-- 4. 界面参考 -->
-<div class="page-break"></div>
 <h2>4. 界面参考</h2>
 
 <h3>4.1 工具栏按钮</h3>
@@ -308,7 +312,6 @@ th {{
 </ul>
 
 <!-- 5. 快捷键 -->
-<div class="page-break"></div>
 <h2>5. 快捷键</h2>
 
 <h3>导航</h3>
@@ -377,7 +380,6 @@ th {{
 </table>
 
 <!-- 8. 用户研究任务说明 -->
-<div class="page-break"></div>
 <h2>8. 用户研究任务说明</h2>
 
 <h3>8.1 您的任务</h3>

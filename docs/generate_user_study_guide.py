@@ -122,6 +122,12 @@ class GuidePDF(FPDF):
         self._color(40, 50, 60)
         self.cell(0, 6, desc, ln=True)
 
+    def _ensure_space(self, needed_mm=60):
+        """Add a new page only if less than *needed_mm* mm remain."""
+        page_h = self.h - self.b_margin
+        if self.get_y() + needed_mm > page_h:
+            self.add_page()
+
     # ---- content ----
     def build(self):
         self._title_page()
@@ -189,7 +195,7 @@ class GuidePDF(FPDF):
         self._img("step_05_refine_and_accept.png", "Fig 5. Draw a scribble, refine, and accept")
 
         # ======== 3. Core Workflows ========
-        self.add_page()
+        self._ensure_space(50)
         self._section("3. Core Workflows")
 
         self._section("3.1 Direct Timeline Annotation (Basic)", level=2)
@@ -263,7 +269,7 @@ class GuidePDF(FPDF):
         )
 
         # ======== 4. Interface Reference ========
-        self.add_page()
+        self._ensure_space(50)
         self._section("4. Interface Reference")
 
         self._section("4.1 Toolbar Buttons", level=2)
@@ -315,7 +321,7 @@ class GuidePDF(FPDF):
         self._bullet("Action buttons: Accept / Reject / Start Scribble")
 
         # ======== 5. Keyboard Shortcuts ========
-        self.add_page()
+        self._ensure_space(50)
         self._section("5. Keyboard Shortcuts")
 
         self._section("Navigation", level=2)
@@ -371,7 +377,7 @@ class GuidePDF(FPDF):
         self._bold_bullet("Import/Export Label Map ", "- Load or save the label vocabulary (TXT)")
 
         # ======== 8. User Study Task ========
-        self.add_page()
+        self._ensure_space(50)
         self._section("8. User Study Task Instructions")
 
         self._section("8.1 Your Task", level=2)

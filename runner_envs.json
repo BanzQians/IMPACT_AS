@@ -1,8 +1,5 @@
-﻿{
-  "ui": "current",
-  "opentad": "current",
-  "east": "current",
+{
+  "current": "current",
   "asot": "current",
-  "mobileclip": "mobileclip",
   "siglip2": "siglip2"
 }

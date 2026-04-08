@@ -591,9 +591,14 @@ class QueryUtilityModel:
 #   [0] span_len_norm (log-scaled)
 #   [1..3] query_type one-hot (boundary_scribble, label_review, state_repair)
 #   [4] uncertainty score
-#   [5] boundary energy score
-#   [6] state_conflict score
-_QUERY_FEAT_DIM = 7
+#   [5] disagreement score
+#   [6] multiview score
+#   [7] state_conflict score
+#   [8] propagation_gain score
+#   [9] history prior
+#   [10] boundary energy score
+#   [11] normalized estimated_cost
+_QUERY_FEAT_DIM = 12
 _QUERY_TYPE_INDEX = {
     QueryType.BOUNDARY_SCRIBBLE: 0,
     QueryType.LABEL_REVIEW: 1,
@@ -610,8 +615,13 @@ def _candidate_to_feature_vec(candidate: QueryCandidate) -> np.ndarray:
     vec[1 + idx] = 1.0
     terms = dict(candidate.score_terms or {})
     vec[4] = _clamp(terms.get("uncertainty", 0.0))
-    vec[5] = _clamp(terms.get("energy", 0.0))
-    vec[6] = _clamp(terms.get("state_conflict", 0.0))
+    vec[5] = _clamp(terms.get("disagreement", 0.0))
+    vec[6] = _clamp(terms.get("multiview", 0.0))
+    vec[7] = _clamp(terms.get("state_conflict", 0.0))
+    vec[8] = _clamp(terms.get("propagation_gain", 0.0))
+    vec[9] = _clamp(terms.get("history", 0.0))
+    vec[10] = _clamp(terms.get("energy", 0.0))
+    vec[11] = _clamp(float(candidate.estimated_cost or 0.0) / 2.0)
     return vec
 
 
@@ -679,20 +689,25 @@ class TrainableQueryUtilityModel:
         self.add_observation(candidate, utility)
 
     def fit(self, *, lr: float = 0.01, epochs: int = 20) -> float:
-        """Train weights on accumulated observations via SGD. Returns final MSE."""
+        """Train weights on accumulated observations via weighted SGD. Returns final MSE."""
         if len(self._observations) < 3:
             self.ready = False
             return 0.0
         feats = np.stack([o["feat"] for o in self._observations]).astype(np.float64)
         targets = np.array([o["utility"] for o in self._observations], dtype=np.float64)
+        # Favor recent corrections slightly so the planner can adapt to the current
+        # user/session without forgetting the older signal entirely.
+        sample_weights = np.linspace(0.7, 1.0, num=len(targets), dtype=np.float64)
+        reg = 1e-3
         w = self.weights.copy()
         b = float(self.bias)
         n = len(targets)
         for _ in range(max(1, int(epochs))):
             preds = feats @ w + b
             residuals = preds - targets
-            grad_w = (2.0 / n) * (feats.T @ residuals)
-            grad_b = (2.0 / n) * residuals.sum()
+            weighted = residuals * sample_weights
+            grad_w = (2.0 / n) * (feats.T @ weighted) + 2.0 * reg * w
+            grad_b = (2.0 / n) * weighted.sum()
             w -= lr * grad_w
             b -= lr * grad_b
         self.weights = w
@@ -700,7 +715,7 @@ class TrainableQueryUtilityModel:
         was_ready = self.ready
         self.ready = True
         preds = feats @ w + b
-        mse = float(np.mean((preds - targets) ** 2))
+        mse = float(np.mean(sample_weights * ((preds - targets) ** 2)))
         if not was_ready:
             _log.info(
                 "TrainableQueryUtilityModel now ready (n=%d, mse=%.4f)",
@@ -725,12 +740,21 @@ class TrainableQueryUtilityModel:
         if not isinstance(data, dict):
             return
         w = data.get("weights")
-        if isinstance(w, list) and len(w) == _QUERY_FEAT_DIM:
-            self.weights = np.array(w, dtype=np.float64)
+        loaded_weights = False
+        if isinstance(w, list) and w:
+            arr = np.asarray(w, dtype=np.float64).reshape(-1)
+            if int(arr.size) >= _QUERY_FEAT_DIM:
+                self.weights = arr[:_QUERY_FEAT_DIM].astype(np.float64)
+                loaded_weights = True
+            else:
+                padded = np.zeros(_QUERY_FEAT_DIM, dtype=np.float64)
+                padded[: int(arr.size)] = arr
+                self.weights = padded
+                loaded_weights = True
         b = data.get("bias")
         if b is not None:
             self.bias = float(b)
-        self.ready = bool(data.get("ready", True))
+        self.ready = bool(data.get("ready", True) and loaded_weights)
 
 
 class ProposalConfidenceCalibrator:

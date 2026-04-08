@@ -143,7 +143,7 @@ This is the basis for structured constraints.
     - ResNet50
 
 - `tools/asot_full_infer_adapter.py`
-  - ASOT pre-label inference for current-video feature directories
+  - optional external pre-label inference for current-video feature directories
 
 - `tools/boundary_eval.py`
   - evaluates boundary quality
@@ -772,7 +772,7 @@ After real use begins:
 - collect real correction sessions
 - fine-tune the local model and query planner
 
-### Stage C: Global model distillation
+### Stage C: Global model training from confirmed windows
 
 Convert confirmed local corrections into supervision for the full-sequence model.
 

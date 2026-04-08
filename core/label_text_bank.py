@@ -216,7 +216,7 @@ def ensure_label_text_bank(
     classes: Sequence[str],
     feature_dim: int,
     *,
-    backend: str = "siglip2",
+    backend: str = "auto",
     model_name: str = "",
     prompt_template: str = "assembly action: {}",
 ) -> Dict[str, Any]:
@@ -225,7 +225,7 @@ def ensure_label_text_bank(
     os.makedirs(runtime_dir, exist_ok=True)
     labels = _normalize_labels(classes)
     feature_dim = int(max(1, feature_dim))
-    backend = str(backend or "siglip2").strip().lower() or "siglip2"
+    backend = str(backend or "auto").strip().lower() or "auto"
     model_name = str(
         model_name
         or os.environ.get("TEXT_BANK_MODEL")

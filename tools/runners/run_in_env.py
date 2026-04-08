@@ -5,6 +5,7 @@ Run a Python script in a selected conda environment profile.
 
 Usage:
   python tools/runners/run_in_env.py --profile current -- tools/siglip2_text_bank.py --help
+  python tools/runners/run_in_env.py --profile asot -- tools/asot_full_infer_adapter.py --help
   python tools/runners/run_in_env.py --profile siglip2 -- tools/siglip2_text_bank.py --help
 """
 
@@ -36,8 +37,7 @@ def _quiet_windows_kwargs() -> dict:
 
 PROFILE_DEFAULT_ENVS: Dict[str, str] = {
     "current": "current",
-    "ui": "current",
-    "mobileclip": "mobileclip",
+    "asot": "current",
     "siglip2": "siglip2",
 }
 
@@ -83,18 +83,18 @@ def _resolve_env_name(profile: str, explicit_env: str) -> str:
     if os.environ.get(env_key):
         return str(os.environ.get(env_key) or "").strip()
 
-    if key == "mobileclip" and os.environ.get("MOBILECLIP_CONDA_ENV"):
-        return str(os.environ.get("MOBILECLIP_CONDA_ENV") or "").strip()
-    if key == "mobileclip" and os.environ.get("MOBILECLIP_CONDA_PREFIX"):
-        return str(os.environ.get("MOBILECLIP_CONDA_PREFIX") or "").strip()
+    if key in {"current", "asot"} and os.environ.get("CURRENT_CONDA_ENV"):
+        return str(os.environ.get("CURRENT_CONDA_ENV") or "").strip()
+    if key in {"current", "asot"} and os.environ.get("CURRENT_CONDA_PREFIX"):
+        return str(os.environ.get("CURRENT_CONDA_PREFIX") or "").strip()
+    if key == "asot" and os.environ.get("ASOT_CONDA_ENV"):
+        return str(os.environ.get("ASOT_CONDA_ENV") or "").strip()
+    if key == "asot" and os.environ.get("ASOT_CONDA_PREFIX"):
+        return str(os.environ.get("ASOT_CONDA_PREFIX") or "").strip()
     if key == "siglip2" and os.environ.get("SIGLIP2_CONDA_ENV"):
         return str(os.environ.get("SIGLIP2_CONDA_ENV") or "").strip()
     if key == "siglip2" and os.environ.get("SIGLIP2_CONDA_PREFIX"):
         return str(os.environ.get("SIGLIP2_CONDA_PREFIX") or "").strip()
-    if key in {"current", "ui"} and os.environ.get("OPENTAD_CONDA_ENV"):
-        return str(os.environ.get("OPENTAD_CONDA_ENV") or "").strip()
-    if key in {"current", "ui"} and os.environ.get("OPENTAD_CONDA_PREFIX"):
-        return str(os.environ.get("OPENTAD_CONDA_PREFIX") or "").strip()
 
     config_map = _load_env_config()
     if config_map.get(key):
@@ -102,10 +102,6 @@ def _resolve_env_name(profile: str, explicit_env: str) -> str:
 
     # Common local layout fallback: /home/.../conda_envs/<name>
     home = os.path.expanduser("~")
-    if key == "mobileclip":
-        cand = os.path.join(home, "IsaacDrive", "conda_envs", key)
-        if os.path.isdir(cand):
-            return cand
     if key == "siglip2":
         cand = os.path.join(home, "IsaacDrive", "conda_envs", key)
         if os.path.isdir(cand):
@@ -136,7 +132,7 @@ def _build_exec_cmd(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run a script in a configured conda environment profile.")
-    ap.add_argument("--profile", default="current", help="Environment profile: current/ui/mobileclip/siglip2/...")
+    ap.add_argument("--profile", default="current", help="Environment profile: current/asot/siglip2/...")
     ap.add_argument("--env-name", default="", help="Override conda env name directly.")
     ap.add_argument("--conda-exe", default=os.environ.get("CONDA_EXE", "conda"), help="conda executable path.")
     ap.add_argument("--python-bin", default="python", help="Python binary name inside target env.")

@@ -3,7 +3,7 @@
   "FEATURE_BACKBONE": "i3d",
   "FEATURE_TARGET_DIM": 1024,
   "I3D_TARGET_DIM": 1024,
-  "TEXT_BANK_BACKEND": "siglip2",
+  "TEXT_BANK_BACKEND": "auto",
   "TEXT_BANK_MODEL": "external/huggingface/google--siglip2-base-patch16-224",
   "TEXT_BANK_PROMPT_TEMPLATE": "assembly action: {}",
   "TEXT_BANK_WEIGHT": 0.35,

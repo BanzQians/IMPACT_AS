@@ -90,6 +90,8 @@ class LabelPanel(QWidget):
         self._selected_verb: Optional[str] = None
         self._selected_label_name: Optional[str] = None
         self._item_fg = QColor(32, 32, 32)
+        self._browser_primary_title = "Verb"
+        self._browser_secondary_title = "Object"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -156,7 +158,7 @@ class LabelPanel(QWidget):
         verb_layout = QVBoxLayout(self.verb_col)
         verb_layout.setContentsMargins(0, 0, 0, 0)
         verb_layout.setSpacing(4)
-        self.lbl_verb = QLabel("Verb")
+        self.lbl_verb = QLabel(self._browser_primary_title)
         self.lbl_verb.setObjectName("labelPanelColumn")
         verb_layout.addWidget(self.lbl_verb)
         self.verb_list = QListWidget(self)
@@ -167,7 +169,7 @@ class LabelPanel(QWidget):
         obj_layout = QVBoxLayout(self.obj_col)
         obj_layout.setContentsMargins(0, 0, 0, 0)
         obj_layout.setSpacing(4)
-        self.lbl_object = QLabel("Object")
+        self.lbl_object = QLabel(self._browser_secondary_title)
         self.lbl_object.setObjectName("labelPanelColumn")
         obj_layout.addWidget(self.lbl_object)
         self.obj_list = QListWidget(self)
@@ -212,6 +214,12 @@ class LabelPanel(QWidget):
         self._compound_verbs = set(cleaned)
         if refresh:
             self.refresh()
+
+    def set_browser_titles(self, primary: str = "Verb", secondary: str = "Object"):
+        self._browser_primary_title = str(primary or "Verb")
+        self._browser_secondary_title = str(secondary or "Object")
+        self.lbl_verb.setText(self._browser_primary_title)
+        self.lbl_object.setText(self._browser_secondary_title)
 
     def set_verb_only(self, on: bool):
         """Toggle verb-only mode by hiding the object column."""
@@ -557,8 +565,22 @@ class LabelPanel(QWidget):
         self._candidate_order = names
         self._candidate_conf = {name: conf for name, conf in candidates if name}
         self._candidate_only = True
-        self._selected_label_name = None
-        self._selected_verb = None
+        preferred_name = str(self._selected_label_name or "").strip()
+        chosen_name = ""
+        if preferred_name and preferred_name in names:
+            chosen_name = preferred_name
+        else:
+            current_name = str(self.current_label_name() or "").strip()
+            if current_name and current_name in names:
+                chosen_name = current_name
+            elif names:
+                chosen_name = str(names[0] or "").strip()
+        self._selected_label_name = chosen_name or None
+        if chosen_name:
+            chosen_verb, _ = self._split_label(chosen_name)
+            self._selected_verb = chosen_verb or None
+        else:
+            self._selected_verb = None
         self.refresh()
 
     def clear_candidate_priority(self):

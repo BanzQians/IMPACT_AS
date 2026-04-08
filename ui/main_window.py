@@ -23,7 +23,7 @@ class MainWindow(QWidget):
 
     def __init__(self, logger: OperationLogger = None):
         super().__init__()
-        self._app_title = "IMPACT AS"
+        self._app_title = "IMPACT-Scribe"
         self.setWindowTitle(self._app_title)
         self.setGeometry(100, 80, 1200, 780)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)

@@ -127,6 +127,7 @@ class AdaptationSample:
     side_valid: bool = True
     action_valid: bool = True
     query_utility: float = -1.0
+    calibrated_confidence: float = -1.0
     timestamp: str = field(default_factory=_utc_now_iso)
 
     def to_jsonable(self) -> Dict[str, Any]:
@@ -151,6 +152,7 @@ class AdaptationSample:
             "side_valid": bool(self.side_valid),
             "action_valid": bool(self.action_valid),
             "query_utility": float(self.query_utility),
+            "calibrated_confidence": float(self.calibrated_confidence),
             "timestamp": str(self.timestamp or _utc_now_iso()),
         }
 
@@ -186,6 +188,9 @@ class AdaptationSample:
                 side_valid=bool(payload.get("side_valid", True)),
                 action_valid=bool(payload.get("action_valid", True)),
                 query_utility=float(payload.get("query_utility", -1.0) or -1.0),
+                calibrated_confidence=float(
+                    payload.get("calibrated_confidence", -1.0) or -1.0
+                ),
                 timestamp=str(payload.get("timestamp", "") or _utc_now_iso()),
             )
         except Exception:
@@ -227,6 +232,7 @@ class AdaptationSampleBuffer:
                 "side_valid": bool(s.side_valid),
                 "action_valid": bool(s.action_valid),
                 "query_utility": float(s.query_utility),
+                "calibrated_confidence": float(s.calibrated_confidence),
                 "window_features": s.window_features,
                 "scribble_channels": s.scribble_channels,
                 "boundary_energy": s.boundary_energy,

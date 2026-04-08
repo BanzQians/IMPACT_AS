@@ -53,6 +53,11 @@ class BackgroundRefinerTrainer(QThread):
         action_loss_weight: float = 0.0,
         struct_loss_weight: float = 0.0,
         query_loss_weight: float = 0.0,
+        max_train_samples: int = 192,
+        min_calibrated_confidence: float = 0.35,
+        validation_fraction: float = 0.15,
+        min_validation_samples: int = 8,
+        max_validation_regression: float = 0.02,
         device: str = "auto",
         parent=None,
     ) -> None:
@@ -76,12 +81,61 @@ class BackgroundRefinerTrainer(QThread):
         self.action_loss_weight = max(0.0, float(action_loss_weight))
         self.struct_loss_weight = max(0.0, float(struct_loss_weight))
         self.query_loss_weight = max(0.0, float(query_loss_weight))
+        self.max_train_samples = max(8, int(max_train_samples))
+        self.min_calibrated_confidence = float(min_calibrated_confidence)
+        self.validation_fraction = max(0.0, min(0.45, float(validation_fraction)))
+        self.min_validation_samples = max(4, int(min_validation_samples))
+        self.max_validation_regression = max(0.0, float(max_validation_regression))
         self.device_request = str(device)
         self._result_path = ""
 
     @property
     def result_path(self) -> str:
         return self._result_path
+
+    def _sample_confidence(self, sample: Dict[str, Any]) -> float:
+        try:
+            return float(sample.get("calibrated_confidence", -1.0) or -1.0)
+        except Exception:
+            return -1.0
+
+    def _select_training_samples(self, samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = [dict(sample) for sample in list(samples or []) if isinstance(sample, dict)]
+        filtered: List[Dict[str, Any]] = []
+        dropped_low_conf = 0
+        for sample in rows:
+            kind = str(sample.get("sample_kind", "boundary_accept") or "boundary_accept")
+            conf = self._sample_confidence(sample)
+            if (
+                kind == "boundary_accept"
+                and conf >= 0.0
+                and conf < self.min_calibrated_confidence
+            ):
+                dropped_low_conf += 1
+                continue
+            filtered.append(sample)
+        if dropped_low_conf > 0:
+            self.progress.emit(
+                "[BackgroundRefinerTrainer] skipped "
+                f"{dropped_low_conf} low-confidence adaptation samples"
+            )
+        if len(filtered) <= self.max_train_samples:
+            return filtered
+        recent_keep = max(1, self.max_train_samples // 2)
+        recent = filtered[-recent_keep:]
+        older = filtered[:-recent_keep]
+        replay_keep = max(0, self.max_train_samples - len(recent))
+        replay: List[Dict[str, Any]] = []
+        if replay_keep > 0 and older:
+            rng = random.Random(17)
+            replay = rng.sample(older, min(replay_keep, len(older)))
+            replay.sort(key=lambda row: str(row.get("timestamp", "") or ""))
+        selected = replay + recent
+        self.progress.emit(
+            "[BackgroundRefinerTrainer] replay-selected "
+            f"{len(selected)}/{len(filtered)} samples for stable adaptation"
+        )
+        return selected
 
     def run(self) -> None:
         try:
@@ -101,9 +155,15 @@ class BackgroundRefinerTrainer(QThread):
             _import_torch,
             _resolve_torch_device,
         )
-        self.progress.emit(f"[BackgroundRefinerTrainer] starting with {len(self.samples)} samples")
-
         if not self.samples:
+            self.training_finished.emit("")
+            return
+        selected_samples = self._select_training_samples(self.samples)
+        self.progress.emit(
+            "[BackgroundRefinerTrainer] starting with "
+            f"{len(self.samples)} buffered samples ({len(selected_samples)} selected)"
+        )
+        if not selected_samples:
             self.training_finished.emit("")
             return
 
@@ -171,7 +231,7 @@ class BackgroundRefinerTrainer(QThread):
         default_label_idx = int(min(self.label_to_idx.values())) if self.label_to_idx else 0
         inferred_input_dim: Optional[int] = None
 
-        for sample in self.samples:
+        for sample in selected_samples:
             wf = np.asarray(sample.get("window_features"), dtype=np.float32)
             sc = sample.get("scribble_channels", {})
             ws = int(sample.get("window_start", 0))
@@ -317,85 +377,125 @@ class BackgroundRefinerTrainer(QThread):
         )
         criterion = nn.CrossEntropyLoss()
 
+        def _compute_loss_for_indices(index_tensor: "torch.Tensor") -> "torch.Tensor":
+            out = model(t_x[index_tensor], t_unc[index_tensor], t_lft[index_tensor], t_rgt[index_tensor])
+            batch = {
+                "uncertain": t_unc[index_tensor],
+                "left": t_lft[index_tensor],
+                "right": t_rgt[index_tensor],
+                "boundary_index": t_bi[index_tensor],
+                "left_label": t_ll[index_tensor],
+                "right_label": t_rl[index_tensor],
+                "action_labels": t_action[index_tensor],
+                "query_utility": t_query[index_tensor],
+                "boundary_valid": t_boundary_valid[index_tensor],
+                "side_valid": t_side_valid[index_tensor],
+                "action_valid": t_action_valid[index_tensor],
+            }
+            loss = float(boundary_weight) * _compute_boundary_loss(
+                out, batch, criterion, device
+            ) + float(label_weight) * _compute_side_loss(
+                out, batch, criterion, device
+            )
+            if num_states > 0 and left_states:
+                idx_list = index_tensor.detach().cpu().tolist()
+                batch["left_state"] = torch.tensor(
+                    [left_states[i] for i in idx_list], dtype=torch.long, device=device
+                )
+                batch["right_state"] = torch.tensor(
+                    [right_states[i] for i in idx_list], dtype=torch.long, device=device
+                )
+                batch["state_before"] = torch.tensor(
+                    [state_before[i] for i in idx_list], dtype=torch.long, device=device
+                )
+                batch["state_after"] = torch.tensor(
+                    [state_after[i] for i in idx_list], dtype=torch.long, device=device
+                )
+                if state_weight > 0.0 and "left_state_logits" in out:
+                    loss = loss + float(state_weight) * _compute_state_loss(
+                        out, batch, criterion, device
+                    )
+                if consistency_weight > 0.0:
+                    loss = loss + float(consistency_weight) * _compute_consistency_loss(
+                        out, batch, device
+                    )
+            if action_weight > 0.0 and "action_logits" in out:
+                loss = loss + float(action_weight) * _compute_action_loss(
+                    out, batch, device
+                )
+            if struct_weight > 0.0 and "action_logits" in out:
+                loss = loss + float(struct_weight) * _compute_struct_loss(
+                    out, batch, device
+                )
+            if query_weight > 0.0 and "query_utility_logits" in out:
+                loss = loss + float(query_weight) * _compute_query_loss(
+                    out, batch, device
+                )
+            return loss
+
         # Training loop
         n = t_x.shape[0]
+        val_indices: List[int] = []
+        train_indices: List[int] = list(range(n))
+        if n >= self.min_validation_samples and self.validation_fraction > 0.0:
+            val_count = int(round(float(n) * self.validation_fraction))
+            val_count = max(1, min(n - 1, val_count))
+            if val_count > 0:
+                val_indices = list(range(n - val_count, n))
+                train_indices = list(range(0, n - val_count))
+                self.progress.emit(
+                    "[BackgroundRefinerTrainer] using "
+                    f"{len(train_indices)} train / {len(val_indices)} validation samples"
+                )
+        train_idx_full = torch.tensor(train_indices, dtype=torch.long, device=device)
+        val_idx_full = (
+            torch.tensor(val_indices, dtype=torch.long, device=device)
+            if val_indices
+            else None
+        )
+        baseline_val_loss: Optional[float] = None
+        if val_idx_full is not None and int(val_idx_full.numel()) > 0:
+            model.eval()
+            with torch.no_grad():
+                baseline_val_loss = float(_compute_loss_for_indices(val_idx_full).item())
+            self.progress.emit(
+                "[BackgroundRefinerTrainer] baseline validation loss="
+                f"{baseline_val_loss:.4f}"
+            )
         model.train()
         for epoch in range(1, self.epochs + 1):
-            perm = torch.randperm(n, device=device)
+            perm = train_idx_full[torch.randperm(int(train_idx_full.numel()), device=device)]
             total_loss = 0.0
-            for start in range(0, n, max(1, min(32, n))):
-                idx = perm[start:start + 32]
+            batch_size = max(1, min(32, int(train_idx_full.numel())))
+            for start in range(0, int(train_idx_full.numel()), batch_size):
+                idx = perm[start:start + batch_size]
                 optimizer.zero_grad(set_to_none=True)
-                out = model(t_x[idx], t_unc[idx], t_lft[idx], t_rgt[idx])
-                batch = {
-                    "uncertain": t_unc[idx],
-                    "left": t_lft[idx],
-                    "right": t_rgt[idx],
-                    "boundary_index": t_bi[idx],
-                    "left_label": t_ll[idx],
-                    "right_label": t_rl[idx],
-                    "action_labels": t_action[idx],
-                    "query_utility": t_query[idx],
-                    "boundary_valid": t_boundary_valid[idx],
-                    "side_valid": t_side_valid[idx],
-                    "action_valid": t_action_valid[idx],
-                }
-                loss = float(boundary_weight) * _compute_boundary_loss(
-                    out, batch, criterion, device
-                ) + float(label_weight) * _compute_side_loss(
-                    out, batch, criterion, device
-                )
-                if num_states > 0 and left_states:
-                    t_ls = torch.tensor(
-                        [left_states[i] for i in idx.cpu().tolist()],
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    t_rs = torch.tensor(
-                        [right_states[i] for i in idx.cpu().tolist()],
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    t_sb = torch.tensor(
-                        [state_before[i] for i in idx.cpu().tolist()],
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    t_sa = torch.tensor(
-                        [state_after[i] for i in idx.cpu().tolist()],
-                        dtype=torch.long,
-                        device=device,
-                    )
-                    batch["left_state"] = t_ls
-                    batch["right_state"] = t_rs
-                    batch["state_before"] = t_sb
-                    batch["state_after"] = t_sa
-                    if state_weight > 0.0 and "left_state_logits" in out:
-                        loss = loss + float(state_weight) * _compute_state_loss(
-                            out, batch, criterion, device
-                        )
-                    if consistency_weight > 0.0:
-                        loss = loss + float(consistency_weight) * _compute_consistency_loss(
-                            out, batch, device
-                        )
-                if action_weight > 0.0 and "action_logits" in out:
-                    loss = loss + float(action_weight) * _compute_action_loss(
-                        out, batch, device
-                    )
-                if struct_weight > 0.0 and "action_logits" in out:
-                    loss = loss + float(struct_weight) * _compute_struct_loss(
-                        out, batch, device
-                    )
-                if query_weight > 0.0 and "query_utility_logits" in out:
-                    loss = loss + float(query_weight) * _compute_query_loss(
-                        out, batch, device
-                    )
-
+                loss = _compute_loss_for_indices(idx)
                 loss.backward()
                 optimizer.step()
                 total_loss += float(loss.item()) * len(idx)
-            avg = total_loss / max(1, n)
+            avg = total_loss / max(1, int(train_idx_full.numel()))
             self.progress.emit(f"[BackgroundRefinerTrainer] epoch {epoch}/{self.epochs} loss={avg:.4f}")
+
+        adapted_val_loss: Optional[float] = None
+        if val_idx_full is not None and int(val_idx_full.numel()) > 0:
+            model.eval()
+            with torch.no_grad():
+                adapted_val_loss = float(_compute_loss_for_indices(val_idx_full).item())
+            self.progress.emit(
+                "[BackgroundRefinerTrainer] adapted validation loss="
+                f"{adapted_val_loss:.4f}"
+            )
+            if (
+                baseline_val_loss is not None
+                and adapted_val_loss > baseline_val_loss + self.max_validation_regression
+            ):
+                self.progress.emit(
+                    "[BackgroundRefinerTrainer] rejected checkpoint because validation "
+                    f"loss regressed ({baseline_val_loss:.4f} -> {adapted_val_loss:.4f})"
+                )
+                self.training_finished.emit("")
+                return
 
         # Save checkpoint
         lora_sd: Dict[str, Any] = {}
@@ -434,8 +534,15 @@ class BackgroundRefinerTrainer(QThread):
         new_ckpt["query_head"] = bool(query_weight > 0.0)
         new_ckpt["num_examples"] = int(len(xs))
         new_ckpt["adaptation_samples"] = int(len(xs))
+        new_ckpt["selected_adaptation_samples"] = int(len(selected_samples))
         new_ckpt["bootstrap_from_scratch"] = bool(not has_base_checkpoint)
         new_ckpt["base_checkpoint"] = str(self.base_checkpoint or "")
+        new_ckpt["validation_fraction"] = float(self.validation_fraction)
+        new_ckpt["validation_samples"] = int(len(val_indices))
+        if baseline_val_loss is not None:
+            new_ckpt["baseline_validation_loss"] = float(baseline_val_loss)
+        if adapted_val_loss is not None:
+            new_ckpt["adapted_validation_loss"] = float(adapted_val_loss)
         if lora_sd:
             new_ckpt["lora_state_dict"] = lora_sd
             new_ckpt["lora_rank"] = self.lora_rank

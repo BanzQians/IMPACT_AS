@@ -5,6 +5,7 @@ import argparse
 import bisect
 import json
 import statistics
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -37,11 +38,36 @@ def _parse_deltas(text: str) -> List[int]:
     return rows or [5, 10, 20]
 
 
+def _parse_float_budgets(text: str) -> List[float]:
+    rows: List[float] = []
+    for part in str(text or "").split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        try:
+            value = float(chunk)
+        except Exception:
+            continue
+        if value > 0:
+            rows.append(float(value))
+    return rows
+
+
 def _mean(values: Sequence[float]) -> Optional[float]:
     rows = [float(v) for v in values if v is not None]
     if not rows:
         return None
     return float(sum(rows) / len(rows))
+
+
+def _parse_timestamp_seconds(text: str) -> Optional[float]:
+    stamp = str(text or "").strip()
+    if not stamp:
+        return None
+    try:
+        return float(datetime.fromisoformat(stamp).timestamp())
+    except Exception:
+        return None
 
 
 def _resolve_gt_path(
@@ -149,6 +175,42 @@ def _evaluate_case(
     boundary_curve: List[Dict[str, Any]] = []
     seen_boundaries = set()
     ordered_boundaries: List[int] = []
+    history_cost_lookup: Dict[int, float] = {}
+    history_elapsed_lookup: Dict[int, Optional[float]] = {}
+    history_rows = extract_correction_events(history, include_feedback=False)
+    online_cost_model = QueryCostModel()
+    first_event_seconds: Optional[float] = None
+    for row in history_rows:
+        qtype_text = str(row.get("query_type") or "").strip().lower()
+        try:
+            qtype = QueryType(qtype_text)
+        except Exception:
+            continue
+        candidate = QueryCandidate(
+            query_id=f"history:{int(row.get('history_index', 0) or 0)}",
+            query_type=qtype,
+            start_frame=int(row.get("start_frame", 0) or 0),
+            end_frame=int(row.get("end_frame", row.get("start_frame", 0)) or 0),
+        )
+        history_cost_lookup[int(row.get("history_index", 0) or 0)] = float(
+            online_cost_model.predict(candidate)
+        )
+        stamp_seconds = _parse_timestamp_seconds(
+            row.get("committed_at") or row.get("started_at")
+        )
+        if stamp_seconds is not None and first_event_seconds is None:
+            first_event_seconds = float(stamp_seconds)
+        history_elapsed_lookup[int(row.get("history_index", 0) or 0)] = (
+            None
+            if stamp_seconds is None or first_event_seconds is None
+            else float(max(0.0, stamp_seconds - first_event_seconds))
+        )
+        summary = row.get("summary")
+        if isinstance(summary, dict):
+            online_cost_model.update_from_summary(summary)
+
+    cumulative_steps = 0.0
+    cumulative_cost = 0.0
     for index, event in enumerate(boundary_events, start=1):
         boundary_frame = event.get("boundary_frame")
         if boundary_frame is None:
@@ -159,9 +221,19 @@ def _evaluate_case(
         if frame_i not in seen_boundaries:
             seen_boundaries.add(frame_i)
             ordered_boundaries.append(frame_i)
+        event_steps = float(int(event.get("steps", 0) or 0))
+        cumulative_steps += event_steps
+        history_index = int(event.get("history_index", 0) or 0)
+        predicted_cost = float(history_cost_lookup.get(history_index, 0.0))
+        cumulative_cost += predicted_cost
         row: Dict[str, Any] = {
             "interaction_count": int(index),
             "boundary_count": int(len(ordered_boundaries)),
+            "event_steps": float(event_steps),
+            "cumulative_actual_steps": float(cumulative_steps),
+            "event_estimated_cost": float(predicted_cost),
+            "cumulative_estimated_cost": float(cumulative_cost),
+            "elapsed_seconds": history_elapsed_lookup.get(history_index),
         }
         if gt_boundaries is not None:
             for delta in deltas:
@@ -291,6 +363,48 @@ def _aggregate_curve(cases: Sequence[Dict[str, Any]], deltas: Sequence[int]) -> 
     return rows
 
 
+def _macro_budget_curve(
+    cases: Sequence[Dict[str, Any]],
+    deltas: Sequence[int],
+    *,
+    budget_key: str,
+    budgets: Sequence[float],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for budget in budgets:
+        matched: List[Dict[str, Any]] = []
+        for case in cases:
+            curve = list(case.get("boundary_curve") or [])
+            chosen = None
+            for item in curve:
+                value = item.get(budget_key)
+                if value is None:
+                    continue
+                try:
+                    if float(value) <= float(budget):
+                        chosen = item
+                except Exception:
+                    continue
+            if chosen is not None:
+                matched.append(chosen)
+        if not matched:
+            continue
+        row: Dict[str, Any] = {
+            "budget": float(budget),
+            "case_count": int(len(matched)),
+        }
+        for delta in deltas:
+            row[f"f1@{delta}"] = _mean(
+                [
+                    float(item.get(f"f1@{delta}", 0.0) or 0.0)
+                    for item in matched
+                    if item.get(f"f1@{delta}") is not None
+                ]
+            )
+        rows.append(row)
+    return rows
+
+
 def _build_summary(cases: Sequence[Dict[str, Any]], deltas: Sequence[int]) -> Dict[str, Any]:
     feedback_total = sum(int(case.get("proposal_feedback_count", 0) or 0) for case in cases)
     accept_total = sum(int(case.get("proposal_accept_count", 0) or 0) for case in cases)
@@ -353,8 +467,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--deltas",
-        default="5,10,20",
+        default="5,10,25,50",
         help="Comma-separated boundary tolerances.",
+    )
+    parser.add_argument(
+        "--step_budgets",
+        default="10,25,50",
+        help="Comma-separated cumulative step budgets for macro curves.",
+    )
+    parser.add_argument(
+        "--cost_budgets",
+        default="1,2,5,10",
+        help="Comma-separated cumulative estimated-cost budgets for macro curves.",
+    )
+    parser.add_argument(
+        "--time_budgets_sec",
+        default="30,60,120,300",
+        help="Comma-separated elapsed-second budgets for macro curves.",
     )
     parser.add_argument(
         "--out",
@@ -381,6 +510,9 @@ def main() -> None:
         raise SystemExit("--gt can only be used when exactly one case is evaluated.")
 
     deltas = _parse_deltas(args.deltas)
+    step_budgets = _parse_float_budgets(args.step_budgets)
+    cost_budgets = _parse_float_budgets(args.cost_budgets)
+    time_budgets = _parse_float_budgets(args.time_budgets_sec)
     reports: List[Dict[str, Any]] = []
     for case in cases:
         gt_path = _resolve_gt_path(case, gt_path=args.gt, gt_dir=args.gt_dir)
@@ -398,6 +530,24 @@ def main() -> None:
         "deltas": list(deltas),
         "summary": dict(summary),
         "macro_boundary_curve": list(curve),
+        "macro_step_budget_curve": _macro_budget_curve(
+            reports,
+            deltas,
+            budget_key="cumulative_actual_steps",
+            budgets=step_budgets,
+        ),
+        "macro_estimated_cost_budget_curve": _macro_budget_curve(
+            reports,
+            deltas,
+            budget_key="cumulative_estimated_cost",
+            budgets=cost_budgets,
+        ),
+        "macro_time_budget_curve": _macro_budget_curve(
+            reports,
+            deltas,
+            budget_key="elapsed_seconds",
+            budgets=time_budgets,
+        ),
         "cases": list(reports),
     }
 

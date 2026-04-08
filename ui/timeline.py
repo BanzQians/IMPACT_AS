@@ -1081,6 +1081,10 @@ class CombinedTimelineRow(BaseTimelineRow):
         self._scribble_last_y_norm: Optional[float] = None
         self._scribble_seq = 0
         self._scribble_proposal: Optional[dict] = None
+        self._scribble_press_pos: Optional[QPoint] = None
+        self._scribble_press_frame: Optional[float] = None
+        self._scribble_press_y_norm: Optional[float] = None
+        self._scribble_press_segment: Optional[Tuple[int, int, Optional[str]]] = None
         self._scribble_cache_pixmap: Optional[QPixmap] = None
         self._scribble_cache_key: Optional[Tuple[int, int, int, int, int]] = None
         self._scribble_cache_rev = 0
@@ -1166,6 +1170,10 @@ class CombinedTimelineRow(BaseTimelineRow):
             self._draft_scribble = None
             self._scribble_last_frame = None
             self._scribble_last_y_norm = None
+            self._scribble_press_pos = None
+            self._scribble_press_frame = None
+            self._scribble_press_y_norm = None
+            self._scribble_press_segment = None
             self._proposal_drag_boundary_frame = None
             self.setCursor(Qt.ArrowCursor)
         self._invalidate_scribble_cache()
@@ -2601,6 +2609,7 @@ class CombinedTimelineRow(BaseTimelineRow):
             boundary_frame = proposal.get("boundary_frame")
             window_start = proposal.get("window_start")
             window_end = proposal.get("window_end")
+            proposal_action = str(proposal.get("proposal_action", "") or "").strip()
             if boundary_frame is not None:
                 try:
                     boundary_frame = int(boundary_frame)
@@ -2622,16 +2631,24 @@ class CombinedTimelineRow(BaseTimelineRow):
                 x1 = self.frame_to_x(s_vis)
                 x2 = self.frame_to_x(e_vis + 1)
                 rect = QRect(x1, 10, max(4, x2 - x1), self.height() - 20)
-                fill_col = QColor(23, 92, 211, 28)
-                line_col = QColor(23, 92, 211, 180)
+                if proposal_action == "remove_boundary":
+                    fill_col = QColor(185, 28, 28, 24)
+                    line_col = QColor(185, 28, 28, 185)
+                else:
+                    fill_col = QColor(23, 92, 211, 28)
+                    line_col = QColor(23, 92, 211, 180)
                 p.fillRect(rect, fill_col)
                 p.setBrush(Qt.NoBrush)
                 p.setPen(QPen(line_col, 2, Qt.DashLine))
                 p.drawRoundedRect(rect, 4, 4)
             if boundary_frame is not None and start <= boundary_frame <= end:
                 x = self.frame_to_x(boundary_frame)
-                line_pen = QPen(QColor(23, 92, 211, 180), 2, Qt.DashLine)
-                tick_pen = QPen(QColor(23, 92, 211), 4)
+                if proposal_action == "remove_boundary":
+                    line_pen = QPen(QColor(185, 28, 28, 180), 2, Qt.DashLine)
+                    tick_pen = QPen(QColor(185, 28, 28), 4)
+                else:
+                    line_pen = QPen(QColor(23, 92, 211, 180), 2, Qt.DashLine)
+                    tick_pen = QPen(QColor(23, 92, 211), 4)
                 p.setPen(line_pen)
                 p.drawLine(x, 0, x, self.height())
                 p.setPen(tick_pen)
@@ -2645,7 +2662,12 @@ class CombinedTimelineRow(BaseTimelineRow):
                         caption = f"P {float(conf):.2f}"
                 except Exception:
                     pass
-                if left_label or right_label:
+                if proposal_action == "remove_boundary":
+                    merged_label = str(proposal.get("merged_label", "") or left_label or right_label or "").strip()
+                    caption = f"Remove {float(conf):.2f}" if conf is not None else "Remove"
+                    if merged_label:
+                        caption = f"{caption} {merged_label}"
+                elif left_label or right_label:
                     caption = f"{caption} {left_label or '?'}|{right_label or '?'}"
                 p.setFont(QFont("Arial", 7))
                 fm = p.fontMetrics()
@@ -2653,7 +2675,8 @@ class CombinedTimelineRow(BaseTimelineRow):
                 tx = max(self.get_gutter() + 2, min(x + 6, self.width() - text_w - 2))
                 badge = QRect(tx, 2, text_w, 12)
                 p.fillRect(badge, QColor(255, 255, 255, 220))
-                p.setPen(QPen(QColor(23, 92, 211), 1))
+                badge_col = QColor(185, 28, 28) if proposal_action == "remove_boundary" else QColor(23, 92, 211)
+                p.setPen(QPen(badge_col, 1))
                 p.drawRect(badge)
                 p.drawText(badge.adjusted(3, 0, -3, 0), Qt.AlignLeft | Qt.AlignVCenter, caption)
 
@@ -2704,6 +2727,40 @@ class CombinedTimelineRow(BaseTimelineRow):
         self.hoverFrame.emit(f)
         self.update()
         if self._scribble_mode:
+            if self._mode == "scribble_pending":
+                press_pos = self._scribble_press_pos
+                if press_pos is None:
+                    self.setToolTip("")
+                    self.setCursor(
+                        Qt.CrossCursor if self._frame_in_edit_mask(f) else Qt.ForbiddenCursor
+                    )
+                    return
+                if (e.pos() - press_pos).manhattanLength() < QApplication.startDragDistance():
+                    self.setToolTip("")
+                    self.setCursor(
+                        Qt.CrossCursor if self._frame_in_edit_mask(f) else Qt.ForbiddenCursor
+                    )
+                    return
+                start_frame = (
+                    float(self._scribble_press_frame)
+                    if self._scribble_press_frame is not None
+                    else self.x_to_frame_float(e.x())
+                )
+                start_y_norm = (
+                    float(self._scribble_press_y_norm)
+                    if self._scribble_press_y_norm is not None
+                    else float(self._scribble_y_norm_from_pos(e.y()))
+                )
+                self._dragging = True
+                self._mode = "scribble"
+                self._begin_draft_scribble(start_frame, start_y_norm)
+                self._extend_draft_scribble(
+                    self.x_to_frame_float(e.x()),
+                    self._scribble_y_norm_from_pos(e.y()),
+                )
+                self.setCursor(Qt.CrossCursor)
+                self.update()
+                return
             if not self._dragging:
                 proposal_hit = self._proposal_boundary_hit(e.x(), e.y())
                 if hover_marker is not None and self._is_scribble_marker(hover_marker):
@@ -2888,9 +2945,15 @@ class CombinedTimelineRow(BaseTimelineRow):
             frame_f = self.x_to_frame_float(e.x())
             if not self._frame_in_edit_mask(int(round(frame_f))):
                 return
-            self._dragging = True
-            self._mode = "scribble"
-            self._begin_draft_scribble(frame_f, self._scribble_y_norm_from_pos(e.y()))
+            self._dragging = False
+            self._mode = "scribble_pending"
+            self._scribble_press_pos = e.pos()
+            self._scribble_press_frame = float(frame_f)
+            self._scribble_press_y_norm = float(self._scribble_y_norm_from_pos(e.y()))
+            try:
+                self._scribble_press_segment = self._segment_at(int(round(frame_f)))
+            except Exception:
+                self._scribble_press_segment = None
             self.setCursor(Qt.CrossCursor)
             self.update()
             return
@@ -3002,6 +3065,29 @@ class CombinedTimelineRow(BaseTimelineRow):
             self._draft_scribble = None
             self._scribble_last_frame = None
             self._scribble_last_y_norm = None
+            self._scribble_press_pos = None
+            self._scribble_press_frame = None
+            self._scribble_press_y_norm = None
+            self._scribble_press_segment = None
+            self.update()
+            return
+        if self._mode == "scribble_pending":
+            self.setCursor(Qt.ArrowCursor)
+            seg = self._scribble_press_segment
+            if seg is not None:
+                s, e_, lb = seg
+                self._selected_interval = (int(s), int(e_))
+                self._selected_label = lb
+                self._selection_scope = "segment"
+                self.segmentSelected.emit(int(s), int(e_), lb)
+                if lb:
+                    self.labelClicked.emit(lb, self.x_to_frame(e.x()))
+            self._dragging = False
+            self._mode = None
+            self._scribble_press_pos = None
+            self._scribble_press_frame = None
+            self._scribble_press_y_norm = None
+            self._scribble_press_segment = None
             self.update()
             return
         if self._dragging and self._mode == "scribble_proposal_boundary":
@@ -3123,6 +3209,10 @@ class CombinedTimelineRow(BaseTimelineRow):
         self._preview_interval = None
         self._create_anchor = None
         self._active_label = None
+        self._scribble_press_pos = None
+        self._scribble_press_frame = None
+        self._scribble_press_y_norm = None
+        self._scribble_press_segment = None
         self.update()
 
     def contextMenuEvent(self, e):

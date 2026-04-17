@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QToolButton,
     QApplication,
     QToolTip,
+    QMenu,
 )
 from core.models import AnnotationStore, LabelDef
 from utils.constants import (
@@ -978,28 +979,8 @@ class TimelineRow(BaseTimelineRow):
         self.update()
 
     def contextMenuEvent(self, e):
-        interval, _ = self._hit_interval(e.x())
-        if interval:
-            s, e_ = interval
-            if not self._interval_in_edit_mask(s, e_):
-                return
-            if callable(self.delete_handler):
-                handled = bool(self.delete_handler(s, e_, self.label.name, self))
-                if handled:
-                    return
-            if hasattr(self.store, "begin_txn"):
-                self.store.begin_txn()
-            bulk_remove = getattr(self.store, "remove_range", None)
-            if callable(bulk_remove):
-                bulk_remove(self.label.name, s, e_)
-            else:
-                for f in range(s, e_ + 1):
-                    if self.store.label_at(f) == self.label.name:
-                        self.store.remove_at(f)
-            if hasattr(self.store, "end_txn"):
-                self.store.end_txn()
-            self.changed.emit()
-            self.update()
+        e.accept()
+        return
 
 
 class CombinedTimelineRow(BaseTimelineRow):
@@ -1423,6 +1404,7 @@ class CombinedTimelineRow(BaseTimelineRow):
             lines.append(f"Labels: {left_label or '?'} -> {right_label or '?'}")
         if str(visual.get("conf_text") or "").strip():
             lines.append(f"Confidence: {visual['conf_text']}")
+        lines.append("Click to reopen and edit this boundary.")
         return "\n".join(lines)
 
     def _sync_hover_scribble_marker(
@@ -1498,6 +1480,8 @@ class CombinedTimelineRow(BaseTimelineRow):
     def _proposal_boundary_hit(self, x: int, y: int) -> Optional[int]:
         if not self._scribble_mode or not isinstance(self._scribble_proposal, dict):
             return None
+        if str(self._scribble_proposal.get("proposal_action", "") or "").strip() in ("remove_boundaries", "remove_segment"):
+            return None
         try:
             boundary_i = self._scribble_proposal.get("boundary_frame")
             if boundary_i is None:
@@ -1513,6 +1497,34 @@ class CombinedTimelineRow(BaseTimelineRow):
         if y < 0 or y > self.height():
             return None
         return int(boundary_i)
+
+    def _pending_scribble_gesture(self, pos) -> Optional[str]:
+        press_pos = self._scribble_press_pos
+        if press_pos is None or pos is None:
+            return None
+        try:
+            dx = int(pos.x()) - int(press_pos.x())
+            dy = int(pos.y()) - int(press_pos.y())
+        except Exception:
+            return None
+        adx = abs(int(dx))
+        ady = abs(int(dy))
+        base = max(6, int(QApplication.startDragDistance()))
+        horizontal_threshold = max(14, base + 6)
+        vertical_threshold = max(12, base + 3)
+        if adx < horizontal_threshold and ady < vertical_threshold:
+            return None
+        if adx >= horizontal_threshold and adx >= int(round(float(ady) * 1.35)):
+            return "horizontal"
+        if ady >= vertical_threshold and ady >= int(round(float(adx) * 1.1)):
+            return "vertical"
+        # For ambiguous diagonal gestures, bias toward vertical so delete
+        # intent is easier to trigger than a horizontal split/merge.
+        if ady >= vertical_threshold:
+            return "vertical"
+        if adx >= horizontal_threshold:
+            return "horizontal"
+        return None
 
     def _clamp_proposal_boundary_frame(self, frame_i: int) -> int:
         try:
@@ -1696,6 +1708,23 @@ class CombinedTimelineRow(BaseTimelineRow):
             meta_norm["path_points"] = path_points
         else:
             meta_norm.pop("path_points", None)
+        if path_points:
+            try:
+                x_vals = [
+                    float(self.frame_to_x_float(float(row[0]))) for row in path_points
+                ]
+                y_vals = [float(self._scribble_y_px(row[1])) for row in path_points]
+                if x_vals and y_vals:
+                    meta_norm["gesture_metrics"] = {
+                        "x_span_px": float(max(x_vals) - min(x_vals)),
+                        "y_span_px": float(max(y_vals) - min(y_vals)),
+                    }
+                else:
+                    meta_norm.pop("gesture_metrics", None)
+            except Exception:
+                meta_norm.pop("gesture_metrics", None)
+        else:
+            meta_norm.pop("gesture_metrics", None)
         if frame_counts:
             meta_norm["frame_counts"] = {
                 int(frame_i): int(max(1, min(255, round(float(weight)))))
@@ -1732,7 +1761,13 @@ class CombinedTimelineRow(BaseTimelineRow):
         start_i, end_i = self._scribble_item_bounds(item)
         return [[int(start_i), 0.5], [int(end_i), 0.5]]
 
-    def _begin_draft_scribble(self, frame_i: float, y_norm: float) -> Dict[str, Any]:
+    def _begin_draft_scribble(
+        self,
+        frame_i: float,
+        y_norm: float,
+        *,
+        gesture_intent: str = "",
+    ) -> Dict[str, Any]:
         payload = {
             "start_frame": int(round(frame_i)),
             "end_frame": int(round(frame_i)),
@@ -1743,6 +1778,8 @@ class CombinedTimelineRow(BaseTimelineRow):
                 "frame_counts": {},
             },
         }
+        if str(gesture_intent or "").strip():
+            payload["meta"]["gesture_intent"] = str(gesture_intent).strip().lower()
         self._draft_scribble = payload
         self._scribble_last_frame = None
         self._scribble_last_y_norm = None
@@ -1791,7 +1828,16 @@ class CombinedTimelineRow(BaseTimelineRow):
             self._scribble_last_frame = float(frame_i)
             self._scribble_last_y_norm = float(y_norm)
             return
-        steps = max(1, int(math.ceil(abs(float(frame_i) - float(prev_frame)) * 2.0)))
+        frame_steps = int(math.ceil(abs(float(frame_i) - float(prev_frame)) * 2.0))
+        try:
+            px_delta = abs(
+                float(self.frame_to_x_float(float(frame_i)))
+                - float(self.frame_to_x_float(float(prev_frame)))
+            )
+        except Exception:
+            px_delta = 0.0
+        pixel_steps = int(math.ceil(px_delta / 4.0))
+        steps = max(1, min(frame_steps, pixel_steps if pixel_steps > 0 else frame_steps))
         for step in range(1, steps + 1):
             t = float(step) / float(steps)
             interp_frame = float(prev_frame) + (float(frame_i) - float(prev_frame)) * t
@@ -2002,10 +2048,11 @@ class CombinedTimelineRow(BaseTimelineRow):
                 boundary_i = int(round((start_i + end_i) / 2.0))
             px = self.frame_to_x_float(float(boundary_i))
             dx = float(px - float(x))
-            if start_i <= self.x_to_frame(x) <= end_i:
-                dy = 0.0
-            else:
-                dy = max(0.0, abs(float(y) - float(self.height() / 2.0)) - 20.0)
+            # Use actual vertical distance from the boundary line (center of
+            # the row) so that clicks far above/below do not match the marker,
+            # allowing the user to start a new scribble near an existing marker.
+            center_y = float(self.height()) / 2.0
+            dy = max(0.0, abs(float(y) - center_y) - 20.0)
             return dx * dx + dy * dy
         best = float("inf")
         points = self._scribble_path_points(item)
@@ -2631,7 +2678,10 @@ class CombinedTimelineRow(BaseTimelineRow):
                 x1 = self.frame_to_x(s_vis)
                 x2 = self.frame_to_x(e_vis + 1)
                 rect = QRect(x1, 10, max(4, x2 - x1), self.height() - 20)
-                if proposal_action == "remove_boundary":
+                if proposal_action == "merge_then_split":
+                    fill_col = QColor(176, 96, 20, 28)
+                    line_col = QColor(176, 96, 20, 190)
+                elif proposal_action in ("remove_boundary", "remove_boundaries", "remove_segment"):
                     fill_col = QColor(185, 28, 28, 24)
                     line_col = QColor(185, 28, 28, 185)
                 else:
@@ -2643,7 +2693,10 @@ class CombinedTimelineRow(BaseTimelineRow):
                 p.drawRoundedRect(rect, 4, 4)
             if boundary_frame is not None and start <= boundary_frame <= end:
                 x = self.frame_to_x(boundary_frame)
-                if proposal_action == "remove_boundary":
+                if proposal_action == "merge_then_split":
+                    line_pen = QPen(QColor(23, 92, 211, 180), 2, Qt.DashLine)
+                    tick_pen = QPen(QColor(23, 92, 211), 4)
+                elif proposal_action in ("remove_boundary", "remove_boundaries", "remove_segment"):
                     line_pen = QPen(QColor(185, 28, 28, 180), 2, Qt.DashLine)
                     tick_pen = QPen(QColor(185, 28, 28), 4)
                 else:
@@ -2662,7 +2715,24 @@ class CombinedTimelineRow(BaseTimelineRow):
                         caption = f"P {float(conf):.2f}"
                 except Exception:
                     pass
-                if proposal_action == "remove_boundary":
+                if proposal_action == "merge_then_split":
+                    caption = "Merge+Split"
+                    if left_label or right_label:
+                        caption = f"{caption} {left_label or '?'}|{right_label or '?'}"
+                elif proposal_action == "remove_boundaries":
+                    merged_label = str(proposal.get("merged_label", "") or left_label or right_label or "").strip()
+                    removed_count = int(proposal.get("removed_boundary_count", 0) or 0)
+                    caption = (
+                        f"Remove {removed_count:d}" if removed_count > 0 else "Remove span"
+                    )
+                    if merged_label:
+                        caption = f"{caption} {merged_label}"
+                elif proposal_action == "remove_segment":
+                    seg_label = str(proposal.get("segment_label", "") or "").strip()
+                    caption = "Delete segment"
+                    if seg_label:
+                        caption = f"{caption} {seg_label}"
+                elif proposal_action == "remove_boundary":
                     merged_label = str(proposal.get("merged_label", "") or left_label or right_label or "").strip()
                     caption = f"Remove {float(conf):.2f}" if conf is not None else "Remove"
                     if merged_label:
@@ -2675,7 +2745,12 @@ class CombinedTimelineRow(BaseTimelineRow):
                 tx = max(self.get_gutter() + 2, min(x + 6, self.width() - text_w - 2))
                 badge = QRect(tx, 2, text_w, 12)
                 p.fillRect(badge, QColor(255, 255, 255, 220))
-                badge_col = QColor(185, 28, 28) if proposal_action == "remove_boundary" else QColor(23, 92, 211)
+                if proposal_action == "merge_then_split":
+                    badge_col = QColor(176, 96, 20)
+                elif proposal_action in ("remove_boundary", "remove_boundaries"):
+                    badge_col = QColor(185, 28, 28)
+                else:
+                    badge_col = QColor(23, 92, 211)
                 p.setPen(QPen(badge_col, 1))
                 p.drawRect(badge)
                 p.drawText(badge.adjusted(3, 0, -3, 0), Qt.AlignLeft | Qt.AlignVCenter, caption)
@@ -2730,13 +2805,18 @@ class CombinedTimelineRow(BaseTimelineRow):
             if self._mode == "scribble_pending":
                 press_pos = self._scribble_press_pos
                 if press_pos is None:
+                    self._proposal_hover_boundary_frame = None
                     self.setToolTip("")
                     self.setCursor(
                         Qt.CrossCursor if self._frame_in_edit_mask(f) else Qt.ForbiddenCursor
                     )
                     return
-                if (e.pos() - press_pos).manhattanLength() < QApplication.startDragDistance():
-                    self.setToolTip("")
+                gesture_commit = self._pending_scribble_gesture(e.pos())
+                if gesture_commit is None:
+                    self._proposal_hover_boundary_frame = None
+                    self.setToolTip(
+                        "Click a segment to relabel it. Drag horizontally to draw a boundary gesture, or drag vertically across a boundary to remove it."
+                    )
                     self.setCursor(
                         Qt.CrossCursor if self._frame_in_edit_mask(f) else Qt.ForbiddenCursor
                     )
@@ -2753,21 +2833,30 @@ class CombinedTimelineRow(BaseTimelineRow):
                 )
                 self._dragging = True
                 self._mode = "scribble"
-                self._begin_draft_scribble(start_frame, start_y_norm)
+                self._begin_draft_scribble(
+                    start_frame,
+                    start_y_norm,
+                    gesture_intent=str(gesture_commit or ""),
+                )
                 self._extend_draft_scribble(
                     self.x_to_frame_float(e.x()),
                     self._scribble_y_norm_from_pos(e.y()),
                 )
                 self.setCursor(Qt.CrossCursor)
+                self.setToolTip("Release to finish the boundary gesture.")
                 self.update()
                 return
             if not self._dragging:
                 proposal_hit = self._proposal_boundary_hit(e.x(), e.y())
+                edge_hit = self._hit_edge(e.x()) if self.editable else None
                 if hover_marker is not None and self._is_scribble_marker(hover_marker):
                     self.setCursor(Qt.PointingHandCursor)
                 elif proposal_hit is not None:
                     self.setCursor(Qt.SizeHorCursor)
                     self.setToolTip("Drag to adjust the proposed boundary.")
+                elif edge_hit:
+                    self.setCursor(Qt.SizeHorCursor)
+                    self.setToolTip("Drag to adjust the existing segment boundary.")
                 else:
                     self.setToolTip("")
                     self.setCursor(
@@ -2794,6 +2883,9 @@ class CombinedTimelineRow(BaseTimelineRow):
                 )
                 self.update()
                 return
+        if not self._dragging and hover_marker is not None and self._is_scribble_marker(hover_marker):
+            self.setCursor(Qt.PointingHandCursor)
+            return
         if not self.editable:
             return
 
@@ -2929,11 +3021,11 @@ class CombinedTimelineRow(BaseTimelineRow):
                 handled = False
             if handled:
                 return
+        marker = self._scribble_at(e.x(), e.y())
+        if marker is not None and self._is_scribble_marker(marker):
+            self.scribbleActivated.emit(dict(marker))
+            return
         if self._scribble_mode:
-            marker = self._scribble_at(e.x(), e.y())
-            if marker is not None and self._is_scribble_marker(marker):
-                self.scribbleActivated.emit(dict(marker))
-                return
             proposal_hit = self._proposal_boundary_hit(e.x(), e.y())
             if proposal_hit is not None:
                 self._dragging = True
@@ -2942,6 +3034,26 @@ class CombinedTimelineRow(BaseTimelineRow):
                 self.setCursor(Qt.SizeHorCursor)
                 self.update()
                 return
+            if self.editable:
+                hit = self._hit_edge(e.x())
+                if hit:
+                    interval, label, where = hit
+                    if not self._interval_in_edit_mask(interval[0], interval[1]):
+                        return
+                    self._dragging = True
+                    self._active_interval = interval
+                    self._active_label = label
+                    self._mode = "resize_left" if where == "left" else "resize_right"
+                    self._preview_interval = interval
+                    st = self._store_for_label(label)
+                    if st is not None:
+                        try:
+                            st.begin_txn()
+                        except Exception:
+                            pass
+                    self.setCursor(Qt.SizeHorCursor)
+                    self.update()
+                    return
             frame_f = self.x_to_frame_float(e.x())
             if not self._frame_in_edit_mask(int(round(frame_f))):
                 return
@@ -2986,25 +3098,26 @@ class CombinedTimelineRow(BaseTimelineRow):
         f = self.x_to_frame(e.x())
         if not self._frame_in_edit_mask(f):
             return
-        if self._label_at(f) is None:
-            if self._snap_segments:
-                s = self._snap_to_segment_start(f)
-            else:
-                s = self._snap_edge_after_label_left(f)
-                if s < 0:
-                    s = self._snap_unlabeled(f)
-            if s is None:
-                return
-            if not self._frame_in_edit_mask(s):
-                return
-            self._dragging = True
-            self._mode = "create"
-            self._active_interval = None
-            self._active_label = None
-            self._create_anchor = s
-            self._preview_interval = (s, s)
-            self.setCursor(Qt.CrossCursor)
-            self.update()
+        if self._label_at(f) is not None:
+            return
+        if self._snap_segments:
+            s = self._snap_to_segment_start(f)
+        else:
+            s = self._snap_edge_after_label_left(f)
+            if s < 0:
+                s = self._snap_unlabeled(f)
+        if s is None:
+            return
+        if not self._frame_in_edit_mask(s):
+            return
+        self._dragging = True
+        self._mode = "create"
+        self._active_interval = None
+        self._active_label = None
+        self._create_anchor = s
+        self._preview_interval = (s, s)
+        self.setCursor(Qt.CrossCursor)
+        self.update()
 
     def mouseDoubleClickEvent(self, e):
         if e.button() != Qt.LeftButton:
@@ -3216,53 +3329,27 @@ class CombinedTimelineRow(BaseTimelineRow):
         self.update()
 
     def contextMenuEvent(self, e):
-        g = self.get_gutter()
-        if e.x() < g:
+        try:
+            pos = e.pos()
+            marker = self._scribble_at(pos.x(), pos.y())
+        except Exception:
+            marker = None
+        if marker is None or not self._is_scribble_marker(marker):
+            e.accept()
             return
-        if self._scribble_mode:
-            removed = self._pop_scribble_at(e.x(), e.y())
+        menu = QMenu(self)
+        meta = self._scribble_item_meta(marker)
+        bf = meta.get("boundary_frame")
+        label = "Delete marker" if bf is None else f"Delete marker @ F{int(bf)}"
+        act_del = menu.addAction(label)
+        chosen = menu.exec_(e.globalPos())
+        if chosen is act_del:
+            removed = self._pop_scribble_at(pos.x(), pos.y())
             if removed is not None:
                 self._invalidate_scribble_cache()
+                self.update()
                 self.scribbleRemoved.emit(dict(removed))
-                self.update()
-            return
-        f = self.x_to_frame(e.x())
-        s, e_, lb = self._segment_at(f)
-        if not lb:
-            return
-        if not self._interval_in_edit_mask(s, e_):
-            return
-        if callable(self.delete_handler):
-            handled = bool(self.delete_handler(s, e_, lb, self))
-            if handled:
-                self._selected_interval = None
-                self._selected_label = None
-                self.update()
-                return
-        if not self.editable:
-            return
-        st = self._store_for_label(lb)
-        if st is None:
-            return
-        try:
-            st.begin_txn()
-        except Exception:
-            pass
-        bulk_remove = getattr(st, "remove_range", None)
-        if callable(bulk_remove):
-            bulk_remove(lb, s, e_)
-        else:
-            for fr in range(s, e_ + 1):
-                if self._label_at(fr) == lb:
-                    st.remove_at(fr)
-        try:
-            st.end_txn()
-        except Exception:
-            pass
-        self._selected_interval = None
-        self._selected_label = None
-        self.changed.emit()
-        self.update()
+        e.accept()
 
 
 class TimelineArea(QWidget):
@@ -3277,6 +3364,7 @@ class TimelineArea(QWidget):
     scribbleRemoved = pyqtSignal(object)
     gapPrevRequested = pyqtSignal()
     gapNextRequested = pyqtSignal()
+    frameSeekRequested = pyqtSignal(int)
 
     def __init__(
         self,
@@ -3476,6 +3564,39 @@ class TimelineArea(QWidget):
         self._tail_combined_groups = groups or None
         if self.layout_mode != "combined":
             self.rebuild_rows()
+
+    def coverage_gaps(self, start: int, end: int) -> List[Tuple[int, int]]:
+        """Return unlabeled spans in [start, end] using the exact same label
+        sources the rows paint from — guaranteeing the indicator agrees with
+        what the user sees on the timeline."""
+        if end < start:
+            return []
+        rows: list = []
+        rows.extend(getattr(self, "rows", []) or [])
+        rows.extend(getattr(self, "_combined_rows", []) or [])
+        if not rows:
+            return [(int(start), int(end))]
+        gaps: List[Tuple[int, int]] = []
+        run_start: Optional[int] = None
+        for f in range(int(start), int(end) + 1):
+            covered = False
+            for row in rows:
+                try:
+                    if row._label_at(f) is not None:
+                        covered = True
+                        break
+                except Exception:
+                    continue
+            if not covered:
+                if run_start is None:
+                    run_start = int(f)
+            else:
+                if run_start is not None:
+                    gaps.append((int(run_start), int(f) - 1))
+                    run_start = None
+        if run_start is not None:
+            gaps.append((int(run_start), int(end)))
+        return gaps
 
     def set_gap_summary(self, text: str, tooltip: str = "", has_gaps: bool = False):
         if not getattr(self, "lbl_gap", None):
@@ -3940,6 +4061,44 @@ class TimelineArea(QWidget):
                     row.set_current_frame(self.current_frame)
                 except Exception:
                     pass
+
+    def wheelEvent(self, e):
+        mods = e.modifiers()
+        if mods & (Qt.ControlModifier | Qt.ShiftModifier):
+            super().wheelEvent(e)
+            return
+        delta = e.angleDelta()
+        notches = float(delta.y() or delta.x()) / 120.0
+        if not notches:
+            e.ignore()
+            return
+        try:
+            fc = max(1, int(self.get_fc()))
+        except Exception:
+            fc = max(1, int(self.view_span or 1))
+        span = max(1, int(self.view_span or fc))
+        step = max(1, int(round(span / 10.0)))
+        offset = int(round(notches * step))
+        if offset == 0:
+            offset = 1 if notches > 0 else -1
+        max_start = max(0, fc - span)
+        new_start = int(self.view_start) - offset
+        new_start = max(0, min(max_start, new_start))
+        if new_start != int(self.view_start):
+            self.view_start = new_start
+            try:
+                self.slider_view.blockSignals(True)
+                self.slider_view.setValue(new_start)
+                self.slider_view.blockSignals(False)
+            except Exception:
+                pass
+            for r in self.rows:
+                try:
+                    r.update()
+                except Exception:
+                    pass
+            self.viewPanned.emit()
+        e.accept()
 
     def _on_combined_segment_selected(self, row):
         self._active_combined_row = row

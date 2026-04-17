@@ -106,9 +106,10 @@ from utils.default_action_label_templates import get_default_action_label_templa
 from tools.label_utils import (
     DEFAULT_VERB_PREFIXES,
     infer_verb_noun as infer_label_verb_noun,
-    load_label_names,
+    parse_label_line,
     resolve_label_source,
 )
+from tools.segment_utils import load_annotation_txt_segments
 from core.psr_state import (
     load_components as psr_load_components,
     load_rules as psr_load_rules,
@@ -174,6 +175,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 try:
     import sip  # type: ignore
@@ -181,6 +183,18 @@ except Exception:
     sip = None
 import numpy as np
 from utils.op_logger import OperationLogger
+
+
+def _boundary_trace(tag: str, **values) -> None:
+    if not os.environ.get("IMPACT_AS_TRACE_BOUNDARY"):
+        return
+    import sys as _sys
+    try:
+        parts = [f"{k}={v!r}" for k, v in values.items()]
+        _sys.stderr.write(f"[BTRACE {tag}] " + " ".join(parts) + "\n")
+        _sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def _default_local_refiner_checkpoint_candidates(repo_root: str) -> List[str]:
@@ -239,6 +253,10 @@ FINE_PHASE_ROW_HEIGHT = 30
 KNOWN_VERB_PREFIXES = list(DEFAULT_VERB_PREFIXES)
 
 FEATURE_VIDEO_EXTS = (".avi", ".mp4", ".mov", ".mkv", ".m4v")
+ANNOTATION_FILE_FILTER = (
+    "Annotation Files (*.json *.txt);;JSON Files (*.json);;Text Files (*.txt);;All Files (*)"
+)
+GT_CANDIDATE_DIR_NAMES = ("groundTruth", "groundtruth", "GroundTruth", "gt", "GT")
 
 # Fixed HAS component catalog used by PSR/ASR/ASD state inference.
 HAS_COMPONENT_CATALOG = [
@@ -261,24 +279,18 @@ HAS_COMPONENT_CATALOG = [
     (16, "M6_nut"),
 ]
 
-# ---- helper: read 3-line txt segments ----
+# ---- helper: read txt annotations (segment triplets or frame-wise GT) ----
 def load_segments_txt(txt_path):
-    segs = []
-    with open(txt_path, "r", encoding="utf-8") as f:
-        lines = [ln.strip() for ln in f]
-    buf = []
-    for ln in lines:
-        if ln == "":
-            if len(buf) >= 3:
-                s, e, name = int(buf[0]), int(buf[1]), buf[2]
-                segs.append({"start": s, "end": e, "label": name})
-            buf = []
-        else:
-            buf.append(ln)
-    if len(buf) >= 3:
-        s, e, name = int(buf[0]), int(buf[1]), buf[2]
-        segs.append({"start": s, "end": e, "label": name})
-    return segs
+    segs, _ = load_annotation_txt_segments(txt_path)
+    return [
+        {
+            "start": int(seg.get("start", 0)),
+            "end": int(seg.get("end", seg.get("start", 0))),
+            "label": str(seg.get("label", "") or "").strip(),
+        }
+        for seg in segs
+        if isinstance(seg, dict)
+    ]
 
 class ActionWindow(FrameControlMixin, QWidget):
     def __init__(
@@ -334,6 +346,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._action_label_bank_source: str = ""
         self._correction_buffer = CorrectionBuffer()
+        self._study_planner_history_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._adaptation_buffer = AdaptationSampleBuffer(max_size=200)
         self._background_refiner_trainer: Optional[BackgroundRefinerTrainer] = None
         self._background_refiner_used_samples: int = 0
@@ -347,6 +360,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         logging_policy = load_logging_policy(
             default_ops_enabled=bool(getattr(self.op_logger, "enabled", False)),
             default_validation_summary_enabled=True,
+        )
+        self.op_logger.enabled = bool(
+            logging_policy.get("ops_csv_enabled", self.op_logger.enabled)
         )
         self._validation_summary_enabled = bool(
             logging_policy.get("validation_summary_enabled", True)
@@ -450,6 +466,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._knn_memory: List[Tuple[np.ndarray, str]] = []
         self._label_confusion_memory: Dict[str, Dict[str, float]] = {}
         self._study_condition = "standard"
+        self._study_participant_id = ""
         self._forced_segment: Optional[Dict[str, Any]] = None
         self._timeline_selected_segment: Optional[Dict[str, Any]] = None
         self._pending_label_review: Optional[Dict[str, Any]] = None
@@ -551,7 +568,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         annotation_group, annotation_ctrl = _toolbar_group()
         assistant_group, assistant_ctrl = _toolbar_group()
 
-        playback_ctrl.addWidget(QLabel("Task:"))
+        self.lbl_task = QLabel("Task:")
+        playback_ctrl.addWidget(self.lbl_task)
         self.combo_task = QComboBox()
         items = self._task_items or [
             "Action Segmentation",
@@ -603,7 +621,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "Open Session...",
                     "Load Video...",
                     "Crop by frames...",
-                    "Import JSON (selected views)...",
+                    "Import annotations (selected views)...",
                     "Export JSON...",
                     "Export JSON (selected views to folders)...",
                     "Export to Seed Dataset...",
@@ -666,11 +684,18 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.combo_speed.setCurrentText("1x")
         annotation_ctrl.addWidget(self.combo_speed)
         self._fit_combo_to_contents(self.combo_speed, min_width=90)
-        self.btn_auto_label_asot = QPushButton("Optional Pre-label")
+        self.btn_auto_label_asot = QPushButton("Pre-label")
         self.btn_auto_label_asot.setToolTip(
-            "Optionally run ASOT to bootstrap baseline action segments for the current video."
+            "Run optional ASOT pre-labeling with the newest default checkpoint. "
+            "Right-click or hold Shift while clicking to choose a different checkpoint."
         )
-        self.btn_auto_label_asot.clicked.connect(self.on_click_auto_label_asot)
+        self.btn_auto_label_asot.clicked.connect(
+            lambda _checked=False: self.on_click_auto_label_asot()
+        )
+        self.btn_auto_label_asot.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_auto_label_asot.customContextMenuRequested.connect(
+            self._show_prelabel_button_menu
+        )
         annotation_ctrl.addWidget(self.btn_auto_label_asot)
 
         # Magnifier toggle
@@ -739,10 +764,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         assistant_ctrl.addWidget(self.btn_scribble_clear)
         self.btn_query_suggest = QToolButton()
         self._shape_btn(self.btn_query_suggest)
-        self.btn_query_suggest.setFixedWidth(self.btn_query_suggest.fontMetrics().horizontalAdvance("Suggest Query") + 24)
-        self.btn_query_suggest.setText("Suggest Query")
+        self.btn_query_suggest.setFixedWidth(self.btn_query_suggest.fontMetrics().horizontalAdvance("Next Boundary") + 24)
+        self.btn_query_suggest.setText("Next Boundary")
         self.btn_query_suggest.setToolTip(
-            "Use the lightweight query planner to focus the next boundary, label, or state question."
+            "Use the lightweight query planner to focus the next suggested boundary."
         )
         self.btn_query_suggest.clicked.connect(self._suggest_next_query)
         assistant_ctrl.addWidget(self.btn_query_suggest)
@@ -887,6 +912,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             on_rename=self._on_label_renamed,
             on_search_matches=self._on_label_search_matches,
             on_select_idx=self._on_label_selected,
+            on_import_labels=self._import_label_map_txt,
             parent=self,
         )
         self._sync_label_panel_verb_hints(refresh=False)
@@ -929,6 +955,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.timeline.viewPanned.connect(
             lambda: setattr(self, "_timeline_auto_follow", False)
         )
+        self.timeline.frameSeekRequested.connect(self._on_timeline_wheel_seek)
         self.timeline.labelClicked.connect(self._on_timeline_label_clicked)
         self.timeline.segmentSelected.connect(self._on_timeline_segment_selected)
         self.timeline.scribbleEditedDetailed.connect(
@@ -1041,9 +1068,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         # LEFT composite panel (entities + labels) with adjustable splitter
         self.entities_panel.setVisible(False)
         self.phase_panel.setVisible(False)
-        self.panel.setMinimumWidth(140)
+        self.panel.setMinimumWidth(0)
         left_split = QSplitter(Qt.Vertical, self)
         left_split.setChildrenCollapsible(False)
+        left_split.setMinimumWidth(0)
         left_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         left_split.addWidget(self.entities_panel)
         left_split.addWidget(self.phase_panel)
@@ -1062,7 +1090,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         left_scroll.setWidget(left_split)
         left_scroll.setContentsMargins(0, 0, 0, 0)
         left_scroll.setStyleSheet("QScrollArea { background: transparent; }")
-        left_scroll.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Expanding)
+        left_scroll.setMinimumWidth(0)
+        left_scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.left_scroll = left_scroll
 
         self.timeline_context_bar = QFrame(self)
@@ -1232,7 +1261,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.lbl_query_footer_kicker.setObjectName("queryFooterKicker")
         query_footer_head.addWidget(self.lbl_query_footer_kicker)
         self.lbl_query_hint = QLabel(
-            "No suggestion yet. Use Suggest Query when a baseline is ready."
+            "No suggestion yet. Use Next Boundary when a baseline is ready."
         )
         self.lbl_query_hint.setObjectName("queryFooterMain")
         self.lbl_query_hint.setWordWrap(True)
@@ -1249,7 +1278,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         query_footer_detail.setContentsMargins(0, 0, 0, 0)
         query_footer_detail.setSpacing(12)
         self.lbl_query_footer_meta = QLabel(
-            "Use Suggest Query to compute the next lightweight interaction target."
+            "Use Next Boundary to jump to the next planner-ranked boundary suggestion."
         )
         self.lbl_query_footer_meta.setObjectName("queryFooterMeta")
         self.lbl_query_footer_meta.setWordWrap(True)
@@ -1362,6 +1391,28 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.video_path = None
 
         # Shortcuts
+        def _accept_on_enter():
+            btn = getattr(self, "btn_scribble_accept", None)
+            if btn is None or not btn.isEnabled() or not btn.isVisible():
+                return
+            fw = QApplication.focusWidget() if QApplication else None
+            # Avoid hijacking Enter in text-entry widgets (search box, etc.)
+            try:
+                from PyQt5.QtWidgets import QLineEdit, QPlainTextEdit, QTextEdit, QComboBox
+                if isinstance(fw, (QLineEdit, QPlainTextEdit, QTextEdit)):
+                    return
+                if isinstance(fw, QComboBox) and fw.isEditable():
+                    return
+            except Exception:
+                pass
+            btn.click()
+
+        self.sc_accept_enter = QShortcut(QKeySequence(Qt.Key_Return), self)
+        self.sc_accept_enter.setContext(Qt.WidgetWithChildrenShortcut)
+        self.sc_accept_enter.activated.connect(_accept_on_enter)
+        self.sc_accept_enter_kp = QShortcut(QKeySequence(Qt.Key_Enter), self)
+        self.sc_accept_enter_kp.setContext(Qt.WidgetWithChildrenShortcut)
+        self.sc_accept_enter_kp.activated.connect(_accept_on_enter)
         self.sc_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
         self.sc_undo.setContext(Qt.WidgetWithChildrenShortcut)
         self.sc_undo.activated.connect(self._undo)
@@ -1420,6 +1471,12 @@ class ActionWindow(FrameControlMixin, QWidget):
             QKeySequence("Ctrl+,"), self, activated=self._open_settings_dialog
         )
         self.sc_settings.setContext(Qt.WidgetWithChildrenShortcut)
+        self.sc_save_json = QShortcut(
+            QKeySequence.Save,
+            self,
+            activated=lambda: self._save_json_annotations(skip_gap_check=False),
+        )
+        self.sc_save_json.setContext(Qt.WidgetWithChildrenShortcut)
         self.apply_shortcut_settings(self._shortcut_bindings)
         self.installEventFilter(self)
         self.psr_embedded = None
@@ -2282,10 +2339,20 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _ensure_view_trim_state(self, view: Dict[str, Any]) -> None:
         if view is None:
             return
-        if "trim_cuts" not in view:
+        current = view.get("trim_cuts")
+        if not isinstance(current, dict):
             view["trim_cuts"] = self._empty_trim_state()
-        else:
-            view["trim_cuts"] = self._clone_trim_state(view.get("trim_cuts"))
+            return
+        if not isinstance(current.get("store"), set):
+            current["store"] = {int(c) for c in (current.get("store") or [])}
+        for kind in ("entity", "phase"):
+            bucket = current.get(kind)
+            if not isinstance(bucket, dict):
+                current[kind] = {}
+                continue
+            for key, val in list(bucket.items()):
+                if not isinstance(val, set):
+                    bucket[key] = {int(c) for c in (val or [])}
 
     def _trim_cut_set_for_view(
         self, view: Dict[str, Any], descriptor: Dict[str, Any], create: bool = False
@@ -2295,15 +2362,81 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._ensure_view_trim_state(view)
         cuts = view.get("trim_cuts") or self._empty_trim_state()
         kind = str(descriptor.get("kind") or "")
+        result: Optional[Set[int]] = None
         if kind == "store":
-            return cuts.setdefault("store", set())
-        if kind in ("entity", "phase"):
+            result = cuts.setdefault("store", set())
+        elif kind in ("entity", "phase"):
             key = str(descriptor.get("entity") or "")
             bucket = cuts.setdefault(kind, {})
             if create:
-                return bucket.setdefault(key, set())
-            return bucket.get(key, set())
-        return set()
+                result = bucket.setdefault(key, set())
+            else:
+                result = bucket.get(key, set())
+        if result is None:
+            return set()
+        # Sweep orphan cuts (same-label on both sides, not user-accepted) on
+        # every read so any path consuming trim cuts — timeline rendering,
+        # scribble merge detection, correction-view splitting — sees the same
+        # cleaned set regardless of how the current state was reached.
+        if not create and result and not getattr(self, "_sweeping_trim_cuts", False):
+            try:
+                self._sweeping_trim_cuts = True
+                self._sweep_stale_trim_cuts(view, descriptor, result)
+            finally:
+                self._sweeping_trim_cuts = False
+        return result
+
+    def _sweep_stale_trim_cuts(
+        self,
+        view: Dict[str, Any],
+        descriptor: Dict[str, Any],
+        cut_set: Set[int],
+    ) -> None:
+        if not cut_set:
+            return
+        _boundary_trace("sweep.enter", descriptor=descriptor, cuts_in=sorted(int(c) for c in cut_set))
+        kind = str(descriptor.get("kind") or "").strip().lower()
+        store = None
+        if kind == "store":
+            store = view.get("store")
+        elif kind in ("entity", "phase"):
+            key = str(descriptor.get("entity") or "")
+            bucket = (
+                view.get("entity_stores" if kind == "entity" else "phase_stores") or {}
+            )
+            store = bucket.get(key)
+        label_at = getattr(store, "label_at", None) if store is not None else None
+        if not callable(label_at):
+            return
+        protected: Set[int] = set()
+        try:
+            protected = self._confirmed_accept_boundary_cut_positions(
+                descriptor=descriptor
+            )
+        except Exception:
+            protected = set()
+        try:
+            protected = set(protected) | self._auto_preserved_cut_set(
+                view, descriptor, create=False
+            )
+        except Exception:
+            pass
+        for c in list(cut_set):
+            try:
+                cf = int(c)
+            except Exception:
+                continue
+            if cf in protected:
+                continue
+            try:
+                left = label_at(cf - 1)
+                right = label_at(cf)
+            except Exception:
+                continue
+            if left is not None and right is not None and left == right:
+                _boundary_trace("sweep.discard", frame=cf, left=left, right=right, protected=sorted(int(p) for p in protected))
+                cut_set.discard(c)
+        _boundary_trace("sweep.exit", descriptor=descriptor, cuts_out=sorted(int(c) for c in cut_set))
 
     def _segment_bounds_with_cuts(
         self, st: Optional[AnnotationStore], frame: int, cuts: Optional[Set[int]] = None
@@ -2322,6 +2455,58 @@ class ActionWindow(FrameControlMixin, QWidget):
         while e < fc - 1 and st.label_at(e + 1) == lb and (e + 1) not in cut_set:
             e += 1
         return int(s), int(e), lb
+
+    @staticmethod
+    def _auto_preserved_bucket_key(descriptor: Dict[str, Any]) -> str:
+        kind = str((descriptor or {}).get("kind") or "store")
+        if kind == "store":
+            return "store"
+        entity = str((descriptor or {}).get("entity") or "")
+        return f"{kind}:{entity}"
+
+    def _auto_preserved_cut_set(
+        self, view: Dict[str, Any], descriptor: Dict[str, Any], create: bool = False
+    ) -> Set[int]:
+        if view is None or descriptor is None:
+            return set()
+        bucket = view.get("auto_preserved_trim_cuts")
+        if not isinstance(bucket, dict):
+            if not create:
+                return set()
+            bucket = {}
+            view["auto_preserved_trim_cuts"] = bucket
+        key = self._auto_preserved_bucket_key(descriptor)
+        cur = bucket.get(key)
+        if not isinstance(cur, set):
+            if not create:
+                return set()
+            cur = set()
+            bucket[key] = cur
+        return cur
+
+    def _set_auto_preserved_cut(
+        self, view: Dict[str, Any], descriptor: Dict[str, Any], frame: int, on: bool
+    ) -> None:
+        s = self._auto_preserved_cut_set(view, descriptor, create=True)
+        if on:
+            s.add(int(frame))
+        else:
+            s.discard(int(frame))
+
+    def _clear_auto_preserved_cuts_in_span(
+        self,
+        view: Dict[str, Any],
+        descriptor: Dict[str, Any],
+        start: int,
+        end: int,
+    ) -> None:
+        s = self._auto_preserved_cut_set(view, descriptor, create=False)
+        if not s:
+            return
+        lo, hi = int(min(start, end)), int(max(start, end))
+        for f in list(s):
+            if lo <= int(f) <= hi:
+                s.discard(f)
 
     def _active_trim_cuts_for_descriptor(self, descriptor: Dict[str, Any]) -> List[int]:
         if not (self.views and 0 <= self.active_view_idx < len(self.views)):
@@ -2387,12 +2572,234 @@ class ActionWindow(FrameControlMixin, QWidget):
         view = self.views[self.active_view_idx]
         rows = view.get("confirmed_accept_records")
         if isinstance(rows, list):
+            # Purge legacy cascade_guard_v1 auto-preserved records (now
+            # tracked in view["auto_preserved_trim_cuts"]).
+            if any(
+                isinstance(r, dict) and str(r.get("source") or "") == "cascade_guard_v1"
+                for r in rows
+            ):
+                rows[:] = [
+                    r for r in rows
+                    if not (isinstance(r, dict) and str(r.get("source") or "") == "cascade_guard_v1")
+                ]
+            # Purge stale boundary-type ACC records whose two sides now share
+            # the same label (a same-label merge silently invalidated them).
+            # Without this, they keep resurrecting as "preserved boundaries"
+            # on subsequent reject-merges.
+            store = view.get("store")
+            if store is not None and getattr(store, "label_at", None):
+                def _stale(r):
+                    if not isinstance(r, dict):
+                        return False
+                    if str(r.get("point_type") or "") != "boundary":
+                        return False
+                    bf = r.get("boundary_frame")
+                    if bf is None:
+                        return False
+                    try:
+                        bfi = int(bf)
+                    except Exception:
+                        return False
+                    if bfi <= 0:
+                        return False
+                    try:
+                        lbl_l = store.label_at(bfi - 1)
+                        lbl_r = store.label_at(bfi)
+                    except Exception:
+                        return False
+                    nm_l = self._resolve_action_label_name(lbl_l) if lbl_l is not None else ""
+                    nm_r = self._resolve_action_label_name(lbl_r) if lbl_r is not None else ""
+                    if not nm_l or not nm_r:
+                        return False
+                    return self._normalized_label_key(str(nm_l)) == self._normalized_label_key(str(nm_r))
+                if any(_stale(r) for r in rows):
+                    rows[:] = [r for r in rows if not _stale(r)]
             return rows
         if create:
             rows = []
             view["confirmed_accept_records"] = rows
             return rows
         return []
+
+    def _purge_accept_artifacts_in_span(
+        self,
+        *,
+        view_idx: Optional[int] = None,
+        start: int,
+        end: int,
+    ) -> bool:
+        """Remove confirmed-accept records and scribble markers that live
+        inside [start, end]. Used when a segment is deleted so that the
+        protected cut bookkeeping + the ACC marker on the timeline don't
+        linger after the segment they belonged to is gone."""
+        if not self.views:
+            return False
+        idx = int(self.active_view_idx if view_idx is None else view_idx)
+        if not (0 <= idx < len(self.views)):
+            return False
+        try:
+            s_i = int(start)
+            e_i = int(end)
+        except Exception:
+            return False
+        if e_i < s_i:
+            s_i, e_i = e_i, s_i
+        view = self.views[idx]
+        changed = False
+
+        def _frame_in_span(val: Any) -> bool:
+            try:
+                f = int(val)
+            except Exception:
+                return False
+            return s_i <= f <= e_i
+
+        rows = view.get("confirmed_accept_records")
+        removed_session_ids: Set[str] = set()
+        removed_cut_frames: Set[int] = set()
+        if isinstance(rows, list) and rows:
+            kept_rows: List[Dict[str, Any]] = []
+            for rec in rows:
+                if not isinstance(rec, dict):
+                    kept_rows.append(rec)
+                    continue
+                hit = (
+                    _frame_in_span(rec.get("boundary_frame"))
+                    or _frame_in_span(rec.get("feedback_start"))
+                    or _frame_in_span(rec.get("feedback_end"))
+                )
+                if hit:
+                    sid = str(rec.get("session_id") or "").strip()
+                    if sid:
+                        removed_session_ids.add(sid)
+                    for key in (
+                        "boundary_frame",
+                        "feedback_start",
+                        "feedback_end",
+                        "locked_segment_start",
+                        "locked_segment_end",
+                    ):
+                        raw = rec.get(key)
+                        try:
+                            if raw is not None:
+                                removed_cut_frames.add(int(raw))
+                        except Exception:
+                            pass
+                    changed = True
+                    continue
+                kept_rows.append(rec)
+            if changed:
+                view["confirmed_accept_records"] = kept_rows
+
+        # Also drop any trim cuts whose frame falls in the purge span so the
+        # deleted/accepted boundary doesn't keep splitting segments in the
+        # correction view after the record/marker is gone.
+        try:
+            cut_set = self._trim_cut_set_for_view(view, {"kind": "store"}, create=False)
+        except Exception:
+            cut_set = None
+        if cut_set:
+            cut_removed = False
+            for cut in list(cut_set):
+                try:
+                    cf = int(cut)
+                except Exception:
+                    continue
+                if s_i <= cf <= e_i + 1 or cf in removed_cut_frames:
+                    cut_set.discard(cut)
+                    cut_removed = True
+            if cut_removed:
+                changed = True
+
+        items = list(getattr(self._scribble_items, "items", []) or [])
+        if items:
+            kept_items = []
+            for item in items:
+                try:
+                    its = int(getattr(item, "start_frame", 0))
+                    ite = int(getattr(item, "end_frame", its))
+                except Exception:
+                    kept_items.append(item)
+                    continue
+                if ite < its:
+                    its, ite = ite, its
+                meta = dict(getattr(item, "meta", {}) or {})
+                sid = str(meta.get("session_id") or "").strip()
+                overlaps = not (ite < s_i or its > e_i)
+                if overlaps or (sid and sid in removed_session_ids):
+                    changed = True
+                    continue
+                kept_items.append(item)
+            if changed:
+                self._scribble_items.items = kept_items
+                try:
+                    self._store_active_view_scribble_state()
+                except Exception:
+                    pass
+                try:
+                    self._sync_timeline_scribble_items()
+                except Exception:
+                    pass
+        return changed
+
+    def _confirmed_accept_boundary_cut_positions(
+        self,
+        *,
+        view_idx: Optional[int] = None,
+        descriptor: Optional[Dict[str, Any]] = None,
+    ) -> Set[int]:
+        if not self.views:
+            return set()
+        idx = int(self.active_view_idx if view_idx is None else view_idx)
+        if not (0 <= idx < len(self.views)):
+            return set()
+        view = self.views[idx]
+        rows = view.get("confirmed_accept_records")
+        if not isinstance(rows, list):
+            return set()
+        protected: Set[int] = set()
+        for rec in rows:
+            if not isinstance(rec, dict):
+                continue
+            point_type = str(rec.get("point_type", "") or "").strip().lower()
+            if point_type == "boundary":
+                raw_frame = rec.get("boundary_frame", rec.get("feedback_start"))
+                if raw_frame is None:
+                    continue
+                try:
+                    frame_i = int(raw_frame)
+                except Exception:
+                    continue
+                protected.add(int(frame_i))
+                # Also protect the adjacent segment endpoints that were locked
+                # at acceptance time, so automatic merges cannot silently change
+                # the start/end of manually confirmed action segments.
+                for key in ("locked_segment_start", "locked_segment_end"):
+                    raw = rec.get(key)
+                    if raw is not None:
+                        try:
+                            protected.add(int(raw))
+                        except Exception:
+                            pass
+            elif point_type == "label":
+                # When a label is confirmed for a segment, protect the
+                # segment start boundary so automatic merges cannot shift
+                # the confirmed segment's extent.
+                raw_start = rec.get("feedback_start")
+                if raw_start is not None:
+                    try:
+                        protected.add(int(raw_start))
+                    except Exception:
+                        pass
+                raw_end = rec.get("feedback_end")
+                if raw_end is not None:
+                    try:
+                        # The cut at end+1 marks the boundary between this
+                        # segment and the next one.
+                        protected.add(int(raw_end) + 1)
+                    except Exception:
+                        pass
+        return protected
 
     def _confirm_record_key(self, rec: Dict[str, Any]) -> Tuple[Any, ...]:
         point_type = str(rec.get("point_type", "") or "").strip().lower()
@@ -2422,6 +2829,65 @@ class ActionWindow(FrameControlMixin, QWidget):
                 rows[idx] = clean
                 return
         rows.append(clean)
+
+    def _clear_boundary_lock_records_in_span(
+        self,
+        span_start: int,
+        span_end: int,
+        *,
+        keep: Optional[Set[int]] = None,
+        view_idx: Optional[int] = None,
+    ) -> int:
+        """Remove confirmed boundary-accept records whose boundary_frame
+        falls within [span_start, span_end], except those in *keep*.
+
+        This is called after an explicit user action (merge, remove, delete)
+        so that the old lock records no longer block future automatic
+        operations.  Returns the number of records removed.
+        """
+        target_view_idx = (
+            int(self.active_view_idx)
+            if view_idx is None
+            else int(view_idx)
+        )
+        if not self.views or not (0 <= target_view_idx < len(self.views)):
+            return 0
+        view = self.views[target_view_idx]
+        rows = view.get("confirmed_accept_records")
+        if not isinstance(rows, list):
+            rows = []
+        if not rows:
+            return 0
+        keep_set = keep or set()
+        s = int(span_start)
+        e = int(span_end)
+        if e < s:
+            s, e = e, s
+        kept: List[Dict[str, Any]] = []
+        removed = 0
+        for rec in rows:
+            if not isinstance(rec, dict):
+                kept.append(rec)
+                continue
+            if str(rec.get("point_type", "") or "").strip().lower() != "boundary":
+                kept.append(rec)
+                continue
+            raw = rec.get("boundary_frame", rec.get("feedback_start"))
+            if raw is None:
+                kept.append(rec)
+                continue
+            try:
+                frame_i = int(raw)
+            except Exception:
+                kept.append(rec)
+                continue
+            if s <= frame_i <= e and frame_i not in keep_set:
+                removed += 1
+                continue
+            kept.append(rec)
+        if removed:
+            rows[:] = kept
+        return removed
 
     def _build_accept_record_for_point(
         self, pt: Optional[Dict[str, Any]], *, boundary_frame: Optional[int] = None
@@ -2467,7 +2933,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 return None
             left_label = str((pt.get("left") or {}).get("label", "") or "").strip()
             right_label = str((pt.get("right") or {}).get("label", "") or "").strip()
-            return {
+            rec: Dict[str, Any] = {
                 "schema_version": 2,
                 "point_type": "boundary",
                 "action_kind": "boundary_accept",
@@ -2481,6 +2947,16 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "source": "confirmed_accept_v1",
                 "confirmed_kind": "accepted",
             }
+            # Also lock the adjacent segment endpoints so that automatic
+            # operations cannot silently move the start/end of segments that
+            # the user has already confirmed.
+            seg_start = pt.get("segment_start")
+            seg_end = pt.get("segment_end")
+            if seg_start is not None:
+                rec["locked_segment_start"] = int(seg_start)
+            if seg_end is not None:
+                rec["locked_segment_end"] = int(seg_end)
+            return rec
         return None
 
     def _confirmed_boundary_frames_for_export(
@@ -2527,8 +3003,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             if not label:
                 continue
             try:
-                start = int(rec.get("feedback_start", 0) or 0)
-                end = int(rec.get("feedback_end", start) or start)
+                _v = rec.get("feedback_start")
+                start = int(_v if _v is not None else 0)
+                _v = rec.get("feedback_end")
+                end = int(_v if _v is not None else start)
             except Exception:
                 continue
             if end < start:
@@ -2566,9 +3044,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             left = dict(segments[idx] or {})
             right = dict(segments[idx + 1] or {})
             try:
-                boundary = int(right.get("start", left.get("end", 0)) or 0)
-                start = int(left.get("start", boundary) or boundary)
-                end = int(right.get("end", boundary) or boundary)
+                _rb = right.get("start")
+                _lb = left.get("end")
+                boundary = int(_rb if _rb is not None else (_lb if _lb is not None else 0))
+                _ls = left.get("start")
+                start = int(_ls if _ls is not None else boundary)
+                _re = right.get("end")
+                end = int(_re if _re is not None else boundary)
             except Exception:
                 continue
             if boundary not in confirmed_frames:
@@ -2605,8 +3087,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             if not isinstance(win, dict):
                 continue
             try:
-                start = int(win.get("start_frame", 0) or 0)
-                end = int(win.get("end_frame", start) or start)
+                _v = win.get("start_frame")
+                start = int(_v if _v is not None else 0)
+                _v = win.get("end_frame")
+                end = int(_v if _v is not None else start)
             except Exception:
                 continue
             if end < start:
@@ -3245,7 +3729,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             records.extend(filtered_accepts)
         records.sort(
             key=lambda row: (
-                int(row.get("feedback_start", 0) or 0),
+                int(row.get("feedback_start") if row.get("feedback_start") is not None else 0),
                 0 if str(row.get("point_type", "") or "") == "boundary" else 1,
                 str(row.get("action_kind", "") or ""),
                 str(row.get("label", "") or ""),
@@ -3255,8 +3739,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         return list(records)
 
     def _begin_correction_session(self, kind: str, **meta) -> None:
-        meta = dict(meta or {})
-        meta.setdefault("study_condition", self._current_study_condition())
+        meta = self._merge_interaction_context_meta(meta)
         self._correction_buffer.begin(kind, meta=meta, replace=True)
 
     def _note_correction_step(self, count: int = 1) -> None:
@@ -3272,8 +3755,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         query_type = str(meta_update.get("query_type") or "").strip().lower()
         if query_type and query_type != str(candidate.query_type.value):
             return meta_update
-        start = int(meta_update.get("feedback_start", meta_update.get("frame", candidate.start_frame)) or candidate.start_frame)
-        end = int(meta_update.get("feedback_end", meta_update.get("frame", candidate.end_frame)) or candidate.end_frame)
+        _v = meta_update.get("feedback_start")
+        if _v is None:
+            _v = meta_update.get("frame")
+        start = int(_v if _v is not None else candidate.start_frame)
+        _v = meta_update.get("feedback_end")
+        if _v is None:
+            _v = meta_update.get("frame")
+        end = int(_v if _v is not None else candidate.end_frame)
         if end < start:
             start, end = end, start
         overlaps = not (int(end) < int(candidate.start_frame) or int(start) > int(candidate.end_frame))
@@ -3298,10 +3787,9 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _commit_correction_session(self, **meta_update) -> Dict[str, Any]:
         records = self._rebuild_confirmed_correction_records_for_active_view()
         if meta_update:
-            meta_update = dict(meta_update)
+            meta_update = self._merge_interaction_context_meta(meta_update)
         else:
-            meta_update = {}
-        meta_update.setdefault("study_condition", self._current_study_condition())
+            meta_update = self._merge_interaction_context_meta({})
         meta_update = self._attach_query_candidate_meta(meta_update)
         meta_update["persisted"] = False
         summary = self._correction_buffer.commit(records=records, meta_update=meta_update)
@@ -3407,8 +3895,31 @@ class ActionWindow(FrameControlMixin, QWidget):
         if phase_panel is not None and study_mode:
             phase_panel.setVisible(False)
 
+    def _refresh_toolbar_controls_for_study(self) -> None:
+        study_mode = bool(self._study_mode_active())
+        for widget in (
+            getattr(self, "lbl_task", None),
+            getattr(self, "combo_task", None),
+            getattr(self, "lbl_validation", None),
+            getattr(self, "btn_validation", None),
+        ):
+            if widget is not None:
+                widget.setVisible(not study_mode)
+        if study_mode:
+            for widget in (
+                getattr(self, "lbl_overlay", None),
+                getattr(self, "combo_overlay", None),
+            ):
+                if widget is not None:
+                    widget.setVisible(False)
+            return
+        try:
+            self._update_validation_overlay_controls()
+        except Exception:
+            pass
+
     def _planner_button_text_for_current_study(self) -> str:
-        if self._current_study_condition() == "scribble_planner":
+        if self._boundary_only_planner_for_current_study():
             return "Next Boundary"
         return "Suggest Query"
 
@@ -3424,7 +3935,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         if condition == "scribble_only":
             return "User Study: Scribble Only. Draw boundary scribbles manually; planner guidance is disabled."
         if condition == "scribble_planner":
-            return "User Study: Scribble + Planner. Use boundary-only planner suggestions and refine/accept the surfaced boundary sequence."
+            return "User Study: Scribble + Planner. Use planner-ranked boundary suggestions while keeping scribble editing enabled."
         return "Standard mode. All interaction features remain available."
 
     def _apply_study_condition(self, condition: str, *, log_event: bool = True) -> None:
@@ -3433,8 +3944,22 @@ class ActionWindow(FrameControlMixin, QWidget):
         if key not in _STUDY_CONDITION_LABELS:
             key = "standard"
         self._study_condition = key
+        try:
+            if getattr(self, "op_logger", None) is not None:
+                self.op_logger.set_default_fields(
+                    condition=key,
+                    mode_code=self._study_mode_code(key),
+                    participant=self._sanitize_participant_id(
+                        getattr(self, "_study_participant_id", "")
+                    ),
+                )
+                if key == "standard":
+                    self.op_logger.clear_default_fields("participant", "mode_code")
+        except Exception:
+            pass
         self._refresh_interaction_controls_for_study()
         self._refresh_mode_controls_for_study()
+        self._refresh_toolbar_controls_for_study()
         try:
             self._update_phase_panel_visibility()
         except Exception:
@@ -3507,12 +4032,417 @@ class ActionWindow(FrameControlMixin, QWidget):
             except Exception:
                 pass
 
+    _STUDY_MODE_CODES = {
+        "scribble_only": "SO",
+        "scribble_planner": "SP",
+        "standard": "ST",
+    }
+
+    def _study_mode_code(self, condition: Optional[str] = None) -> str:
+        key = str(condition or self._current_study_condition()).strip().lower()
+        return self._STUDY_MODE_CODES.get(key, "ST")
+
+    def _sanitize_participant_id(self, raw: str) -> str:
+        text = str(raw or "").strip()
+        # Keep alphanumerics, dash, underscore. Collapse the rest to empty.
+        out = []
+        for ch in text:
+            if ch.isalnum() or ch in ("-", "_"):
+                out.append(ch)
+        return "".join(out)
+
+    def _current_video_id(self) -> str:
+        vp = getattr(self, "video_path", "") or ""
+        if vp:
+            return os.path.splitext(os.path.basename(vp))[0]
+        return str(getattr(self, "current_video_id", "") or "")
+
+    def _ensure_study_participant_id(
+        self, *, force: bool = False, condition: Optional[str] = None
+    ) -> bool:
+        """Prompt for a Participant No. when entering a study condition.
+
+        Returns True if a valid PN is set; False if the user cancelled.
+        """
+        cond = str(condition or self._current_study_condition()).strip().lower()
+        if cond not in {"scribble_only", "scribble_planner"}:
+            return True
+        current = self._sanitize_participant_id(
+            getattr(self, "_study_participant_id", "")
+        )
+        if current and not force:
+            return True
+        cond_label = self._study_condition_display(cond)
+        while True:
+            text, ok = QInputDialog.getText(
+                self,
+                "Participant No.",
+                (
+                    f"Entering {cond_label}.\n\n"
+                    "Enter Participant No. (PN) for this session:"
+                ),
+                text=current,
+            )
+            if not ok:
+                return False
+            pn = self._sanitize_participant_id(text)
+            if not pn:
+                QMessageBox.information(
+                    self,
+                    "Participant No.",
+                    "Participant No. cannot be empty. Use letters, digits, '-' or '_'.",
+                )
+                continue
+            self._study_participant_id = pn
+            try:
+                if getattr(self, "op_logger", None) is not None:
+                    self.op_logger.set_default_fields(
+                        participant=pn,
+                        condition=cond,
+                        mode_code=self._study_mode_code(cond),
+                    )
+            except Exception:
+                pass
+            try:
+                self._log("study_participant_set", participant=pn, condition=cond)
+            except Exception:
+                pass
+            return True
+
+    def _collect_task_quality_snapshot(self) -> Dict[str, int]:
+        """Gather segment / gap / overlap / unlabeled counts for task_completed."""
+        snap = {
+            "segment_count": 0,
+            "gap_count": 0,
+            "gap_frame_count": 0,
+            "overlap_count": 0,
+            "unlabeled_frame_count": 0,
+        }
+        # Segment + unlabeled/gap counts from per-view axes.
+        try:
+            for v in getattr(self, "views", []) or []:
+                try:
+                    for _axis, gaps in self._gap_axes_for_view(v):
+                        snap["gap_count"] += len(gaps or [])
+                        for g in gaps or []:
+                            try:
+                                s, e = int(g[0]), int(g[1])
+                                snap["gap_frame_count"] += max(0, e - s + 1)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        snap["unlabeled_frame_count"] = snap["gap_frame_count"]
+        # Segment count from the canonical payload of the active view.
+        try:
+            canonical = self._build_canonical_from_store(include_extra=False)
+            anns = canonical.get("annotations") or []
+            snap["segment_count"] = int(len(anns))
+            # Rough overlap detection on sorted segments.
+            spans = []
+            for a in anns:
+                try:
+                    s = int(a.get("f_start", a.get("start", 0)))
+                    e = int(a.get("f_end", a.get("end", s)))
+                    spans.append((s, e))
+                except Exception:
+                    continue
+            spans.sort()
+            overlaps = 0
+            prev_end = -1
+            for s, e in spans:
+                if s < prev_end:
+                    overlaps += 1
+                if e > prev_end:
+                    prev_end = e
+            snap["overlap_count"] = overlaps
+        except Exception:
+            pass
+        return snap
+
+    def _log_task_completed(self, *, video_id: str = "") -> None:
+        if getattr(self, "op_logger", None) is None:
+            return
+        start_ts = float(getattr(self, "_task_start_ts", 0.0) or 0.0)
+        elapsed = None
+        if start_ts > 0:
+            elapsed = round(max(0.0, time.time() - start_ts), 3)
+        snap = self._collect_task_quality_snapshot()
+        fields: Dict[str, Any] = {
+            "video_id": video_id or self._current_video_id(),
+            "participant": self._sanitize_participant_id(
+                getattr(self, "_study_participant_id", "")
+            ),
+            "condition": self._current_study_condition(),
+        }
+        if elapsed is not None:
+            fields["elapsed_seconds"] = elapsed
+        fields.update(snap)
+        try:
+            self._log("task_completed", **fields)
+        except Exception:
+            pass
+
+    def _study_filename_stem(self, video_id: str = "") -> str:
+        """Build ``{PN}_{VIDEO_ID}_{MODE}`` for study-mode saves/exports."""
+        pn = self._sanitize_participant_id(
+            getattr(self, "_study_participant_id", "")
+        )
+        vid = str(video_id or "").strip() or self._current_video_id() or "video"
+        mode = self._study_mode_code()
+        if pn:
+            return f"{pn}_{vid}_{mode}"
+        return f"{vid}_{mode}"
+
+    def _study_planner_cache_enabled(
+        self, condition: Optional[str] = None
+    ) -> bool:
+        key = str(condition or self._current_study_condition()).strip().lower()
+        return key == "scribble_planner"
+
+    def _study_planner_dataset_key_for_path(self, path: str) -> str:
+        raw = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+        if not raw:
+            return ""
+        scan_dir = raw if os.path.isdir(raw) else os.path.dirname(raw)
+        if not scan_dir:
+            return ""
+
+        cur = scan_dir
+        while cur:
+            if os.path.isfile(os.path.join(cur, "manifest.csv")):
+                return os.path.normpath(cur)
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+
+        cur = scan_dir
+        marker_dirs = {
+            "videos",
+            "video",
+            "groundtruth",
+            "gt",
+            "metadata",
+            "annotations",
+            "results",
+        }
+        while cur:
+            base = os.path.basename(cur).strip().lower()
+            if base in marker_dirs:
+                parent = os.path.dirname(cur)
+                if parent and parent != cur:
+                    return os.path.normpath(parent)
+            if base.endswith("_features"):
+                parent = os.path.dirname(cur)
+                if parent and parent != cur:
+                    if os.path.basename(parent).strip().lower() == "videos":
+                        grand = os.path.dirname(parent)
+                        if grand and grand != parent:
+                            return os.path.normpath(grand)
+                    return os.path.normpath(parent)
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                break
+            cur = parent
+        return os.path.normpath(scan_dir)
+
+    def _current_study_planner_dataset_key(self) -> str:
+        return self._study_planner_dataset_key_for_path(
+            str(getattr(self, "video_path", "") or "")
+        )
+
+    def _study_planner_cache_key(
+        self,
+        *,
+        dataset_key: str = "",
+        condition: Optional[str] = None,
+    ) -> str:
+        cond = str(condition or self._current_study_condition()).strip().lower()
+        if not self._study_planner_cache_enabled(cond):
+            return ""
+        key = str(dataset_key or self._current_study_planner_dataset_key()).strip()
+        if not key:
+            return ""
+        return f"{cond}:{os.path.normcase(os.path.normpath(key))}"
+
+    def _current_interaction_context_meta(
+        self, *, view_idx: Optional[int] = None
+    ) -> Dict[str, Any]:
+        if view_idx is None:
+            view_idx = int(getattr(self, "active_view_idx", 0) or 0)
+        meta: Dict[str, Any] = {
+            "study_condition": self._current_study_condition(),
+        }
+        dataset_key = self._current_study_planner_dataset_key()
+        if dataset_key:
+            meta["dataset_key"] = str(dataset_key)
+        video_id = str(self._current_video_id() or "").strip()
+        if video_id:
+            meta["video_id"] = video_id
+        video_path = str(getattr(self, "video_path", "") or "").strip()
+        if video_path:
+            meta["video_path"] = os.path.abspath(os.path.expanduser(video_path))
+        if 0 <= int(view_idx) < len(getattr(self, "views", []) or []):
+            meta["view_idx"] = int(view_idx)
+            try:
+                meta["view"] = self._effective_view_name(
+                    self.views[int(view_idx)], idx=int(view_idx)
+                )
+            except Exception:
+                pass
+        return meta
+
+    def _merge_interaction_context_meta(
+        self,
+        meta: Optional[Dict[str, Any]],
+        *,
+        view_idx: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        merged = dict(meta or {})
+        for key, value in self._current_interaction_context_meta(
+            view_idx=view_idx
+        ).items():
+            merged.setdefault(key, value)
+        return merged
+
+    @staticmethod
+    def _correction_summary_signature(summary: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(summary, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return repr(summary)
+
+    def _merge_correction_histories(
+        self,
+        base_history: Optional[Sequence[Dict[str, Any]]],
+        extra_history: Optional[Sequence[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in list(base_history or []) + list(extra_history or []):
+            if not isinstance(item, dict):
+                continue
+            cloned = copy.deepcopy(item)
+            sig = self._correction_summary_signature(cloned)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            merged.append(cloned)
+        merged.sort(
+            key=lambda row: (
+                str(row.get("started_at") or ""),
+                str(row.get("committed_at") or row.get("discarded_at") or ""),
+                str(row.get("kind") or ""),
+            )
+        )
+        return merged
+
+    def _query_summary_matches_context(
+        self,
+        summary: Dict[str, Any],
+        *,
+        view_idx: Optional[int] = None,
+        view_name: str = "",
+        video_id: str = "",
+        dataset_key: str = "",
+    ) -> bool:
+        meta = summary.get("meta") or {}
+        if not isinstance(meta, dict):
+            return True
+
+        expected_dataset = str(dataset_key or "").strip()
+        if expected_dataset:
+            summary_dataset = str(meta.get("dataset_key", "") or "").strip()
+            if summary_dataset and os.path.normcase(
+                os.path.normpath(summary_dataset)
+            ) != os.path.normcase(os.path.normpath(expected_dataset)):
+                return False
+
+        expected_video = str(video_id or "").strip()
+        if expected_video:
+            summary_video = str(meta.get("video_id", "") or "").strip()
+            if summary_video and summary_video != expected_video:
+                return False
+
+        if view_idx is not None:
+            raw_view_idx = meta.get("view_idx")
+            if raw_view_idx not in (None, ""):
+                try:
+                    if int(raw_view_idx) != int(view_idx):
+                        return False
+                except Exception:
+                    pass
+            elif view_name:
+                summary_view = str(meta.get("view", "") or "").strip()
+                if summary_view and summary_view != str(view_name or "").strip():
+                    return False
+        elif view_name:
+            summary_view = str(meta.get("view", "") or "").strip()
+            if summary_view and summary_view != str(view_name or "").strip():
+                return False
+        return True
+
+    def _refresh_study_planner_history_cache(self) -> None:
+        cache_key = self._study_planner_cache_key()
+        if not cache_key:
+            return
+        history = [
+            copy.deepcopy(item)
+            for item in list(getattr(self._correction_buffer, "history", []) or [])
+            if isinstance(item, dict)
+        ]
+        if history:
+            self._study_planner_history_cache[cache_key] = history
+        else:
+            self._study_planner_history_cache.pop(cache_key, None)
+
+    def _restore_study_planner_history_for_path(self, path: str) -> None:
+        cache_key = self._study_planner_cache_key(
+            dataset_key=self._study_planner_dataset_key_for_path(path)
+        )
+        if not cache_key:
+            return
+        history = self._study_planner_history_cache.get(cache_key) or []
+        if not history:
+            return
+        self._correction_buffer.history = [
+            copy.deepcopy(item) for item in history if isinstance(item, dict)
+        ]
+        self._rebuild_query_learning_models_from_history()
+
     def _on_study_condition_selected(self, idx: int) -> None:
         combo = getattr(self, "combo_study_condition", None)
         if combo is None:
             return
-        value = combo.itemData(int(idx))
-        self._apply_study_condition(str(value or "standard"), log_event=True)
+        value = str(combo.itemData(int(idx)) or "standard")
+        prev = self._current_study_condition()
+        if value == prev:
+            return
+        if getattr(self, "_dirty", False):
+            prev_label = self._study_condition_display(prev)
+            new_label = self._study_condition_display(value)
+            if not self._prompt_save_if_dirty(
+                context=f"switching study condition from '{prev_label}' to '{new_label}'",
+            ):
+                # User cancelled — revert the combo selection without firing again.
+                prev_idx = combo.findData(prev)
+                if prev_idx >= 0:
+                    blocked = combo.blockSignals(True)
+                    combo.setCurrentIndex(int(prev_idx))
+                    combo.blockSignals(blocked)
+                return
+        if value in {"scribble_only", "scribble_planner"}:
+            if not self._ensure_study_participant_id(force=True, condition=value):
+                prev_idx = combo.findData(prev)
+                if prev_idx >= 0:
+                    blocked = combo.blockSignals(True)
+                    combo.setCurrentIndex(int(prev_idx))
+                    combo.blockSignals(blocked)
+                return
+        self._apply_study_condition(value, log_event=True)
 
     def _query_learning_cfg(self) -> Dict[str, Any]:
         self._ensure_algo_cfg_defaults()
@@ -3598,23 +4528,41 @@ class ActionWindow(FrameControlMixin, QWidget):
         obs = summarize_correction_observation(summary)
         if not obs or bool(obs.get("proposal_feedback")):
             return False
+        meta = summary.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
         history = list(getattr(self._correction_buffer, "history", []) or [])
         if len(history) <= 1:
             return False
         radius = self._second_correction_radius()
-        start = int(obs.get("start_frame", 0) or 0)
-        end = int(obs.get("end_frame", start) or start)
+        _v = obs.get("start_frame")
+        start = int(_v if _v is not None else 0)
+        _v = obs.get("end_frame")
+        end = int(_v if _v is not None else start)
         mid = int((start + end) * 0.5)
         same_type_seen = 0
         for prev in reversed(history[:-1]):
+            if not self._query_summary_matches_context(
+                prev,
+                view_idx=meta.get("view_idx", self.active_view_idx),
+                view_name=str(meta.get("view", "") or ""),
+                video_id=str(meta.get("video_id", self._current_video_id()) or ""),
+                dataset_key=str(
+                    meta.get("dataset_key", self._current_study_planner_dataset_key())
+                    or ""
+                ),
+            ):
+                continue
             prev_obs = summarize_correction_observation(prev)
             if not prev_obs or bool(prev_obs.get("proposal_feedback")):
                 continue
             if prev_obs.get("query_type") != obs.get("query_type"):
                 continue
             same_type_seen += 1
-            prev_start = int(prev_obs.get("start_frame", 0) or 0)
-            prev_end = int(prev_obs.get("end_frame", prev_start) or prev_start)
+            _v = prev_obs.get("start_frame")
+            prev_start = int(_v if _v is not None else 0)
+            _v = prev_obs.get("end_frame")
+            prev_end = int(_v if _v is not None else prev_start)
             prev_mid = int((prev_start + prev_end) * 0.5)
             if not (end < prev_start or start > prev_end):
                 return True
@@ -3763,6 +4711,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         if "second_correction" not in meta:
             meta["second_correction"] = bool(self._recent_second_correction_flag(summary))
         self._replay_correction_summary_into_learning(summary)
+        self._refresh_study_planner_history_cache()
 
     def _record_scribble_proposal_feedback(
         self,
@@ -3784,18 +4733,22 @@ class ActionWindow(FrameControlMixin, QWidget):
         if raw_conf is None:
             return
         try:
-            start = int(proposal.get("window_start", proposal.get("boundary_frame", 0)) or 0)
+            _v = proposal.get("window_start")
+            if _v is None:
+                _v = proposal.get("boundary_frame")
+            start = int(_v if _v is not None else 0)
         except Exception:
             start = 0
         try:
-            end = int(proposal.get("window_end", start) or start)
+            _v = proposal.get("window_end")
+            end = int(_v if _v is not None else start)
         except Exception:
             end = start
         if end < start:
             start, end = end, start
         summary = self._correction_buffer.record_event(
             "scribble_proposal_feedback",
-            meta={
+            meta=self._merge_interaction_context_meta({
                 "query_type": str(QueryType.BOUNDARY_SCRIBBLE.value),
                 "point_type": "proposal_feedback",
                 "proposal_feedback": True,
@@ -3823,11 +4776,23 @@ class ActionWindow(FrameControlMixin, QWidget):
                 ),
                 "left_label": str(proposal.get("left_label", "") or ""),
                 "right_label": str(proposal.get("right_label", "") or ""),
-            },
+            }),
             changed=bool(changed),
             reason=str(reason or "").strip(),
         )
         self._on_correction_session_finalized(summary)
+        self._log(
+            "scribble_proposal_feedback",
+            accepted=bool(accepted),
+            changed=bool(changed),
+            reason=str(reason or ""),
+            boundary_frame=proposal.get("boundary_frame"),
+            raw_confidence=raw_conf,
+            left_label=str(proposal.get("left_label", "") or ""),
+            right_label=str(proposal.get("right_label", "") or ""),
+            feedback_start=int(start),
+            feedback_end=int(end),
+        )
 
     def _record_label_review_feedback(
         self,
@@ -3843,18 +4808,20 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not isinstance(review, dict):
             return
         try:
-            start = int(review.get("start_frame", 0) or 0)
+            _v = review.get("start_frame")
+            start = int(_v if _v is not None else 0)
         except Exception:
             start = 0
         try:
-            end = int(review.get("end_frame", start) or start)
+            _v = review.get("end_frame")
+            end = int(_v if _v is not None else start)
         except Exception:
             end = start
         if end < start:
             start, end = end, start
         summary = self._correction_buffer.record_event(
             "label_review_feedback",
-            meta={
+            meta=self._merge_interaction_context_meta({
                 "query_type": str(QueryType.LABEL_REVIEW.value),
                 "point_type": "proposal_feedback",
                 "proposal_feedback": True,
@@ -3878,11 +4845,23 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "calibrated_confidence": float(
                     review.get("calibrated_confidence", 0.0) or 0.0
                 ),
-            },
+            }),
             changed=bool(changed),
             reason=str(reason or "").strip(),
         )
         self._on_correction_session_finalized(summary)
+        self._log(
+            "label_review_feedback",
+            accepted=bool(accepted),
+            changed=bool(changed),
+            reason=str(reason or ""),
+            current_label=str(review.get("current_label", "") or ""),
+            suggested_label=str(review.get("suggested_label", "") or ""),
+            chosen_label=str(chosen_label or ""),
+            feedback_start=int(start),
+            feedback_end=int(end),
+            raw_confidence=float(review.get("raw_confidence", 0.0) or 0.0),
+        )
 
     def _clear_pending_label_review(
         self,
@@ -3937,12 +4916,41 @@ class ActionWindow(FrameControlMixin, QWidget):
         cuts = self._trim_cut_set_for_view(view, descriptor, create=False)
         seg_s, seg_e, seg_label = self._segment_bounds_with_cuts(st, frame_i, cuts)
         proposal_action = str(proposal.get("proposal_action", "") or "").strip()
+        if proposal_action == "merge_then_split":
+            return None
+        if proposal_action == "remove_segment":
+            return None
+        if proposal_action == "remove_boundaries":
+            _v = proposal.get("window_start")
+            merge_s = int(_v if _v is not None else frame_i)
+            _v = proposal.get("window_end")
+            merge_e = int(_v if _v is not None else frame_i)
+            if merge_e < merge_s:
+                merge_s, merge_e = merge_e, merge_s
+            candidates = list(
+                self._bootstrap_label_candidates_for_span(merge_s, merge_e) or []
+            )
+            merged = str(
+                proposal.get("merged_label", "")
+                or proposal.get("left_label", "")
+                or proposal.get("right_label", "")
+                or ""
+            ).strip()
+            return {
+                "mode": "remove_boundaries",
+                "start": int(merge_s),
+                "end": int(merge_e),
+                "current_label": str(merged),
+                "candidates": candidates,
+            }
         if proposal_action == "remove_boundary":
             ctx = self._remove_boundary_context_for_proposal(descriptor, proposal)
             if not ctx:
                 return None
-            merge_s = int((ctx.get("left_segment") or {}).get("start", frame_i) or frame_i)
-            merge_e = int((ctx.get("right_segment") or {}).get("end", frame_i) or frame_i)
+            _cls = (ctx.get("left_segment") or {}).get("start")
+            merge_s = int(_cls if _cls is not None else frame_i)
+            _cre = (ctx.get("right_segment") or {}).get("end")
+            merge_e = int(_cre if _cre is not None else frame_i)
             if merge_e < merge_s:
                 merge_s, merge_e = merge_e, merge_s
             candidates = list(self._bootstrap_label_candidates_for_span(merge_s, merge_e) or [])
@@ -3952,6 +4960,31 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "start": int(merge_s),
                 "end": int(merge_e),
                 "current_label": str(merged),
+                "candidates": candidates,
+            }
+        if proposal_action == "new_boundary" and seg_label is not None:
+            left_start = int(seg_s)
+            left_end = int(frame_i) - 1
+            if left_end < left_start:
+                return None
+            candidates = list(
+                self._bootstrap_label_candidates_for_span(left_start, left_end) or []
+            )
+            if not proposal.get("_new_boundary_defaults_applied"):
+                proposal["left_label"] = str(seg_label)
+                proposal["right_label"] = str(seg_label)
+                proposal["_new_boundary_defaults_applied"] = True
+            current = str(
+                proposal.get("left_label", "")
+                or proposal.get("right_label", "")
+                or seg_label
+                or ""
+            ).strip()
+            return {
+                "mode": "new_boundary",
+                "start": int(left_start),
+                "end": int(left_end),
+                "current_label": str(current),
                 "candidates": candidates,
             }
         if seg_label is None:
@@ -3990,8 +5023,25 @@ class ActionWindow(FrameControlMixin, QWidget):
             return
         candidates = list(payload.get("candidates") or [])
         current = str(payload.get("current_label", "") or "").strip()
-        if current and current not in {str(name or "").strip() for name, _score in candidates if name}:
-            candidates = [(current, None)] + candidates
+        try:
+            panel_current = str(self.panel.current_label_name() or "").strip()
+        except Exception:
+            panel_current = ""
+        known_candidate_names = {
+            str(name or "").strip() for name, _score in candidates if name
+        }
+        has_real_candidate = any(
+            not self._is_placeholder_action_label(name)
+            for name in known_candidate_names
+        )
+        for sticky in (current,):
+            if not sticky or sticky in known_candidate_names:
+                continue
+            if has_real_candidate and self._is_placeholder_action_label(sticky):
+                if not (panel_current and panel_current == sticky):
+                    continue
+            candidates = [(sticky, None)] + candidates
+            known_candidate_names.add(sticky)
         if candidates:
             deduped: List[Tuple[str, Optional[float]]] = []
             seen: Set[str] = set()
@@ -4001,18 +5051,52 @@ class ActionWindow(FrameControlMixin, QWidget):
                     continue
                 seen.add(label)
                 deduped.append((label, score))
+            deduped.sort(
+                key=lambda item: self._is_placeholder_action_label(item[0])
+            )
             candidates = deduped[: max(1, self._topk_k())]
             try:
                 self.panel.set_candidate_priority(candidates)
             except Exception:
                 pass
+        chosen_pool: List[str] = [current]
+        panel_in_candidates = bool(
+            panel_current
+            and any(
+                str(name or "").strip() == panel_current for name, _score in candidates
+            )
+        )
+        if panel_in_candidates:
+            chosen_pool.append(panel_current)
+        chosen_pool.extend([name for name, _score in candidates])
+        if panel_current and panel_current == current:
+            chosen = panel_current
+        else:
+            chosen = self._preferred_action_label(chosen_pool)
+        if chosen:
+            try:
+                self.panel.select_label_by_name(chosen, notify=False)
+            except Exception:
+                pass
+        _v_s = payload.get("start")
+        _v_e = payload.get("end")
         self._pending_boundary_label_override = {
             "mode": str(payload.get("mode") or ""),
-            "start": int(payload.get("start", 0) or 0),
-            "end": int(payload.get("end", 0) or 0),
-            "current_label": str(current),
+            "start": int(_v_s if _v_s is not None else 0),
+            "end": int(_v_e if _v_e is not None else 0),
+            "current_label": str(chosen or current),
             "session_id": str((proposal or {}).get("session_id", "") or ""),
         }
+        if isinstance(proposal, dict):
+            mode = str(payload.get("mode") or "").strip()
+            if mode == "new_boundary":
+                self._last_scribble_result = dict(proposal)
+                self._store_active_view_scribble_state()
+            elif chosen and self._apply_boundary_label_override_choice(
+                proposal, mode, chosen
+            ):
+                self._last_scribble_result = dict(proposal)
+                self._store_active_view_scribble_state()
 
     def _clear_pending_boundary_query_hint(self, *, update_ui: bool = True) -> None:
         proposal = (
@@ -4028,6 +5112,80 @@ class ActionWindow(FrameControlMixin, QWidget):
         if update_ui:
             self._update_scribble_proposal_ui()
 
+    def _planner_reason_summary(
+        self, candidate: Optional[QueryCandidate], *, limit: int = 3
+    ) -> str:
+        if not isinstance(candidate, QueryCandidate):
+            return ""
+        terms = dict(candidate.score_terms or {})
+        label_map = {
+            "uncertainty": "uncertainty",
+            "disagreement": "disagreement",
+            "multiview": "multiview",
+            "propagation_gain": "propagation",
+            "history": "history",
+            "learned_utility": "learned",
+            "state_conflict": "state",
+        }
+        ranked: List[Tuple[float, str]] = []
+        for key, label in label_map.items():
+            try:
+                val = float(terms.get(key, 0.0) or 0.0)
+            except Exception:
+                val = 0.0
+            if val > 0.0:
+                ranked.append((val, label))
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        if not ranked:
+            return "base score only"
+        return ", ".join(f"{label} {val:.2f}" for val, label in ranked[: max(1, int(limit))])
+
+    def _annotate_boundary_candidate_ranking(
+        self, candidate: Optional[QueryCandidate], candidates: Sequence[QueryCandidate]
+    ) -> None:
+        if not isinstance(candidate, QueryCandidate):
+            return
+        boundary_candidates = [
+            item
+            for item in list(candidates or [])
+            if isinstance(item, QueryCandidate)
+            and item.query_type == QueryType.BOUNDARY_SCRIBBLE
+        ]
+        if not boundary_candidates:
+            return
+        weights = self._query_planner_weights
+        ranked = sorted(
+            boundary_candidates,
+            key=lambda item: (
+                score_candidate(item, weights),
+                -int(item.start_frame),
+                str(item.query_id),
+            ),
+            reverse=True,
+        )
+        rank = 1
+        for idx, item in enumerate(ranked, start=1):
+            if str(item.query_id or "") == str(candidate.query_id or ""):
+                rank = int(idx)
+                break
+        best_score = float(score_candidate(candidate, weights))
+        next_score = (
+            float(score_candidate(ranked[1], weights))
+            if len(ranked) > 1 and rank == 1
+            else None
+        )
+        payload = candidate.payload if isinstance(candidate.payload, dict) else {}
+        payload["planner_rank"] = int(rank)
+        payload["planner_candidate_count"] = int(len(ranked))
+        payload["planner_score"] = float(best_score)
+        payload["planner_reason"] = self._planner_reason_summary(candidate)
+        payload["planner_learned_utility"] = float(
+            candidate.score_terms.get("learned_utility", 0.0) or 0.0
+        )
+        if next_score is not None:
+            payload["planner_margin"] = float(best_score - next_score)
+        candidate.payload = payload
+
     def _boundary_query_hint_payload_from_decision(
         self, decision: Optional[QueryDecision]
     ) -> Optional[Dict[str, Any]]:
@@ -4037,12 +5195,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         ):
             return None
         cand = decision.candidate
-        focus_frame = int(
-            cand.payload.get(
-                "boundary_frame", (int(cand.start_frame) + int(cand.end_frame)) // 2
-            )
-            or 0
-        )
+        _bf = cand.payload.get("boundary_frame")
+        focus_frame = int(_bf if _bf is not None else (int(cand.start_frame) + int(cand.end_frame)) // 2)
         return {
             "query_hint": True,
             "query_id": str(cand.query_id or ""),
@@ -4055,6 +5209,16 @@ class ActionWindow(FrameControlMixin, QWidget):
             "confidence": float(cand.payload.get("query_score", decision.utility) or 0.0),
             "raw_confidence": float(cand.payload.get("query_score", decision.utility) or 0.0),
             "scribble_count": 0,
+            "planner_rank": int(cand.payload.get("planner_rank", 1) or 1),
+            "planner_candidate_count": int(
+                cand.payload.get("planner_candidate_count", 1) or 1
+            ),
+            "planner_score": float(cand.payload.get("planner_score", decision.utility) or 0.0),
+            "planner_margin": float(cand.payload.get("planner_margin", 0.0) or 0.0),
+            "planner_reason": str(cand.payload.get("planner_reason", "") or ""),
+            "planner_learned_utility": float(
+                cand.payload.get("planner_learned_utility", 0.0) or 0.0
+            ),
         }
 
     def _label_review_payload_from_decision(
@@ -4178,8 +5342,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         target_label = str(label_name or "").strip()
         current_label = str(payload.get("current_label", "") or "").strip()
         suggested_label = str(payload.get("suggested_label", "") or "").strip()
-        start = int(payload.get("start_frame", 0) or 0)
-        end = int(payload.get("end_frame", start) or start)
+        _v = payload.get("start_frame")
+        start = int(_v if _v is not None else 0)
+        _v = payload.get("end_frame")
+        end = int(_v if _v is not None else start)
         if end < start:
             start, end = end, start
         if not target_label:
@@ -4205,11 +5371,16 @@ class ActionWindow(FrameControlMixin, QWidget):
                 chosen_label=target_label,
             )
             self._clear_pending_label_review()
-            self._refresh_query_planner_hint()
-            self._set_status(
-                f"Kept label {current_label or '?'} at F{int(payload.get('start_frame', 0))}-{int(payload.get('end_frame', 0))}."
+            self._after_manual_query_relevant_edit()
+            auto_advanced = self._maybe_auto_focus_next_query(
+                current_focus_frame=int((int(start) + int(end)) / 2),
+                status_prefix="Next suggestion",
             )
-            self._set_interaction_status("Label Review: kept current label")
+            if not auto_advanced:
+                self._set_status(
+                    f"Kept label {current_label or '?'} at F{int(payload.get('start_frame', 0))}-{int(payload.get('end_frame', 0))}."
+                )
+                self._set_interaction_status("Label Review: kept current label")
             return False
         self._begin_correction_session(
             "label_review",
@@ -4263,21 +5434,26 @@ class ActionWindow(FrameControlMixin, QWidget):
             chosen_label=target_label,
         )
         self._clear_pending_label_review()
-        self._refresh_query_planner_hint()
-        if accepted_suggestion:
-            self._set_status(
-                f"Accepted label review at F{start}-{end}: {current_label or '?'} -> {target_label}"
-            )
-            self._set_interaction_status(
-                f"Label Review accepted: {current_label or '?'} -> {target_label}"
-            )
-        else:
-            self._set_status(
-                f"Applied label review override at F{start}-{end}: {current_label or '?'} -> {target_label}"
-            )
-            self._set_interaction_status(
-                f"Label Review override: {current_label or '?'} -> {target_label}"
-            )
+        self._after_manual_query_relevant_edit()
+        auto_advanced = self._maybe_auto_focus_next_query(
+            current_focus_frame=int((int(start) + int(end)) / 2),
+            status_prefix="Next suggestion",
+        )
+        if not auto_advanced:
+            if accepted_suggestion:
+                self._set_status(
+                    f"Accepted label review at F{start}-{end}: {current_label or '?'} -> {target_label}"
+                )
+                self._set_interaction_status(
+                    f"Label Review accepted: {current_label or '?'} -> {target_label}"
+                )
+            else:
+                self._set_status(
+                    f"Applied label review override at F{start}-{end}: {current_label or '?'} -> {target_label}"
+                )
+                self._set_interaction_status(
+                    f"Label Review override: {current_label or '?'} -> {target_label}"
+                )
         return True
 
     def _accept_pending_label_review(self) -> bool:
@@ -4297,6 +5473,46 @@ class ActionWindow(FrameControlMixin, QWidget):
             reason="accepted",
         )
 
+    def _planner_boundary_reject_to_merge_proposal(
+        self, proposal: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(proposal, dict):
+            return None
+        if not bool(proposal.get("query_hint")):
+            return None
+        if str(proposal.get("proposal_action", "") or "").strip():
+            return None
+        boundary_raw = proposal.get("boundary_frame")
+        if boundary_raw is None or not self.views:
+            return None
+        row = self._active_scribble_row()
+        descriptor = self._mask_descriptor_from_row(row) if row is not None else None
+        if not descriptor or str(descriptor.get("kind") or "") not in ("store", "entity"):
+            descriptor = {"kind": "store"}
+        try:
+            boundary_i = int(boundary_raw)
+        except Exception:
+            return None
+        remove_ctx = self._boundary_context_near_frame(
+            descriptor,
+            frame_i=int(boundary_i),
+            search_radius=2,
+        )
+        if not isinstance(remove_ctx, dict):
+            return None
+        _v = remove_ctx.get("boundary_frame")
+        target_boundary = int(_v if _v is not None else boundary_i)
+        converted = dict(proposal)
+        converted["proposal_action"] = "remove_boundary"
+        converted["boundary_frame"] = int(target_boundary)
+        converted["target_boundary_frame"] = int(target_boundary)
+        merged_label = self._resolve_remove_boundary_label(converted, remove_ctx)
+        if merged_label:
+            converted["merged_label"] = str(merged_label)
+            converted["left_label"] = str(merged_label)
+            converted["right_label"] = str(merged_label)
+        return converted
+
     def _accept_current_interaction_suggestion(self) -> bool:
         if isinstance(self._pending_label_review, dict):
             return self._accept_pending_label_review()
@@ -4309,8 +5525,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             else None
         )
         if review:
-            start = int(review.get("start_frame", 0) or 0)
-            end = int(review.get("end_frame", start) or start)
+            _v = review.get("start_frame")
+            start = int(_v if _v is not None else 0)
+            _v = review.get("end_frame")
+            end = int(_v if _v is not None else start)
             if end < start:
                 start, end = end, start
             self._record_label_review_feedback(
@@ -4322,15 +5540,32 @@ class ActionWindow(FrameControlMixin, QWidget):
             current_label = str(review.get("current_label", "") or "") or "?"
             suggested_label = str(review.get("suggested_label", "") or "") or "?"
             self._clear_pending_label_review()
-            self._refresh_query_planner_hint()
-            self._set_status(
-                f"Rejected label suggestion at F{start}-{end}: {current_label} -> {suggested_label}"
+            self._after_manual_query_relevant_edit()
+            auto_advanced = self._maybe_auto_focus_next_query(
+                current_focus_frame=int((int(start) + int(end)) / 2),
+                status_prefix="Next suggestion",
             )
-            self._set_interaction_status("Label Review rejected")
+            if not auto_advanced:
+                self._set_status(
+                    f"Rejected label suggestion at F{start}-{end}: {current_label} -> {suggested_label}"
+                )
+                self._set_interaction_status("Label Review rejected")
             return True
         proposal = dict(self._last_scribble_result or {})
         if proposal.get("boundary_frame") is not None:
-            frame_i = int(proposal.get("boundary_frame") or 0)
+            _v = proposal.get("boundary_frame")
+            frame_i = int(_v if _v is not None else 0)
+            converted = self._planner_boundary_reject_to_merge_proposal(proposal)
+            if isinstance(converted, dict):
+                self._record_scribble_proposal_feedback(
+                    proposal,
+                    accepted=False,
+                    reason="rejected_to_merge",
+                    changed=False,
+                )
+                self._last_scribble_result = converted
+                self._store_active_view_scribble_state()
+                return bool(self._accept_last_scribble_proposal())
             self._record_scribble_proposal_feedback(
                 proposal,
                 accepted=False,
@@ -4338,8 +5573,15 @@ class ActionWindow(FrameControlMixin, QWidget):
                 changed=False,
             )
             self._clear_active_scribble_episode()
-            self._set_status(f"Rejected scribble proposal at F{frame_i}.")
-            self._set_interaction_status("Boundary Scribble rejected")
+            auto_advanced = False
+            if bool(proposal.get("query_hint")) or str(proposal.get("query_id", "") or "").strip():
+                auto_advanced = self._maybe_auto_focus_next_query(
+                    current_focus_frame=int(frame_i),
+                    status_prefix="Next suggestion",
+                )
+            if not auto_advanced:
+                self._set_status(f"Rejected scribble proposal at F{frame_i}.")
+                self._set_interaction_status("Boundary Scribble rejected")
             return True
         self._set_status("No pending query suggestion to reject.")
         self._update_scribble_proposal_ui()
@@ -4437,15 +5679,42 @@ class ActionWindow(FrameControlMixin, QWidget):
             return ""
         video_dir = os.path.dirname(path)
         stem = os.path.splitext(os.path.basename(path))[0]
-        direct_candidates = [
-            os.path.join(video_dir, f"{stem}.json"),
-            os.path.join(video_dir, f"{stem}_annotations.json"),
-            os.path.join(video_dir, f"{stem}_annotation.json"),
-            os.path.join(video_dir, f"{stem}_segments.json"),
-            os.path.join(video_dir, f"{stem}_labels.json"),
-            os.path.join(video_dir, f"{stem}_coarse.json"),
-            os.path.join(video_dir, f"{stem}_fine.json"),
-        ]
+        direct_candidates: List[str] = []
+
+        def _add_candidate(candidate: str) -> None:
+            cand = os.path.abspath(os.path.expanduser(str(candidate or "").strip()))
+            if cand and cand not in direct_candidates:
+                direct_candidates.append(cand)
+
+        for suffix in (
+            ".json",
+            "_annotations.json",
+            "_annotation.json",
+            "_segments.json",
+            "_labels.json",
+            "_coarse.json",
+            "_fine.json",
+            ".txt",
+            "_annotations.txt",
+            "_annotation.txt",
+            "_segments.txt",
+            "_gt.txt",
+        ):
+            _add_candidate(os.path.join(video_dir, f"{stem}{suffix}"))
+
+        scan_dirs = [video_dir]
+        parent = video_dir
+        for _ in range(2):
+            next_parent = os.path.dirname(parent)
+            if not next_parent or next_parent == parent:
+                break
+            scan_dirs.append(next_parent)
+            parent = next_parent
+        for base_dir in scan_dirs:
+            for gt_dir_name in GT_CANDIDATE_DIR_NAMES:
+                _add_candidate(os.path.join(base_dir, gt_dir_name, f"{stem}.txt"))
+                _add_candidate(os.path.join(base_dir, gt_dir_name, f"{stem}.json"))
+
         for cand in direct_candidates:
             if os.path.isfile(cand):
                 return cand
@@ -4453,7 +5722,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             matches = []
             for name in sorted(os.listdir(video_dir)):
                 low = str(name or "").lower()
-                if not low.endswith(".json"):
+                if not low.endswith((".json", ".txt")):
                     continue
                 if any(
                     token in low
@@ -4465,12 +5734,21 @@ class ActionWindow(FrameControlMixin, QWidget):
                         "components",
                         "rules",
                         "shared_adapter",
+                        "_extra",
+                        "_scribble",
                     )
                 ):
                     continue
                 if stem.lower() in low:
                     matches.append(os.path.join(video_dir, name))
             if matches:
+                matches.sort(
+                    key=lambda item: (
+                        0 if str(item).lower().endswith(".json") else 1,
+                        len(os.path.basename(str(item))),
+                        str(item).lower(),
+                    )
+                )
                 return matches[0]
         except Exception:
             pass
@@ -4522,13 +5800,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             "Choose label map (TXT)",
             "Text Files (*.txt)",
         )
-        row_json, edit_json = _path_row(
+        row_annotations, edit_annotations = _path_row(
             str(getattr(self, "current_annotation_path", "") or "").strip(),
-            "Choose annotations JSON",
-            "JSON Files (*.json)",
+            "Choose annotations / GT",
+            ANNOTATION_FILE_FILTER,
         )
         cb_labels = QCheckBox("Import labels from TXT", group_assets)
-        cb_json = QCheckBox("Import annotations JSON", group_assets)
+        cb_annotations = QCheckBox("Import annotations / GT", group_assets)
         btn_detect = QPushButton("Autofill Nearby Files", group_assets)
 
         def _autofill_from_video(force: bool = False) -> None:
@@ -4542,10 +5820,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             ann_fp = self._guess_open_session_annotation_path(video_fp)
             if force or not str(edit_labels.text() or "").strip():
                 edit_labels.setText(str(label_fp or ""))
-            if force or not str(edit_json.text() or "").strip():
-                edit_json.setText(str(ann_fp or ""))
+            if force or not str(edit_annotations.text() or "").strip():
+                edit_annotations.setText(str(ann_fp or ""))
             cb_labels.setChecked(bool(str(edit_labels.text() or "").strip()))
-            cb_json.setChecked(bool(str(edit_json.text() or "").strip()))
+            cb_annotations.setChecked(bool(str(edit_annotations.text() or "").strip()))
 
         row_video, edit_video = _path_row(
             str(getattr(self, "video_path", "") or "").strip(),
@@ -4557,8 +5835,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         form_assets.addRow("", btn_detect)
         form_assets.addRow("Labels", row_labels)
         form_assets.addRow("", cb_labels)
-        form_assets.addRow("Annotations", row_json)
-        form_assets.addRow("", cb_json)
+        form_assets.addRow("Annotations", row_annotations)
+        form_assets.addRow("", cb_annotations)
         btn_detect.clicked.connect(lambda: _autofill_from_video(force=True))
         outer.addWidget(group_assets)
 
@@ -4577,23 +5855,24 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         video_fp = os.path.abspath(os.path.expanduser(str(edit_video.text() or "").strip()))
         label_fp = os.path.abspath(os.path.expanduser(str(edit_labels.text() or "").strip()))
-        ann_fp = os.path.abspath(os.path.expanduser(str(edit_json.text() or "").strip()))
+        ann_fp = os.path.abspath(os.path.expanduser(str(edit_annotations.text() or "").strip()))
         if not video_fp or not os.path.isfile(video_fp):
             QMessageBox.warning(self, "Open Session", "Choose a valid video file.")
             return
         if cb_labels.isChecked() and label_fp and not os.path.isfile(label_fp):
             QMessageBox.warning(self, "Open Session", "The selected label map does not exist.")
             return
-        if cb_json.isChecked() and ann_fp and not os.path.isfile(ann_fp):
-            QMessageBox.warning(self, "Open Session", "The selected annotation JSON does not exist.")
+        if cb_annotations.isChecked() and ann_fp and not os.path.isfile(ann_fp):
+            QMessageBox.warning(self, "Open Session", "The selected annotation file does not exist.")
             return
         if not self._prompt_save_if_dirty(context="opening a new session"):
             return
-        if not self._load_primary_video(video_fp):
+        if not self._load_primary_video(
+            video_fp,
+            label_map_path=(label_fp if cb_labels.isChecked() and label_fp else ""),
+        ):
             return
-        if cb_labels.isChecked() and label_fp:
-            self._import_label_map_txt(label_fp)
-        if cb_json.isChecked() and ann_fp:
+        if cb_annotations.isChecked() and ann_fp:
             self._load_json_annotations(path=ann_fp)
         self._set_status(f"Opened session: {os.path.basename(video_fp)}")
 
@@ -4635,7 +5914,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         view_idx: int,
         descriptor: Optional[Dict[str, Any]],
         spans: List[Tuple[int, int]],
+        *,
+        protected_cuts: Optional[Iterable[int]] = None,
+        respect_confirmed_boundary_locks: bool = True,
+        allow_same_label_auto_merge: bool = False,
     ) -> List[Dict[str, Any]]:
+        if not bool(allow_same_label_auto_merge):
+            return []
         if not self.views or not self._syncable_descriptor(descriptor):
             return []
         if not (0 <= int(view_idx) < len(self.views)):
@@ -4654,9 +5939,23 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not cuts:
             return []
         fc = max(1, self._get_frame_count())
+        protected = {
+            int(cut)
+            for cut in (protected_cuts or [])
+            if cut is not None
+        }
+        if bool(respect_confirmed_boundary_locks):
+            protected.update(
+                self._confirmed_accept_boundary_cut_positions(
+                    view_idx=int(view_idx),
+                    descriptor=descriptor,
+                )
+            )
         to_remove: List[int] = []
         for cut in sorted({int(c) for c in cuts if c is not None}):
             if cut <= 0 or cut >= fc:
+                continue
+            if int(cut) in protected:
                 continue
             touched = False
             for s, e in merged:
@@ -4669,6 +5968,178 @@ class ActionWindow(FrameControlMixin, QWidget):
             right = st.label_at(int(cut))
             if left == right:
                 to_remove.append(int(cut))
+        if not to_remove:
+            return []
+        ops: List[Dict[str, Any]] = []
+        for cut in to_remove:
+            cuts.discard(int(cut))
+            ops.append(
+                {
+                    "view_idx": int(view_idx),
+                    "descriptor": dict(descriptor or {}),
+                    "frame": int(cut),
+                    "op": "remove",
+                }
+            )
+        return ops
+
+    def _remove_trim_cuts_in_spans(
+        self,
+        view_idx: int,
+        descriptor: Optional[Dict[str, Any]],
+        spans: List[Tuple[int, int]],
+        *,
+        protected_cuts: Optional[Iterable[int]] = None,
+        respect_confirmed_boundary_locks: bool = True,
+    ) -> List[Dict[str, Any]]:
+        if not self.views or not self._syncable_descriptor(descriptor):
+            return []
+        if not (0 <= int(view_idx) < len(self.views)):
+            return []
+        merged = self._merge_spans(spans or [])
+        if not merged:
+            return []
+        view = self.views[int(view_idx)]
+        cuts = self._trim_cut_set_for_view(view, descriptor or {}, create=False)
+        if not cuts:
+            return []
+        protected = {
+            int(cut)
+            for cut in (protected_cuts or [])
+            if cut is not None
+        }
+        if bool(respect_confirmed_boundary_locks):
+            protected.update(
+                self._confirmed_accept_boundary_cut_positions(
+                    view_idx=int(view_idx),
+                    descriptor=descriptor,
+                )
+            )
+        to_remove: List[int] = []
+        for cut in sorted({int(c) for c in cuts if c is not None}):
+            if int(cut) in protected:
+                continue
+            touched = False
+            for s, e in merged:
+                if int(s) - 1 <= int(cut) <= int(e) + 1:
+                    touched = True
+                    break
+            if touched:
+                to_remove.append(int(cut))
+        if not to_remove:
+            return []
+        ops: List[Dict[str, Any]] = []
+        for cut in to_remove:
+            cuts.discard(int(cut))
+            ops.append(
+                {
+                    "view_idx": int(view_idx),
+                    "descriptor": dict(descriptor or {}),
+                    "frame": int(cut),
+                    "op": "remove",
+                }
+            )
+        return ops
+
+    def _ensure_trim_cuts_for_span_bounds(
+        self,
+        view_idx: int,
+        descriptor: Optional[Dict[str, Any]],
+        cuts: Optional[Set[int]],
+        start: int,
+        end: int,
+    ) -> List[Dict[str, Any]]:
+        if cuts is None or not self._syncable_descriptor(descriptor):
+            return []
+        if not (0 <= int(view_idx) < len(self.views or [])):
+            return []
+        fc = max(1, self._get_frame_count())
+        start = int(start)
+        end = int(end)
+        if end < start:
+            start, end = end, start
+        candidates: List[int] = []
+        if int(start) > 0:
+            candidates.append(int(start))
+        right_cut = int(end) + 1
+        if 0 < int(right_cut) < int(fc):
+            candidates.append(int(right_cut))
+        ops: List[Dict[str, Any]] = []
+        for cut in candidates:
+            if int(cut) in cuts:
+                continue
+            cuts.add(int(cut))
+            ops.append(
+                {
+                    "view_idx": int(view_idx),
+                    "descriptor": dict(descriptor or {}),
+                    "frame": int(cut),
+                    "op": "add",
+                }
+            )
+        return ops
+
+    def _coalesce_same_label_internal_cuts_in_span(
+        self,
+        view_idx: int,
+        descriptor: Optional[Dict[str, Any]],
+        start: int,
+        end: int,
+        *,
+        preferred_label: str = "",
+        keep_cuts: Optional[Iterable[int]] = None,
+        respect_confirmed_boundary_locks: bool = False,
+    ) -> List[Dict[str, Any]]:
+        if not self.views or not self._syncable_descriptor(descriptor):
+            return []
+        if not (0 <= int(view_idx) < len(self.views)):
+            return []
+        view = self.views[int(view_idx)]
+        st = self._store_for_view_descriptor(view, descriptor or {})
+        if st is None:
+            return []
+        cuts = self._trim_cut_set_for_view(view, descriptor or {}, create=False)
+        if not cuts:
+            return []
+        s = int(start)
+        e = int(end)
+        if e < s:
+            s, e = e, s
+        keep = {
+            int(cut)
+            for cut in (keep_cuts or [])
+            if cut is not None
+        }
+        protected: Set[int] = set()
+        if bool(respect_confirmed_boundary_locks):
+            protected.update(
+                self._confirmed_accept_boundary_cut_positions(
+                    view_idx=int(view_idx),
+                    descriptor=descriptor,
+                )
+            )
+        target_key = self._normalized_label_key(preferred_label) if preferred_label else ""
+        to_remove: List[int] = []
+        for cut in sorted({int(c) for c in cuts if c is not None}):
+            if int(cut) <= int(s) or int(cut) > int(e):
+                continue
+            if int(cut) in keep or int(cut) in protected:
+                continue
+            left_label = (
+                self._resolve_action_label_name(st.label_at(int(cut) - 1))
+                if int(cut) - 1 >= 0
+                else ""
+            )
+            right_label = self._resolve_action_label_name(st.label_at(int(cut)))
+            if not left_label or not right_label:
+                continue
+            if self._normalized_label_key(left_label) != self._normalized_label_key(
+                right_label
+            ):
+                continue
+            if target_key and self._normalized_label_key(left_label) != target_key:
+                continue
+            to_remove.append(int(cut))
         if not to_remove:
             return []
         ops: List[Dict[str, Any]] = []
@@ -5319,9 +6790,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         path = str(view.get("path") or getattr(self, "video_path", "") or "").strip()
         if not path:
             return None
-        start = int(view.get("start", getattr(player, "crop_start", 0)) or 0)
-        end = int(view.get("end", getattr(player, "crop_end", start)) or start)
-        frame = int(getattr(player, "current_frame", start) or start)
+        _v = view.get("start")
+        start = int(_v if _v is not None else getattr(player, "crop_start", 0))
+        _v = view.get("end")
+        end = int(_v if _v is not None else getattr(player, "crop_end", start))
+        _v = getattr(player, "current_frame", None)
+        frame = int(_v if _v is not None else start)
         frame = max(start, min(frame, end))
         return {
             "path": path,
@@ -5446,9 +6920,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         v = self.views[self.active_view_idx]
         return max(0, v.get("end", 0) - v.get("start", 0) + 1)
 
-    def _load_primary_video(self, path: str) -> bool:
+    def _load_primary_video(self, path: str, label_map_path: str = "") -> bool:
         if not self.views:
             self._init_primary_view()
+        previous_video_path = str(getattr(self, "video_path", "") or "")
+        previous_label_mapping = self._current_action_label_mapping()
+        previous_label_source_path = self._current_label_bank_source_path()
         # clear extra views
         primary_view = self.views[0]
         for extra in self.views[1:]:
@@ -5523,11 +7000,41 @@ class ActionWindow(FrameControlMixin, QWidget):
                     )
         self.player.stop()
         self._reset_all_state_for_new_video(keep_views=True)
+        self._auto_switch_label_bank_for_video(
+            str(path or ""),
+            previous_video_path=previous_video_path,
+            previous_label_mapping=previous_label_mapping,
+            previous_label_source_path=previous_label_source_path,
+            explicit_label_map_path=label_map_path,
+        )
+        self._restore_study_planner_history_for_path(path)
         self._after_video_loaded()
         # rebuild view widgets and sync controls
         self._rebuild_view_widgets()
         self._set_primary_view(0)
+        # Mark the task-start anchor so we can compute Completion Time on save.
+        self._task_start_ts = time.time()
+        self._task_start_frames = int(total_frames)
+        try:
+            if getattr(self, "op_logger", None) is not None:
+                self.op_logger.set_default_fields(
+                    video_id=self._current_video_id(),
+                )
+        except Exception:
+            pass
         self._log("load_video", path=path, start=s, end=e, frames=total_frames)
+        try:
+            self._log(
+                "task_start",
+                participant=self._sanitize_participant_id(
+                    getattr(self, "_study_participant_id", "")
+                ),
+                condition=self._current_study_condition(),
+                video_id=self._current_video_id(),
+                frames=int(total_frames),
+            )
+        except Exception:
+            pass
         return True
 
     def _on_add_view(self):
@@ -5538,8 +7045,16 @@ class ActionWindow(FrameControlMixin, QWidget):
             QMessageBox.information(self, "Info", "Maximum 5 views supported.")
             return
         self._psr_store_active_view_state()
+        _add_view_init = ""
+        try:
+            if self._study_mode_active():
+                _add_view_init = os.path.join(self._root_dir, "user_study")
+                if not os.path.isdir(_add_view_init):
+                    _add_view_init = ""
+        except Exception:
+            _add_view_init = ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load additional view", "", "Video Files (*.mp4 *.avi *.mov *.mkv)"
+            self, "Load additional view", _add_view_init, "Video Files (*.mp4 *.avi *.mov *.mkv)"
         )
         if not path:
             return
@@ -5822,8 +7337,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         selected = getattr(self, "_timeline_selected_segment", None)
         if (
             isinstance(selected, dict)
-            and int(selected.get("start", frame_i) or frame_i) <= frame_i
-            <= int(selected.get("end", frame_i) or frame_i)
+            and int(selected.get("start") if selected.get("start") is not None else frame_i) <= frame_i
+            <= int(selected.get("end") if selected.get("end") is not None else frame_i)
         ):
             label = self._resolve_action_label_name(selected.get("label"))
             if label:
@@ -6037,16 +7552,21 @@ class ActionWindow(FrameControlMixin, QWidget):
         return float(matches) / float(total)
 
     def _query_summary_matches_active_view(self, summary: Dict[str, Any]) -> bool:
-        meta = summary.get("meta") or {}
-        if not isinstance(meta, dict):
-            return True
-        raw_view_idx = meta.get("view_idx")
-        if raw_view_idx in (None, ""):
-            return True
-        try:
-            return int(raw_view_idx) == int(self.active_view_idx)
-        except Exception:
-            return True
+        view_name = ""
+        if self.views and 0 <= self.active_view_idx < len(self.views):
+            try:
+                view_name = self._effective_view_name(
+                    self.views[self.active_view_idx], idx=self.active_view_idx
+                )
+            except Exception:
+                view_name = ""
+        return self._query_summary_matches_context(
+            summary,
+            view_idx=int(self.active_view_idx),
+            view_name=view_name,
+            video_id=str(self._current_video_id() or ""),
+            dataset_key=str(self._current_study_planner_dataset_key() or ""),
+        )
 
     def _query_summary_counts_as_handled(
         self,
@@ -6139,8 +7659,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             prev_query_id = str(meta.get("query_id", "") or "").strip()
             if query_id and prev_query_id and query_id == prev_query_id:
                 return True
-            prev_start = int(obs.get("start_frame", 0) or 0)
-            prev_end = int(obs.get("end_frame", prev_start) or prev_start)
+            _v = obs.get("start_frame")
+            prev_start = int(_v if _v is not None else 0)
+            _v = obs.get("end_frame")
+            prev_end = int(_v if _v is not None else prev_start)
             if candidate.query_type == QueryType.BOUNDARY_SCRIBBLE:
                 prev_boundary = meta.get("boundary_frame", obs.get("start_frame"))
                 try:
@@ -6298,8 +7820,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             return []
         view = self.views[self.active_view_idx]
         frame_count = max(1, int(self._get_frame_count() or 1))
-        view_start = int(view.get("start", 0) or 0)
-        view_end = int(view.get("end", frame_count - 1) or (frame_count - 1))
+        _vs = view.get("start")
+        view_start = int(_vs if _vs is not None else 0)
+        _ve = view.get("end")
+        view_end = int(_ve if _ve is not None else frame_count - 1)
         window_radius = max(
             6, int(self._algo_cfg.get("boundary_snap", {}).get("window_size", 15) or 15)
         )
@@ -6315,7 +7839,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 right_name and is_escape_label(right_name)
             ):
                 continue
-            boundary_frame = int(right.get("start", left.get("end", 0)) or 0)
+            _rs = right.get("start")
+            _le = left.get("end")
+            boundary_frame = int(_rs if _rs is not None else (_le if _le is not None else 0))
             query_score, terms = self._boundary_query_score(
                 frame=boundary_frame,
                 left_label=left_name,
@@ -6373,8 +7899,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             current_label = str(seg.get("label", "") or "").strip()
             if is_escape_label(current_label):
                 continue
-            span_start = int(seg.get("start", 0) or 0)
-            span_end = int(seg.get("end", span_start) or span_start)
+            _sps = seg.get("start")
+            span_start = int(_sps if _sps is not None else 0)
+            _spe = seg.get("end")
+            span_end = int(_spe if _spe is not None else span_start)
             label_candidates, source = self._label_candidates_with_source(seg)
             query_score, terms = self._label_query_score(
                 seg, label_candidates, source=source
@@ -6453,8 +7981,14 @@ class ActionWindow(FrameControlMixin, QWidget):
             repair = conflict.get("repair") or {}
             if str(repair.get("kind") or "") != "state_patch":
                 continue
-            start = int(repair.get("start", conflict.get("start", 0)) or 0)
-            end = int(repair.get("end", conflict.get("end", start)) or start)
+            _v = repair.get("start")
+            if _v is None:
+                _v = conflict.get("start")
+            start = int(_v if _v is not None else 0)
+            _v = repair.get("end")
+            if _v is None:
+                _v = conflict.get("end")
+            end = int(_v if _v is not None else start)
             if end < start:
                 start, end = end, start
             severity = max(0.0, min(1.0, float(conflict.get("severity", 0) or 0.0) / 3.0))
@@ -6508,11 +8042,29 @@ class ActionWindow(FrameControlMixin, QWidget):
             s = int(cand.start_frame)
             e = int(cand.end_frame)
             if decision.query_type == QueryType.BOUNDARY_SCRIBBLE:
-                boundary = int(cand.payload.get("boundary_frame", (s + e) // 2) or 0)
+                _bf = cand.payload.get("boundary_frame")
+                boundary = int(_bf if _bf is not None else (s + e) // 2)
                 left = str(cand.payload.get("left_label", "") or "?")
                 right = str(cand.payload.get("right_label", "") or "?")
-                text = f"Boundary around F{boundary}: {left} | {right}"
+                rank = max(1, int(cand.payload.get("planner_rank", 1) or 1))
+                total = max(1, int(cand.payload.get("planner_candidate_count", 1) or 1))
+                rank_text = f" #{rank}/{total}" if total > 1 else ""
+                text = f"Boundary around F{boundary}: {left} | {right}{rank_text}"
                 kicker_text = "BOUNDARY SUGGESTION"
+                reason = str(cand.payload.get("planner_reason", "") or "").strip()
+                learned = float(cand.payload.get("planner_learned_utility", 0.0) or 0.0)
+                margin = float(cand.payload.get("planner_margin", 0.0) or 0.0)
+                score_txt = float(cand.payload.get("planner_score", decision.utility) or 0.0)
+                tooltip = (
+                    f"{cand.query_type.value} [{s}-{e}] score {score_txt:.2f}"
+                    f" | rank {rank}/{total}"
+                )
+                if reason:
+                    tooltip += f" | {reason}"
+                if learned > 0.0:
+                    tooltip += f" | learned +{learned:.2f}"
+                if margin > 0.0:
+                    tooltip += f" | gap +{margin:.2f}"
             elif decision.query_type == QueryType.LABEL_REVIEW:
                 current = str(cand.payload.get("current_label", "") or "?")
                 suggested = str(cand.payload.get("suggested_label", "") or "?")
@@ -6527,13 +8079,16 @@ class ActionWindow(FrameControlMixin, QWidget):
                 else:
                     text = f"Label review: {current} -> {suggested} @ F{s}-{e}"
                 kicker_text = "LABEL SUGGESTION"
+                tooltip = (
+                    f"{cand.query_type.value} [{s}-{e}] utility {float(decision.utility):.2f}"
+                )
             else:
                 component = str(cand.payload.get("component") or "state")
                 text = f"State repair for {component} @ F{s}-{e}"
                 kicker_text = "STATE REPAIR"
-            tooltip = (
-                f"{cand.query_type.value} [{s}-{e}] utility {float(decision.utility):.2f}"
-            )
+                tooltip = (
+                    f"{cand.query_type.value} [{s}-{e}] utility {float(decision.utility):.2f}"
+                )
         try:
             if footer is not None:
                 footer.setVisible(self._is_action_task() and not self._is_psr_task())
@@ -6554,6 +8109,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             and not self._is_psr_task()
         ):
             if self._boundary_only_planner_for_current_study():
+                if isinstance(self._pending_label_review, dict):
+                    self._clear_pending_label_review(update_ui=False)
                 decision = self._boundary_query_decision()
             else:
                 candidates = self._build_query_candidates()
@@ -6567,6 +8124,38 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._update_query_hint_ui()
         return decision
 
+    def _after_manual_query_relevant_edit(self) -> None:
+        if self._boundary_only_planner_for_current_study():
+            self._last_query_decision = None
+            if self.views and (0 <= self.active_view_idx < len(self.views)):
+                self._ensure_view_scribble_state(self.views[self.active_view_idx])
+                self.views[self.active_view_idx]["query_decision"] = None
+            self._update_query_hint_ui()
+            return
+        self._refresh_query_planner_hint()
+
+    def _maybe_auto_focus_next_query(
+        self,
+        *,
+        current_focus_frame: Optional[int] = None,
+        status_prefix: str = "Next suggestion",
+    ) -> bool:
+        if not self._auto_advance_with_planner_for_current_study():
+            return False
+        decision = (
+            self._last_query_decision
+            if isinstance(self._last_query_decision, QueryDecision)
+            else self._refresh_query_planner_hint()
+        )
+        if not isinstance(decision, QueryDecision):
+            return False
+        cand = decision.candidate
+        _bf = cand.payload.get("boundary_frame")
+        next_focus = int(_bf if _bf is not None else (int(cand.start_frame) + int(cand.end_frame)) // 2)
+        if current_focus_frame is not None and abs(int(next_focus) - int(current_focus_frame)) <= 2:
+            return False
+        return self._focus_query_decision(decision, status_prefix=status_prefix)
+
     def _boundary_query_decision(self) -> Optional[QueryDecision]:
         if not self._is_action_task() or self._is_psr_task():
             return None
@@ -6578,6 +8167,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not candidates:
             return None
         weights = self._query_planner_weights
+        for cand in candidates:
+            self._annotate_boundary_candidate_ranking(cand, candidates)
         best = max(
             candidates,
             key=lambda item: (
@@ -6617,24 +8208,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 )
                 self._clear_pending_label_review()
         cand = decision.candidate
-        focus_frame = int(
-            cand.payload.get(
-                "boundary_frame", (cand.start_frame + cand.end_frame) // 2
-            )
-            or 0
-        )
+        _bf = cand.payload.get("boundary_frame")
+        focus_frame = int(_bf if _bf is not None else (cand.start_frame + cand.end_frame) // 2)
         focus_frame = max(int(cand.start_frame), min(int(cand.end_frame), focus_frame))
         try:
-            self.player.pause()
-        except Exception:
-            pass
-        try:
-            self.player.seek(int(focus_frame), preview_only=False)
-        except Exception:
-            pass
-        try:
             if getattr(self, "timeline", None) is not None:
-                self.timeline.set_current_frame(int(focus_frame), follow=True)
                 if hasattr(self.timeline, "center_on_frame"):
                     self.timeline.center_on_frame(int(focus_frame))
         except Exception:
@@ -6696,6 +8274,14 @@ class ActionWindow(FrameControlMixin, QWidget):
         # session instead of spawning a new marker each time.
         if scribble.kind != ScribbleKind.UNCERTAIN:
             return False
+        meta = dict(getattr(scribble, "meta", {}) or {})
+        if str(meta.get("gesture_intent", "") or "").strip().lower() == "vertical":
+            # Vertical gestures always reuse the active session when spatially
+            # close, regardless of the current proposal_action.  Previously
+            # this forced a new session when the proposal was not already a
+            # remove action, which created a cycle where the vertical intent
+            # could never trigger removal because it kept being isolated.
+            pass
         if not active_items:
             return False
         new_s = int(scribble.start_frame)
@@ -6734,6 +8320,9 @@ class ActionWindow(FrameControlMixin, QWidget):
         # Users only draw one freehand stroke type. When they keep refining the
         # same proposal, infer side support from which side of the boundary they
         # reinforce instead of exposing extra brush modes in the UI.
+        meta = dict(getattr(scribble, "meta", {}) or {})
+        if str(meta.get("gesture_intent", "") or "").strip().lower() == "vertical":
+            return ScribbleKind.UNCERTAIN
         if not reuse_active:
             return resolve_scribble_kind(scribble.kind)
         boundary_i = None
@@ -6788,16 +8377,19 @@ class ActionWindow(FrameControlMixin, QWidget):
             proposal["manual_boundary_adjust_finalized"] = bool(
                 payload.get("finalized")
             )
-        row = self._active_scribble_row()
-        descriptor = self._mask_descriptor_from_row(row) if row is not None else None
-        if not descriptor or str(descriptor.get("kind") or "") not in ("store", "entity"):
-            descriptor = {"kind": "store"}
-        active_items = self._active_scribble_session_items()
-        proposal = self._annotate_scribble_proposal(
-            proposal,
-            list(active_items),
-            descriptor=descriptor,
-        ) or proposal
+        if bool(proposal.get("reopened_from_marker", False)):
+            proposal.pop("target_boundary_frame", None)
+        else:
+            row = self._active_scribble_row()
+            descriptor = self._mask_descriptor_from_row(row) if row is not None else None
+            if not descriptor or str(descriptor.get("kind") or "") not in ("store", "entity"):
+                descriptor = {"kind": "store"}
+            active_items = self._active_scribble_session_items()
+            proposal = self._annotate_scribble_proposal(
+                proposal,
+                list(active_items),
+                descriptor=descriptor,
+            ) or proposal
         self._last_scribble_result = proposal
         self._store_active_view_scribble_state()
         self._update_scribble_proposal_ui()
@@ -6848,7 +8440,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._update_scribble_proposal_ui()
-        self._refresh_query_planner_hint()
+        self._after_manual_query_relevant_edit()
         self._set_status("Cleared the current scribble episode.")
         if self.interaction_mode == "scribble":
             self._set_interaction_status("Boundary Scribble: draw boundary")
@@ -6883,7 +8475,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._set_status("No boundary suggestion is available to refine.")
             self._update_scribble_proposal_ui()
             return False
-        frame_i = int(proposal.get("boundary_frame") or 0)
+        _v = proposal.get("boundary_frame")
+        frame_i = int(_v if _v is not None else 0)
         try:
             self.player.pause()
         except Exception:
@@ -6933,11 +8526,15 @@ class ActionWindow(FrameControlMixin, QWidget):
         visible = bool(self._is_action_task() and not self._is_psr_task())
         kicker_text = None
         main_text = None
-        meta_text = "Use Suggest Query to compute the next lightweight interaction target."
+        if self._boundary_only_planner_for_current_study():
+            meta_text = "Use Next Boundary to jump to the next planner-ranked boundary suggestion."
+        else:
+            meta_text = "Use Suggest Query to compute the next lightweight interaction target."
         accept_text = "Accept Suggestion"
         accept_tooltip = (
             "Accept the current interaction suggestion and write it back to the timeline."
         )
+        reject_text = "Reject Suggestion"
         reject_tooltip = (
             "Reject the current label or boundary suggestion without applying it."
         )
@@ -6952,8 +8549,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         refine_enabled = False
         active_footer = False
         if pending_label_review and pending_label_review.get("suggested_label"):
-            start = int(pending_label_review.get("start_frame", 0) or 0)
-            end = int(pending_label_review.get("end_frame", start) or start)
+            _v = pending_label_review.get("start_frame")
+            start = int(_v if _v is not None else 0)
+            _v = pending_label_review.get("end_frame")
+            end = int(_v if _v is not None else start)
             current = str(pending_label_review.get("current_label", "") or "?")
             suggested = str(pending_label_review.get("suggested_label", "") or "?")
             conf = self._cfg_float(
@@ -6992,12 +8591,77 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "Boundary Scribble refinement is only available for boundary suggestions."
             )
         elif proposal and proposal.get("boundary_frame") is not None:
-            frame = int(proposal.get("boundary_frame") or 0)
+            _v = proposal.get("boundary_frame")
+            frame = int(_v if _v is not None else 0)
             conf = float(proposal.get("confidence", 0.0) or 0.0)
             left = str(proposal.get("left_label", "") or "?")
             right = str(proposal.get("right_label", "") or "?")
             proposal_action = str(proposal.get("proposal_action", "") or "").strip()
-            if proposal_action == "remove_boundary":
+            if proposal_action == "merge_then_split":
+                _v = proposal.get("window_start")
+                edit_s = int(_v if _v is not None else frame)
+                _v = proposal.get("window_end")
+                edit_e = int(_v if _v is not None else frame)
+                if edit_e < edit_s:
+                    edit_s, edit_e = edit_e, edit_s
+                kicker_text = "MERGE + SPLIT"
+                main_text = f"Merge F{edit_s}-F{edit_e}, keep split at F{frame}"
+                meta_text = (
+                    f"Confidence {conf:.2f}. Accept to collapse the crossed boundaries inside F{edit_s}-F{edit_e} and keep one final split at F{frame}, producing {left} | {right}. "
+                    "Use Start Scribble to redraw if this mixed intent is not what you want."
+                )
+                accept_text = "Accept Edit"
+                accept_tooltip = (
+                    f"Accept the combined merge-and-split proposal over F{edit_s}-F{edit_e}."
+                )
+                reject_tooltip = (
+                    f"Reject the current merge-and-split proposal over F{edit_s}-F{edit_e}."
+                )
+            elif proposal_action == "remove_segment":
+                _v = proposal.get("window_start")
+                seg_s = int(_v if _v is not None else frame)
+                _v = proposal.get("window_end")
+                seg_e = int(_v if _v is not None else frame)
+                if seg_e < seg_s:
+                    seg_s, seg_e = seg_e, seg_s
+                seg_label = str(proposal.get("segment_label", "") or "?")
+                kicker_text = "REMOVE SEGMENT"
+                main_text = f"Delete F{seg_s}-F{seg_e}: {seg_label}"
+                meta_text = (
+                    f"Confidence {conf:.2f}. Accept to delete the current action segment F{seg_s}-F{seg_e}. "
+                    "This action removes the whole segment instead of merging to a neighboring label."
+                )
+                accept_text = "Accept Delete"
+                accept_tooltip = (
+                    f"Accept deletion of the segment F{seg_s}-F{seg_e}."
+                )
+                reject_tooltip = (
+                    f"Reject the current remove-segment proposal over F{seg_s}-F{seg_e}."
+                )
+            elif proposal_action == "remove_boundaries":
+                _v = proposal.get("window_start")
+                merge_s = int(_v if _v is not None else frame)
+                _v = proposal.get("window_end")
+                merge_e = int(_v if _v is not None else frame)
+                if merge_e < merge_s:
+                    merge_s, merge_e = merge_e, merge_s
+                merged_label = str(proposal.get("merged_label", "") or left or right or "?")
+                removed_count = int(proposal.get("removed_boundary_count", 0) or 0)
+                boundary_noun = "boundary" if max(1, removed_count) == 1 else "boundaries"
+                kicker_text = "REMOVE BOUNDARIES"
+                main_text = f"Merge F{merge_s}-F{merge_e} into {merged_label}"
+                meta_text = (
+                    f"Confidence {conf:.2f}. Accept to remove the {max(1, removed_count)} crossed {boundary_noun} and merge the whole scribbled span as {merged_label}. "
+                    "Click a label on the left panel to override the merge label, or use Start Scribble to redraw the intent."
+                )
+                accept_text = "Accept Merge"
+                accept_tooltip = (
+                    f"Accept the span merge proposal over F{merge_s}-F{merge_e}."
+                )
+                reject_tooltip = (
+                    f"Reject the current multi-boundary merge proposal over F{merge_s}-F{merge_e}."
+                )
+            elif proposal_action == "remove_boundary":
                 merged_label = str(proposal.get("merged_label", "") or left or right or "?")
                 kicker_text = "REMOVE BOUNDARY"
                 main_text = f"Merge boundary at F{frame} into {merged_label}"
@@ -7014,20 +8678,34 @@ class ActionWindow(FrameControlMixin, QWidget):
                 )
             else:
                 accept_text = "Accept Boundary"
-            if proposal.get("query_hint") and proposal_action != "remove_boundary":
+            if proposal.get("query_hint") and proposal_action not in ("remove_boundary", "remove_boundaries", "merge_then_split", "remove_segment"):
                 kicker_text = "BOUNDARY SUGGESTION"
                 main_text = f"Boundary around F{frame}: {left} | {right}"
+                rank = max(1, int(proposal.get("planner_rank", 1) or 1))
+                total = max(1, int(proposal.get("planner_candidate_count", 1) or 1))
+                reason = str(proposal.get("planner_reason", "") or "").strip()
+                learned = float(proposal.get("planner_learned_utility", 0.0) or 0.0)
+                margin = float(proposal.get("planner_margin", 0.0) or 0.0)
+                planner_bits = [f"Planner rank {rank}/{total}"]
+                if reason:
+                    planner_bits.append(reason)
+                if learned > 0.0:
+                    planner_bits.append(f"learned +{learned:.2f}")
+                if margin > 0.0:
+                    planner_bits.append(f"gap +{margin:.2f}")
                 meta_text = (
-                    "Accept to apply this boundary directly, Reject to skip it, "
+                    f"{' | '.join(planner_bits)}. "
+                    "Accept to apply this boundary directly, Reject to merge the adjacent segments instead, "
                     "or use Start Scribble to refine it first."
                 )
                 accept_tooltip = (
                     f"Accept the suggested boundary at frame {frame} and apply it to the timeline."
                 )
+                reject_text = "Reject / Merge"
                 reject_tooltip = (
-                    f"Reject the suggested boundary at frame {frame} and move on."
+                    f"Reject the suggested boundary at frame {frame} and merge the adjacent segments instead."
                 )
-            elif proposal_action != "remove_boundary":
+            elif proposal_action not in ("remove_boundary", "remove_boundaries", "merge_then_split", "remove_segment"):
                 kicker_text = "BOUNDARY PROPOSAL"
                 main_text = f"Boundary proposal at F{frame}: {left} | {right}"
                 meta_text = (
@@ -7080,6 +8758,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             accept_btn.setEnabled(bool(visible and accept_enabled))
             accept_btn.setToolTip(accept_tooltip)
             reject_btn.setVisible(bool(visible and reject_visible))
+            reject_btn.setText(reject_text)
             reject_btn.setEnabled(bool(visible and reject_enabled))
             reject_btn.setToolTip(reject_tooltip)
             refine_btn.setVisible(bool(visible and refine_visible))
@@ -7099,6 +8778,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             if isinstance(self._pending_label_review, dict)
             else None
         )
+        self._sync_boundary_label_override_ui(proposal)
         try:
             if getattr(self, "timeline", None) is not None:
                 if proposal:
@@ -7107,7 +8787,6 @@ class ActionWindow(FrameControlMixin, QWidget):
                     self.timeline.clear_scribble_proposal()
         except Exception:
             pass
-        self._sync_boundary_label_override_ui(proposal)
         if not proposal and not pending_label_review:
             self._update_query_hint_ui()
         self._update_query_footer_actions(proposal, pending_label_review)
@@ -7254,7 +8933,67 @@ class ActionWindow(FrameControlMixin, QWidget):
             value = 15
         return max(1, int(value))
 
+    def _boundary_split_lengths(
+        self, start_frame: int, end_frame: int, boundary_frame: int
+    ) -> Tuple[int, int]:
+        s = int(start_frame)
+        e = int(end_frame)
+        b = int(boundary_frame)
+        if e < s:
+            s, e = e, s
+        left_len = max(0, int(b) - int(s))
+        right_len = max(0, int(e) - int(b) + 1)
+        return int(left_len), int(right_len)
+
+    def _split_respects_min_action_segment_frames(
+        self, start_frame: int, end_frame: int, boundary_frame: int
+    ) -> bool:
+        min_len = int(self._current_min_action_segment_frames())
+        left_len, right_len = self._boundary_split_lengths(
+            int(start_frame), int(end_frame), int(boundary_frame)
+        )
+        return bool(left_len >= min_len and right_len >= min_len)
+
+    @staticmethod
+    def _boundary_would_add_new_cut(
+        start_frame: int,
+        end_frame: int,
+        boundary_frame: int,
+        cuts: Optional[Set[int]] = None,
+    ) -> bool:
+        try:
+            s = int(start_frame)
+            e = int(end_frame)
+            b = int(boundary_frame)
+        except Exception:
+            return False
+        if e < s:
+            s, e = e, s
+        cut_set = {int(c) for c in (cuts or set()) if c is not None}
+        return bool(int(b) not in cut_set and int(b) > int(s) and int(b) <= int(e))
+
+    def _split_too_short_message(
+        self, start_frame: int, end_frame: int, boundary_frame: int
+    ) -> str:
+        min_len = int(self._current_min_action_segment_frames())
+        left_len, right_len = self._boundary_split_lengths(
+            int(start_frame), int(end_frame), int(boundary_frame)
+        )
+        return (
+            f"Blocked split at F{int(boundary_frame)}: resulting segments would be "
+            f"{left_len} and {right_len} frames, below the minimum {min_len}-frame rule."
+        )
+
     def _default_asot_ckpt(self) -> str:
+        preferred = os.path.join(
+            self._root_dir,
+            "external",
+            "action_seg_ot",
+            "weights",
+            "asot_s8ijjapy_final.pth",
+        )
+        if os.path.isfile(preferred):
+            return preferred
         search_dirs = [
             os.path.join(self._root_dir, "external", "action_seg_ot", "lightning_logs"),
             os.path.join(self._root_dir, "external", "action_seg_ot", "weights"),
@@ -7278,6 +9017,49 @@ class ActionWindow(FrameControlMixin, QWidget):
                         newest_mtime = mtime
                         newest = path
         return newest if newest and os.path.isfile(newest) else ""
+
+    def _resolve_asot_checkpoint_path(
+        self,
+        *,
+        force_prompt: bool = False,
+        dialog_title: Optional[str] = None,
+    ) -> str:
+        default_ckpt = self._default_asot_ckpt()
+        if not bool(force_prompt) and default_ckpt and os.path.isfile(default_ckpt):
+            return default_ckpt
+        init_dir = (
+            os.path.dirname(default_ckpt)
+            if default_ckpt
+            else os.path.join(self._root_dir, "external", "action_seg_ot")
+        )
+        title = str(dialog_title or "").strip() or (
+            "Choose ASOT checkpoint "
+            f"(default: {os.path.basename(default_ckpt) if default_ckpt else 'none'})"
+        )
+        ckpt, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            init_dir,
+            "PyTorch Models (*.pth *.pt *.ckpt)",
+        )
+        if not ckpt:
+            if bool(force_prompt):
+                return ""
+            ckpt = default_ckpt
+        return ckpt if ckpt and os.path.isfile(ckpt) else ""
+
+    def _show_prelabel_button_menu(self, pos) -> None:
+        btn = getattr(self, "btn_auto_label_asot", None)
+        if btn is None:
+            return
+        menu = QMenu(btn)
+        action_default = menu.addAction("Run with default checkpoint")
+        action_manual = menu.addAction("Choose checkpoint...")
+        chosen = menu.exec_(btn.mapToGlobal(pos))
+        if chosen is action_default:
+            self.on_click_auto_label_asot(manual_checkpoint=False)
+        elif chosen is action_manual:
+            self.on_click_auto_label_asot(manual_checkpoint=True)
 
     def _start_feature_extraction(self, feat_dir: str, backbone: str = ""):
         if not getattr(self, "video_path", None):
@@ -7335,7 +9117,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._segment_embedding_cache = {}
         self._label_text_bank_cache = {}
         self._set_status(f"Feature extraction finished. Using {feat_dir}")
-        if pending_task == "asot pre-labeling":
+        if pending_task in {
+            "asot pre-labeling",
+            "optional external pre-labeling",
+        }:
             self._set_status("Feature extraction finished. Starting optional external pre-labeling...")
             QTimer.singleShot(0, self.on_click_auto_label_asot)
 
@@ -7540,17 +9325,173 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not path or not os.path.isfile(path):
             return ""
         try:
-            current = [
-                str(lb.name).strip()
-                for lb in (self.labels or [])
-                if str(lb.name).strip()
-            ]
-            source_names = load_label_names(path)
+            current_mapping = self._current_action_label_mapping()
+            source_mapping = self._load_label_mapping_txt(path)
         except Exception:
             return ""
-        if current and source_names and list(source_names) == current:
+        if current_mapping and source_mapping and list(source_mapping) == current_mapping:
             return path
         return ""
+
+    def _current_action_label_mapping(
+        self,
+        *,
+        include_runtime_labels: bool = False,
+    ) -> List[Tuple[str, int]]:
+        rows: List[Tuple[str, int]] = []
+        for idx, lb in enumerate(list(self.labels or [])):
+            name = str(getattr(lb, "name", "") or "").strip()
+            if not name:
+                continue
+            if (not include_runtime_labels) and (
+                is_extra_label(name) or is_escape_label(name)
+            ):
+                continue
+            try:
+                lid = int(getattr(lb, "id", idx))
+            except Exception:
+                lid = int(idx)
+            rows.append((name, lid))
+        return rows
+
+    def _load_label_mapping_txt(self, path: str) -> List[Tuple[str, int]]:
+        fp = os.path.abspath(os.path.expanduser(str(path or "").strip()))
+        if not fp or not os.path.isfile(fp):
+            return []
+        mapping: List[Tuple[str, int]] = []
+        next_id = 0
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                for line in f:
+                    name, lid = parse_label_line(line)
+                    name = str(name or "").strip()
+                    if not name:
+                        continue
+                    if lid is None:
+                        lid = next_id
+                    try:
+                        lid_i = int(lid)
+                    except Exception:
+                        lid_i = int(next_id)
+                    mapping.append((name, lid_i))
+                    next_id = max(int(next_id) + 1, int(lid_i) + 1)
+        except Exception:
+            return []
+        return mapping
+
+    def _notify_label_map_load_issue(
+        self,
+        path: str,
+        *,
+        title: str,
+        reason: str = "empty",
+    ) -> None:
+        label_name = os.path.basename(str(path or "").strip()) or "the selected label map"
+        if reason == "missing":
+            QMessageBox.warning(self, title, "The selected label map does not exist.")
+            return
+        if reason == "empty":
+            QMessageBox.information(
+                self,
+                title,
+                f"No valid entries found in {label_name}.",
+            )
+            return
+        QMessageBox.warning(
+            self,
+            title,
+            f"Failed to load {label_name}.",
+        )
+
+    def _apply_label_mapping_for_video_switch(
+        self,
+        mapping: List[Tuple[str, int]],
+        *,
+        label_source_path: str = "",
+    ) -> bool:
+        if not mapping:
+            return False
+        count = self._replace_action_labels(
+            mapping,
+            refresh_panel=bool(getattr(self, "panel", None)),
+            rebuild_timeline=bool(getattr(self, "timeline", None)),
+            preserve_selection=False,
+            label_source_path=label_source_path,
+        )
+        return bool(count)
+
+    def _auto_switch_label_bank_for_video(
+        self,
+        new_video_path: str,
+        *,
+        previous_video_path: str = "",
+        previous_label_mapping: Optional[List[Tuple[str, int]]] = None,
+        previous_label_source_path: str = "",
+        explicit_label_map_path: str = "",
+    ) -> bool:
+        prev_dataset_key = str(
+            self._study_planner_dataset_key_for_path(previous_video_path)
+        ).strip()
+        next_dataset_key = str(
+            self._study_planner_dataset_key_for_path(new_video_path)
+        ).strip()
+        same_dataset = bool(prev_dataset_key and next_dataset_key) and (
+            os.path.normcase(os.path.normpath(prev_dataset_key))
+            == os.path.normcase(os.path.normpath(next_dataset_key))
+        )
+
+        explicit_path_text = str(explicit_label_map_path or "").strip()
+        preferred_path = (
+            os.path.abspath(os.path.expanduser(explicit_path_text))
+            if explicit_path_text
+            else ""
+        )
+        if preferred_path:
+            if not os.path.isfile(preferred_path):
+                self._notify_label_map_load_issue(
+                    preferred_path,
+                    title="Open Session",
+                    reason="missing",
+                )
+                return False
+            mapping = self._load_label_mapping_txt(preferred_path)
+            if not mapping:
+                self._notify_label_map_load_issue(
+                    preferred_path,
+                    title="Open Session",
+                    reason="empty",
+                )
+                return False
+            return self._apply_label_mapping_for_video_switch(
+                mapping,
+                label_source_path=preferred_path,
+            )
+
+        if same_dataset and previous_label_mapping:
+            if self._apply_label_mapping_for_video_switch(
+                list(previous_label_mapping),
+                label_source_path=str(previous_label_source_path or ""),
+            ):
+                return True
+
+        resolved_path = resolve_label_source(
+            video_path=str(new_video_path or ""),
+            repo_root=self._root_dir,
+        )
+        if resolved_path and os.path.isfile(resolved_path):
+            mapping = self._load_label_mapping_txt(resolved_path)
+            if self._apply_label_mapping_for_video_switch(
+                mapping,
+                label_source_path=resolved_path,
+            ):
+                return True
+
+        if previous_label_mapping and same_dataset:
+            return self._apply_label_mapping_for_video_switch(
+                list(previous_label_mapping),
+                label_source_path=str(previous_label_source_path or ""),
+            )
+        return False
 
     def _write_label_bank_txt(
         self,
@@ -7559,7 +9500,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         file_name: str,
         labels: Optional[List[str]] = None,
     ) -> Optional[str]:
-        source = labels or [lb.name for lb in (self.labels or [])]
+        source = labels or [name for name, _ in self._current_action_label_mapping()]
         names = [str(x).strip() for x in source if str(x).strip()]
         if not names:
             return None
@@ -9957,7 +11898,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     (
                         run.get("state", [])
                         for run in runs
-                        if int(run.get("start_frame", 0) or 0) == int(frame)
+                        if int(run.get("start_frame") if run.get("start_frame") is not None else 0) == int(frame)
                     ),
                     [],
                 )
@@ -10042,7 +11983,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     (
                         run.get("state", [])
                         for run in runs
-                        if int(run.get("start_frame", 0) or 0) == int(frame)
+                        if int(run.get("start_frame") if run.get("start_frame") is not None else 0) == int(frame)
                     ),
                     [],
                 )
@@ -11219,8 +13160,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             str(item.get("source") or ""),
             str(item.get("view") or ""),
             str(item.get("component_id") or item.get("store") or ""),
-            int(item.get("start", item.get("frame", 0)) or 0),
-            int(item.get("end", item.get("start", item.get("frame", 0)) or 0) or 0),
+            int(item.get("start") if item.get("start") is not None else (item.get("frame") if item.get("frame") is not None else 0)),
+            int(item.get("end") if item.get("end") is not None else (item.get("start") if item.get("start") is not None else (item.get("frame") if item.get("frame") is not None else 0))),
             str(item.get("action") or ""),
         )
 
@@ -11235,8 +13176,14 @@ class ActionWindow(FrameControlMixin, QWidget):
             repair = conflict.get("repair") or {}
             if str(repair.get("kind") or "") != "state_patch":
                 continue
-            start = int(repair.get("start", conflict.get("start", 0)) or 0)
-            end = int(repair.get("end", conflict.get("end", start)) or start)
+            _v = repair.get("start")
+            if _v is None:
+                _v = conflict.get("start")
+            start = int(_v if _v is not None else 0)
+            _v = repair.get("end")
+            if _v is None:
+                _v = conflict.get("end")
+            end = int(_v if _v is not None else start)
             if end < start:
                 start, end = end, start
             component_id = conflict.get("component_id")
@@ -11269,8 +13216,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
         items.sort(
             key=lambda item: (
-                -int(item.get("severity", 0) or 0),
-                int(item.get("start", item.get("frame", 0)) or 0),
+                -int(item.get("severity") if item.get("severity") is not None else 0),
+                int(item.get("start") if item.get("start") is not None else (item.get("frame") if item.get("frame") is not None else 0)),
                 str(item.get("component_id") or ""),
             )
         )
@@ -11300,8 +13247,8 @@ class ActionWindow(FrameControlMixin, QWidget):
         merged.sort(
             key=lambda item: (
                 1 if item.get("decision") is not None else 0,
-                -int(item.get("severity", 0) or 0),
-                int(item.get("start", item.get("frame", 0)) or 0),
+                -int(item.get("severity") if item.get("severity") is not None else 0),
+                int(item.get("start") if item.get("start") is not None else (item.get("frame") if item.get("frame") is not None else 0)),
                 str(item.get("component_id") or item.get("store") or ""),
             )
         )
@@ -12909,6 +14856,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             self._set_status(f"Exported rules: {os.path.basename(fp)}")
             self._log("export_psr_rules", path=fp, count=len(rules_list))
+            self._flush_ops_logs_for_paths(primary_base=fp, context="export psr rules")
         except Exception as ex:
             QMessageBox.warning(self, "Error", f"Failed to write rules:\n{ex}")
 
@@ -13746,23 +15694,50 @@ class ActionWindow(FrameControlMixin, QWidget):
         return ("action" in lower) and ("segment" in lower)
 
     def _gaps_for_store(
-        self, store: AnnotationStore, start: int, end: int
+        self,
+        store: AnnotationStore,
+        start: int,
+        end: int,
+        *,
+        fallback_stores: Sequence[AnnotationStore] = (),
     ) -> List[Tuple[int, int]]:
-        """Return list of [start,end] gaps (inclusive) with no labels between start/end."""
-        if not store or end < start:
+        """Return list of [start,end] gaps (inclusive) with no labels between start/end.
+
+        A frame counts as covered if *any* of ``store`` + ``fallback_stores``
+        has a label for it — that way baseline coverage (ASOT prelabel, etc.)
+        visible on the timeline doesn't register as an unlabeled gap.
+        """
+        if end < start:
             return []
-        labeled = [int(f) for f in store.frame_to_label.keys() if start <= f <= end]
-        if not labeled:
-            return [(start, end)]
-        labeled.sort()
-        gaps = []
-        cursor = start
-        for f in labeled:
-            if f > cursor:
-                gaps.append((cursor, f - 1))
-            cursor = max(cursor, f + 1)
-        if cursor <= end:
-            gaps.append((cursor, end))
+        stores = [s for s in (store, *fallback_stores) if s is not None]
+        if not stores:
+            return [(int(start), int(end))]
+
+        def _has_label(frame: int) -> bool:
+            for s in stores:
+                label_at = getattr(s, "label_at", None)
+                if callable(label_at):
+                    try:
+                        if label_at(int(frame)):
+                            return True
+                    except Exception:
+                        pass
+                elif int(frame) in getattr(s, "frame_to_label", {}):
+                    return True
+            return False
+
+        gaps: List[Tuple[int, int]] = []
+        run_start: Optional[int] = None
+        for f in range(int(start), int(end) + 1):
+            if not _has_label(f):
+                if run_start is None:
+                    run_start = int(f)
+            else:
+                if run_start is not None:
+                    gaps.append((int(run_start), int(f) - 1))
+                    run_start = None
+        if run_start is not None:
+            gaps.append((int(run_start), int(end)))
         return gaps
 
     def _gap_axes_for_view(self, view: dict) -> List[Tuple[str, List[Tuple[int, int]]]]:
@@ -13776,6 +15751,28 @@ class ActionWindow(FrameControlMixin, QWidget):
         end = int(view.get("end", start))
         if end < start:
             return []
+        prelabel_store = view.get("prelabel_store")
+        extra_store = getattr(self, "extra_store", None)
+        # Aggregate every store that could contribute a painted label in this
+        # view: primary, prelabel baseline, manual-segmentation extras, and any
+        # per-entity/phase/anomaly stores. A frame counts as covered whenever
+        # ANY of them has a label, so the indicator never disagrees with the
+        # timeline's visual coverage.
+        view_extra_stores: list = []
+        for key in ("entity_stores", "phase_stores"):
+            mapping = view.get(key) or {}
+            for st in mapping.values():
+                if st is not None:
+                    view_extra_stores.append(st)
+        anom_map = view.get("anomaly_type_stores") or {}
+        for ent_map in anom_map.values():
+            if isinstance(ent_map, dict):
+                for st in ent_map.values():
+                    if st is not None:
+                        view_extra_stores.append(st)
+        global_fallbacks = [
+            s for s in (prelabel_store, extra_store, *view_extra_stores) if s is not None
+        ]
         if self.mode == "Fine":
             entity_names = [e.name for e in self.entities]
             view_stores = view.get("entity_stores", {})
@@ -13785,14 +15782,44 @@ class ActionWindow(FrameControlMixin, QWidget):
             axes = []
             if not entity_names:
                 st = view.get("store")
-                return [("GLOBAL", self._gaps_for_store(st, start, end))]
+                return [(
+                    "GLOBAL",
+                    self._gaps_for_store(
+                        st, start, end, fallback_stores=tuple(global_fallbacks),
+                    ),
+                )]
             for ename in entity_names:
                 st = view_stores.get(ename)
-                gaps = self._gaps_for_store(st, start, end)
+                # Per-entity gap must reflect *that entity's* coverage; do NOT
+                # let other entities' stores fill in the gaps. Only the ASOT
+                # prelabel baseline is a valid fallback, since it's a
+                # per-entity-agnostic prediction the user can still accept.
+                fallbacks = [prelabel_store] if prelabel_store is not None else []
+                gaps = self._gaps_for_store(
+                    st, start, end, fallback_stores=tuple(fallbacks),
+                )
                 axes.append((ename, gaps))
             return axes
         st_primary = view.get("store")
-        return [("GLOBAL", self._gaps_for_store(st_primary, start, end))]
+        # Prefer timeline-derived coverage so the indicator never disagrees
+        # with what is painted on screen — but only when timeline rows are
+        # actually built. If we're still mid-rebuild, fall back to the store
+        # aggregation to avoid reporting every frame as a gap transiently.
+        tl = getattr(self, "timeline", None)
+        rows_ready = bool(
+            (getattr(tl, "_combined_rows", []) or []) or (getattr(tl, "rows", []) or [])
+        )
+        if tl is not None and rows_ready and hasattr(tl, "coverage_gaps"):
+            try:
+                return [("GLOBAL", tl.coverage_gaps(start, end))]
+            except Exception:
+                pass
+        return [(
+            "GLOBAL",
+            self._gaps_for_store(
+                st_primary, start, end, fallback_stores=tuple(global_fallbacks),
+            ),
+        )]
 
     def _format_gap_list(self, gaps: List[Tuple[int, int]]) -> str:
         parts = []
@@ -13873,11 +15900,17 @@ class ActionWindow(FrameControlMixin, QWidget):
                 if not gaps:
                     continue
                 total_ranges += len(gaps)
+                first_preview = self._format_gap_list(gaps[:1])
+                preview_tail = "…" if len(gaps) > 1 else ""
                 if self.mode == "Fine" and axis:
-                    counts.append(f"{vname}/{axis}({len(gaps)})")
+                    counts.append(
+                        f"{vname}/{axis}({len(gaps)}:F{first_preview}{preview_tail})"
+                    )
                     lines.append(f"{vname}/{axis}: {self._format_gap_list(gaps)}")
                 else:
-                    counts.append(f"{vname}({len(gaps)})")
+                    counts.append(
+                        f"{vname}({len(gaps)}:F{first_preview}{preview_tail})"
+                    )
                     lines.append(f"{vname}: {self._format_gap_list(gaps)}")
 
         if total_ranges == 0:
@@ -14379,6 +16412,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         scribble_cfg.setdefault("checkpoint", "")
         scribble_cfg.setdefault("device", "auto")
         scribble_cfg.setdefault("prefer_checkpoint", True)
+        scribble_cfg.setdefault("search_auto_candidates", True)
         scribble_cfg.setdefault("hidden_dim", 128)
         scribble_cfg.setdefault("dropout", 0.1)
         scribble_cfg.setdefault("state_loss_weight", 0.5)
@@ -14453,22 +16487,23 @@ class ActionWindow(FrameControlMixin, QWidget):
             if path:
                 candidates.append(path)
 
-        features_dir = self._resolve_features_dir_for_snap()
-        if features_dir:
-            patterns = (
-                os.path.join(features_dir, "*local_refiner*.pt"),
-                os.path.join(features_dir, "*local_refiner*.pth"),
-            )
-            for pattern in patterns:
-                for match in sorted(glob.glob(pattern)):
-                    candidates.append(os.path.abspath(match))
+        if bool(cfg.get("search_auto_candidates", True)):
+            features_dir = self._resolve_features_dir_for_snap()
+            if features_dir:
+                patterns = (
+                    os.path.join(features_dir, "*local_refiner*.pt"),
+                    os.path.join(features_dir, "*local_refiner*.pth"),
+                )
+                for pattern in patterns:
+                    for match in sorted(glob.glob(pattern)):
+                        candidates.append(os.path.abspath(match))
 
-        for raw in _default_local_refiner_checkpoint_candidates(
-            os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        ):
-            path = os.path.abspath(os.path.expanduser(str(raw or "").strip()))
-            if path:
-                candidates.append(path)
+            for raw in _default_local_refiner_checkpoint_candidates(
+                os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+            ):
+                path = os.path.abspath(os.path.expanduser(str(raw or "").strip()))
+                if path:
+                    candidates.append(path)
 
         for path in candidates:
             if path and os.path.isfile(path):
@@ -16296,10 +18331,10 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _apply_label_range(
         self, store: AnnotationStore, start: int, end: int, label_name: str
-    ) -> None:
+    ) -> List[Tuple]:
         """Apply label to [start, end] in a single store."""
         if not store or not label_name:
-            return
+            return []
         try:
             store.begin_txn()
         except Exception:
@@ -16313,6 +18348,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             store.end_txn()
         except Exception:
             pass
+        consume = getattr(store, "consume_last_deltas", None)
+        if callable(consume):
+            try:
+                return list(consume() or [])
+            except Exception:
+                return []
+        return []
 
     def _target_entity_stores(
         self, label_name: str
@@ -16377,12 +18419,69 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._discard_correction_session("missing_entity")
             return False
         if targets:
+            undo_batches: List[Tuple[AnnotationStore, List[Tuple]]] = []
             for _ename, st in targets:
-                self._apply_label_range(st, s, e, label_name)
+                ds = self._apply_label_range(st, s, e, label_name)
+                if ds:
+                    undo_batches.append((st, list(ds)))
         else:
-            self._apply_label_range(self.store, s, e, label_name)
+            undo_batches = []
+            ds = self._apply_label_range(self.store, s, e, label_name)
+            if ds:
+                undo_batches.append((self.store, list(ds)))
+        row = getattr(getattr(self, "timeline", None), "_active_combined_row", None)
+        descriptor = self._mask_descriptor_from_row(row) if row is not None else None
+        if not descriptor or not self._syncable_descriptor(descriptor):
+            descriptor = {"kind": "store"}
+        cut_ops = self._coalesce_same_label_internal_cuts_in_span(
+            int(self.active_view_idx),
+            descriptor,
+            int(s),
+            int(e),
+            preferred_label=str(label_name),
+            respect_confirmed_boundary_locks=True,
+        )
+        removed_cut_frames = sorted(
+            {
+                int(op.get("frame"))
+                for op in cut_ops
+                if isinstance(op, dict)
+                and str(op.get("op") or "") == "remove"
+                and op.get("frame") is not None
+            }
+        )
+        for frame in removed_cut_frames:
+            self._clear_boundary_lock_records_in_span(int(frame), int(frame))
+        history_meta = {
+            "action": "direct_label",
+            "start": int(s),
+            "end": int(e),
+            "label": str(label_name),
+        }
+        if undo_batches and cut_ops:
+            self._push_undo_composite(
+                undo_batches,
+                cut_ops,
+                meta=history_meta,
+            )
+            self._redo_stack.clear()
+        elif len(undo_batches) > 1:
+            self._push_undo_batch(
+                undo_batches,
+                meta=history_meta,
+            )
+            self._redo_stack.clear()
+        elif len(undo_batches) == 1:
+            st, ds = undo_batches[0]
+            self._push_undo_entry(st, list(ds))
+            self._redo_stack.clear()
+        elif cut_ops:
+            self._push_undo_item({"kind": "trim_cuts", "ops": list(cut_ops)})
+            self._redo_stack.clear()
         self._dirty = True
         self._on_store_changed()
+        if cut_ops:
+            self._rebuild_timeline_sources()
         self._note_correction_step()
         self._commit_correction_session(
             point_type="label",
@@ -17115,6 +19214,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 "unique_frames": 1,
                 "revisit_ratio": 1.0,
                 "has_side_support": False,
+                "max_x_span_px": 0.0,
+                "max_y_span_px": 0.0,
+                "explicit_remove_gesture": False,
             }
         start_i = min(int(item.start_frame) for item in items)
         end_i = max(int(item.end_frame) for item in items)
@@ -17123,10 +19225,27 @@ class ActionWindow(FrameControlMixin, QWidget):
         visit_mass = 0.0
         unique_frames: Set[int] = set()
         has_side_support = False
+        max_x_span_px = 0.0
+        max_y_span_px = 0.0
+        has_vertical_remove_gesture = False
         for item in items:
             if resolve_scribble_kind(getattr(item, "kind", ScribbleKind.UNCERTAIN)) != ScribbleKind.UNCERTAIN:
                 has_side_support = True
             meta = dict(getattr(item, "meta", {}) or {})
+            if str(meta.get("gesture_intent", "") or "").strip().lower() == "vertical":
+                has_vertical_remove_gesture = True
+            gesture_metrics = dict(meta.get("gesture_metrics") or {})
+            try:
+                max_x_span_px = max(
+                    float(max_x_span_px),
+                    float(gesture_metrics.get("x_span_px", 0.0) or 0.0),
+                )
+                max_y_span_px = max(
+                    float(max_y_span_px),
+                    float(gesture_metrics.get("y_span_px", 0.0) or 0.0),
+                )
+            except Exception:
+                pass
             frame_counts = meta.get("frame_counts")
             if isinstance(frame_counts, dict) and frame_counts:
                 for key, value in frame_counts.items():
@@ -17153,6 +19272,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         unique_count = max(1, len(unique_frames))
         width = max(1, int(end_i) - int(start_i) + 1)
         revisit_ratio = float(visit_mass) / float(unique_count)
+        explicit_remove_gesture = bool(
+            bool(has_vertical_remove_gesture)
+            or (
+                float(max_y_span_px) >= 26.0
+                and float(max_y_span_px) >= max(18.0, float(max_x_span_px) * 1.5)
+            )
+        )
         return {
             "start": int(start_i),
             "end": int(end_i),
@@ -17162,6 +19288,9 @@ class ActionWindow(FrameControlMixin, QWidget):
             "unique_frames": int(unique_count),
             "revisit_ratio": float(max(1.0, revisit_ratio)),
             "has_side_support": bool(has_side_support),
+            "max_x_span_px": float(max_x_span_px),
+            "max_y_span_px": float(max_y_span_px),
+            "explicit_remove_gesture": bool(explicit_remove_gesture),
         }
 
     def _boundary_context_near_frame(
@@ -17179,28 +19308,35 @@ class ActionWindow(FrameControlMixin, QWidget):
             frame_val = int(frame_i)
         except Exception:
             return None
-        radius = max(1, int(search_radius))
+        radius = max(0, int(search_radius))
         view = self.views[self.active_view_idx]
         st = self._store_for_view_descriptor(view, descriptor)
         if st is None:
             return None
-        view_start = int(view.get("start", 0) or 0)
-        view_end = int(
-            view.get("end", self._get_frame_count() - 1) or (self._get_frame_count() - 1)
-        )
+        _vs = view.get("start")
+        view_start = int(_vs if _vs is not None else 0)
+        _ve = view.get("end")
+        view_end = int(_ve if _ve is not None else self._get_frame_count() - 1)
         cuts = self._trim_cut_set_for_view(view, descriptor, create=False)
+        effective_cuts = {int(c) for c in (cuts or set()) if c is not None}
+        effective_cuts.update(
+            self._confirmed_accept_boundary_cut_positions(
+                view_idx=int(self.active_view_idx),
+                descriptor=descriptor,
+            )
+        )
         segments = self._segments_for_correction_store(
             st,
             start=int(view_start),
             end=int(view_end),
-            cut_frames=cuts,
+            cut_frames=effective_cuts,
         )
         if len(segments) < 2:
             return None
-        cut_set = {int(c) for c in (cuts or set()) if c is not None}
+        cut_set = set(effective_cuts)
         best: Optional[Dict[str, Any]] = None
         best_dist = None
-        for left_seg, right_seg in zip(segments, segments[1:]):
+        for idx, (left_seg, right_seg) in enumerate(zip(segments, segments[1:])):
             try:
                 left_end = int(left_seg.get("end", -1))
                 right_start = int(right_seg.get("start", -1))
@@ -17213,6 +19349,22 @@ class ActionWindow(FrameControlMixin, QWidget):
             if dist > int(radius):
                 continue
             if best is None or best_dist is None or dist < best_dist:
+                preserved_boundaries: List[int] = []
+                try:
+                    left_boundary = int(left_seg.get("start", boundary))
+                except Exception:
+                    left_boundary = int(boundary)
+                if int(idx) > 0 and int(left_boundary) > 0:
+                    preserved_boundaries.append(int(left_boundary))
+                if int(idx) + 2 < len(segments):
+                    try:
+                        next_boundary = int(
+                            (segments[int(idx) + 2] or {}).get("start", 0)
+                        )
+                    except Exception:
+                        next_boundary = 0
+                    if int(next_boundary) > 0:
+                        preserved_boundaries.append(int(next_boundary))
                 best = {
                     "boundary_frame": int(boundary),
                     "left_segment": dict(left_seg),
@@ -17220,6 +19372,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                     "left_label": str(left_seg.get("label", "") or "").strip(),
                     "right_label": str(right_seg.get("label", "") or "").strip(),
                     "has_trim_cut": bool(int(boundary) in cut_set),
+                    "preserved_boundaries": preserved_boundaries,
                 }
                 best_dist = int(dist)
         if best is None:
@@ -17227,12 +19380,551 @@ class ActionWindow(FrameControlMixin, QWidget):
         best["distance"] = int(best_dist if best_dist is not None else 0)
         return best
 
+    def _segment_context_at_frame(
+        self,
+        descriptor: Dict[str, Any],
+        *,
+        frame_i: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.views:
+            return None
+        if not self._syncable_descriptor(descriptor):
+            return None
+        try:
+            frame_val = int(frame_i)
+        except Exception:
+            return None
+        view = self.views[self.active_view_idx]
+        st = self._store_for_view_descriptor(view, descriptor)
+        if st is None:
+            return None
+        cuts = self._trim_cut_set_for_view(view, descriptor, create=False)
+        seg_s, seg_e, seg_label = self._segment_bounds_with_cuts(st, frame_val, cuts)
+        label = str(seg_label or "").strip()
+        if not label:
+            return None
+        return {
+            "start": int(seg_s),
+            "end": int(seg_e),
+            "label": str(label),
+            "has_left_cut": bool(int(seg_s) in (cuts or set())),
+            "has_right_cut": bool((int(seg_e) + 1) in (cuts or set())),
+        }
+
+    def _boundary_removal_span_context(
+        self,
+        descriptor: Dict[str, Any],
+        *,
+        start_frame: int,
+        end_frame: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.views:
+            return None
+        if not self._syncable_descriptor(descriptor):
+            return None
+        try:
+            span_s = int(start_frame)
+            span_e = int(end_frame)
+        except Exception:
+            return None
+        if span_e < span_s:
+            span_s, span_e = span_e, span_s
+        view = self.views[self.active_view_idx]
+        st = self._store_for_view_descriptor(view, descriptor)
+        if st is None:
+            return None
+        _vs = view.get("start")
+        view_start = int(_vs if _vs is not None else 0)
+        _ve = view.get("end")
+        view_end = int(_ve if _ve is not None else self._get_frame_count() - 1)
+        span_s = max(int(view_start), int(span_s))
+        span_e = min(int(view_end), int(span_e))
+        if span_e < span_s:
+            return None
+        cuts = self._trim_cut_set_for_view(view, descriptor, create=False)
+        effective_cuts = {int(c) for c in (cuts or set()) if c is not None}
+        effective_cuts.update(
+            self._confirmed_accept_boundary_cut_positions(
+                view_idx=int(self.active_view_idx),
+                descriptor=descriptor,
+            )
+        )
+        segments = self._segments_for_correction_store(
+            st,
+            start=int(view_start),
+            end=int(view_end),
+            cut_frames=effective_cuts,
+        )
+        overlapped: List[Dict[str, Any]] = []
+        for seg in segments:
+            try:
+                _ss = seg.get("start")
+                seg_s = int(_ss if _ss is not None else span_s)
+                _se = seg.get("end")
+                seg_e = int(_se if _se is not None else seg_s)
+            except Exception:
+                continue
+            if seg_e < span_s or seg_s > span_e:
+                continue
+            overlapped.append(
+                {
+                    "start": int(seg_s),
+                    "end": int(seg_e),
+                    "label": str(seg.get("label", "") or "").strip(),
+                }
+            )
+        if len(overlapped) < 2:
+            return None
+        merge_s = min(int(seg["start"]) for seg in overlapped)
+        merge_e = max(int(seg["end"]) for seg in overlapped)
+        boundary_frames: List[int] = []
+        for _left, right in zip(overlapped, overlapped[1:]):
+            try:
+                boundary_i = int(right["start"])
+            except Exception:
+                continue
+            left_label = str(_left.get("label", "") or "").strip()
+            right_label = str(right.get("label", "") or "").strip()
+            if left_label == right_label:
+                continue
+            if int(merge_s) < int(boundary_i) <= int(merge_e):
+                boundary_frames.append(int(boundary_i))
+        if not boundary_frames:
+            return None
+        label_candidates = list(
+            self._bootstrap_label_candidates_for_span(int(merge_s), int(merge_e)) or []
+        )
+        merged_label = ""
+        if label_candidates:
+            merged_label = str(label_candidates[0][0] or "").strip()
+        if not merged_label:
+            best_len = -1
+            for seg in overlapped:
+                label = str(seg.get("label", "") or "").strip()
+                try:
+                    seg_len = int(seg["end"]) - int(seg["start"]) + 1
+                except Exception:
+                    seg_len = 0
+                if label and seg_len > best_len:
+                    merged_label = str(label)
+                    best_len = int(seg_len)
+        return {
+            "start": int(merge_s),
+            "end": int(merge_e),
+            "segments": list(overlapped),
+            "boundary_frames": list(boundary_frames),
+            "boundary_count": int(len(boundary_frames)),
+            "label_candidates": list(label_candidates),
+            "merged_label": str(merged_label),
+        }
+
+    def _resolve_remove_boundaries_label(
+        self, proposal: Dict[str, Any], context: Dict[str, Any]
+    ) -> str:
+        ordered: List[str] = [
+            str(proposal.get("merged_label", "") or "").strip(),
+            str(context.get("merged_label", "") or "").strip(),
+        ]
+        for item in list(context.get("label_candidates") or []):
+            try:
+                ordered.append(str(item[0] or "").strip())
+            except Exception:
+                continue
+        ordered.extend(
+            [
+                str(proposal.get("left_label", "") or "").strip(),
+                str(proposal.get("right_label", "") or "").strip(),
+            ]
+        )
+        for seg in list(context.get("segments") or []):
+            ordered.append(str((seg or {}).get("label", "") or "").strip())
+        return self._preferred_action_label(ordered)
+
+    def _resolve_merge_split_labels(
+        self,
+        proposal: Dict[str, Any],
+        *,
+        start: int,
+        boundary_frame: int,
+        end: int,
+        segment_hints: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, str]:
+        try:
+            span_s = int(start)
+            boundary_i = int(boundary_frame)
+            span_e = int(end)
+        except Exception:
+            return "", ""
+        if span_e < span_s:
+            span_s, span_e = span_e, span_s
+        hinted_segments = list(segment_hints or [])
+
+        def _ranked_labels_from_segments(sub_s: int, sub_e: int) -> List[str]:
+            if int(sub_e) < int(sub_s):
+                return []
+            scores: Dict[str, int] = {}
+            for seg in hinted_segments:
+                try:
+                    _ss = seg.get("start")
+                    seg_s = int(_ss if _ss is not None else sub_s)
+                    _se = seg.get("end")
+                    seg_e = int(_se if _se is not None else seg_s)
+                except Exception:
+                    continue
+                label = str(seg.get("label", "") or "").strip()
+                if not label:
+                    continue
+                overlap_s = max(int(sub_s), int(seg_s))
+                overlap_e = min(int(sub_e), int(seg_e))
+                if overlap_e < overlap_s:
+                    continue
+                scores[label] = scores.get(label, 0) + int(overlap_e - overlap_s + 1)
+            return [
+                name
+                for name, _score in sorted(
+                    scores.items(),
+                    key=lambda item: (-int(item[1]), str(item[0]).lower()),
+                )
+            ]
+
+        left_candidates = (
+            list(
+                self._bootstrap_label_candidates_for_span(
+                    int(span_s), int(boundary_i) - 1
+                )
+                or []
+            )
+            if int(boundary_i) - 1 >= int(span_s)
+            else []
+        )
+        right_candidates = (
+            list(
+                self._bootstrap_label_candidates_for_span(
+                    int(boundary_i), int(span_e)
+                )
+                or []
+            )
+            if int(boundary_i) <= int(span_e)
+            else []
+        )
+
+        def _first_label(
+            items: List[Tuple[str, Optional[float]]]
+        ) -> str:
+            for raw_name, _score in items:
+                name = str(raw_name or "").strip()
+                if name:
+                    return name
+            return ""
+
+        def _first_distinct_name(
+            names: List[str],
+            avoid: str,
+        ) -> str:
+            avoid_key = self._normalized_label_key(str(avoid or "").strip())
+            for name in names:
+                label = str(name or "").strip()
+                if not label:
+                    continue
+                if not avoid_key or self._normalized_label_key(label) != avoid_key:
+                    return label
+            return ""
+
+        def _first_distinct(
+            items: List[Tuple[str, Optional[float]]],
+            avoid: str,
+        ) -> str:
+            avoid_key = self._normalized_label_key(str(avoid or "").strip())
+            for raw_name, _score in items:
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                if not avoid_key or self._normalized_label_key(name) != avoid_key:
+                    return name
+            return ""
+
+        left_hint_names = _ranked_labels_from_segments(int(span_s), int(boundary_i) - 1)
+        right_hint_names = _ranked_labels_from_segments(int(boundary_i), int(span_e))
+        left_label = str(proposal.get("left_label", "") or "").strip()
+        right_label = str(proposal.get("right_label", "") or "").strip()
+        if not left_label:
+            left_label = _first_label([(name, None) for name in left_hint_names])
+        if not left_label:
+            left_label = _first_label(left_candidates)
+        if not right_label:
+            right_label = _first_label([(name, None) for name in right_hint_names])
+        if not right_label:
+            right_label = _first_label(right_candidates)
+        if left_label and right_label:
+            if self._normalized_label_key(left_label) == self._normalized_label_key(
+                right_label
+            ):
+                alt_left = _first_distinct_name(left_hint_names, right_label)
+                if alt_left:
+                    left_label = str(alt_left)
+                alt_right = _first_distinct_name(right_hint_names, left_label)
+                if alt_right:
+                    right_label = str(alt_right)
+                alt_left = _first_distinct(left_candidates, right_label)
+                if alt_left:
+                    left_label = str(alt_left)
+                alt_right = _first_distinct(right_candidates, left_label)
+                if alt_right:
+                    right_label = str(alt_right)
+        return str(left_label), str(right_label)
+
+    def _merge_then_split_context_from_proposal(
+        self,
+        proposal: Dict[str, Any],
+        *,
+        geom: Dict[str, Any],
+        removal_span_ctx: Optional[Dict[str, Any]],
+        scribbles: Optional[List[TemporalScribble]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(proposal, dict) or not isinstance(removal_span_ctx, dict):
+            return None
+        try:
+            _bf = proposal.get("boundary_frame")
+            _gm = geom.get("mid_frame")
+            span_mid = int(_bf if _bf is not None else (_gm if _gm is not None else 0))
+            _ss = removal_span_ctx.get("start")
+            span_s = int(_ss if _ss is not None else span_mid)
+            _se = removal_span_ctx.get("end")
+            span_e = int(_se if _se is not None else span_mid)
+        except Exception:
+            return None
+        if span_e < span_s:
+            span_s, span_e = span_e, span_s
+        width = max(1, int(span_e) - int(span_s) + 1)
+        overall_revisit = float(geom.get("revisit_ratio", 1.0) or 1.0)
+        clear_horizontal_merge = bool(
+            int(width) >= 10
+            and float(geom.get("max_x_span_px", 0.0) or 0.0)
+            >= max(24.0, float(geom.get("max_y_span_px", 0.0) or 0.0) * 1.05)
+        )
+        if (
+            not clear_horizontal_merge
+            and not bool(geom.get("has_side_support", False))
+            and overall_revisit < 1.1
+        ):
+            return None
+        refined_tail_max = max(8, min(32, int(round(float(width) * 0.45))))
+        boundary_frames = sorted(
+            {
+                int(frame_i)
+                for frame_i in list(removal_span_ctx.get("boundary_frames") or [])
+                if int(span_s) < int(frame_i) <= int(span_e)
+            }
+        )
+        if len(boundary_frames) < 2:
+            return None
+        items = list(scribbles or [])
+        frame_mass: Dict[int, float] = {}
+        for item in items:
+            meta = dict(getattr(item, "meta", {}) or {})
+            counts = meta.get("frame_counts")
+            if isinstance(counts, dict) and counts:
+                for key, value in counts.items():
+                    try:
+                        frame_i = int(key)
+                        weight = float(value)
+                    except Exception:
+                        continue
+                    if (
+                        int(span_s) <= int(frame_i) <= int(span_e)
+                        and np.isfinite(weight)
+                        and weight > 0.0
+                    ):
+                        frame_mass[int(frame_i)] = frame_mass.get(int(frame_i), 0.0) + float(weight)
+                continue
+            try:
+                item_s = int(getattr(item, "start_frame", span_s))
+                item_e = int(getattr(item, "end_frame", item_s))
+            except Exception:
+                continue
+            if item_e < item_s:
+                item_s, item_e = item_e, item_s
+            item_s = max(int(span_s), int(item_s))
+            item_e = min(int(span_e), int(item_e))
+            for frame_i in range(int(item_s), int(item_e) + 1):
+                frame_mass[int(frame_i)] = frame_mass.get(int(frame_i), 0.0) + 1.0
+
+        unique_mass_frames = max(1, len(frame_mass))
+        total_mass = float(sum(float(v) for v in frame_mass.values()))
+        baseline_mass = float(total_mass) / float(unique_mass_frames)
+        local_radius = max(2, min(6, int(round(float(width) * 0.04))))
+
+        def _tail_revisit_candidate(boundary_i: int) -> Optional[Dict[str, Any]]:
+            if int(boundary_i) <= int(span_s) or int(boundary_i) > int(span_e):
+                return None
+            tail_distance = min(
+                abs(int(boundary_i) - int(span_s)),
+                abs(int(span_e) - int(boundary_i)),
+            )
+            if int(tail_distance) > int(refined_tail_max):
+                return None
+            local_frames = range(
+                max(int(span_s), int(boundary_i) - int(local_radius)),
+                min(int(span_e), int(boundary_i) + int(local_radius)) + 1,
+            )
+            local_values = [float(frame_mass.get(int(frame_i), 0.0)) for frame_i in local_frames]
+            if not local_values:
+                return None
+            local_mass = float(sum(local_values))
+            peak_mass = float(max(local_values))
+            expected_mass = float(baseline_mass) * float(len(local_values))
+            mass_excess = float(local_mass) - float(expected_mass)
+            peak_excess = float(peak_mass) - float(baseline_mass)
+            if (
+                float(peak_excess) < max(1.25, float(baseline_mass) * 0.6)
+                and float(mass_excess) < max(2.5, float(baseline_mass) * 1.5)
+            ):
+                return None
+            merge_direction = (
+                "left"
+                if abs(int(span_e) - int(boundary_i)) <= abs(int(boundary_i) - int(span_s))
+                else "right"
+            )
+            return {
+                "merge_direction": str(merge_direction),
+                "boundary_frame": int(boundary_i),
+                "tail_distance": int(tail_distance),
+                "mass": float(max(local_mass, peak_mass * 2.0)),
+                "mass_excess": float(max(mass_excess, peak_excess)),
+            }
+
+        def _support_span(kind: ScribbleKind) -> Optional[Dict[str, Any]]:
+            support_items = [
+                item
+                for item in items
+                if resolve_scribble_kind(
+                    getattr(item, "kind", ScribbleKind.UNCERTAIN)
+                )
+                == kind
+            ]
+            if not support_items:
+                return None
+            start_i = min(int(item.start_frame) for item in support_items)
+            end_i = max(int(item.end_frame) for item in support_items)
+            mass = 0.0
+            for item in support_items:
+                meta = dict(getattr(item, "meta", {}) or {})
+                counts = meta.get("frame_counts")
+                if isinstance(counts, dict) and counts:
+                    for key, value in counts.items():
+                        try:
+                            frame_i = int(key)
+                            weight = float(value)
+                        except Exception:
+                            continue
+                        if int(span_s) <= int(frame_i) <= int(span_e) and np.isfinite(weight):
+                            mass += max(0.0, float(weight))
+                else:
+                    mass += float(
+                        max(
+                            1,
+                            int(getattr(item, "end_frame", start_i))
+                            - int(getattr(item, "start_frame", start_i))
+                            + 1,
+                        )
+                    )
+            return {
+                "start": int(start_i),
+                "end": int(end_i),
+                "mass": float(max(1.0, mass)),
+            }
+
+        candidates: List[Dict[str, Any]] = []
+        right_support = _support_span(ScribbleKind.RIGHT)
+        if right_support is not None:
+            _rss = right_support.get("start")
+            support_s = int(_rss if _rss is not None else span_e)
+            _rse = right_support.get("end")
+            support_e = int(_rse if _rse is not None else support_s)
+            tail_distance = min(
+                abs(int(span_e) - int(support_s)),
+                abs(int(span_e) - int(support_e)),
+            )
+            boundary_i = max(int(span_s) + 1, min(int(span_e), int(support_s)))
+            if int(tail_distance) <= int(refined_tail_max) and int(span_s) < int(boundary_i) <= int(span_e):
+                candidates.append(
+                    {
+                        "merge_direction": "left",
+                        "boundary_frame": int(boundary_i),
+                        "tail_distance": int(tail_distance),
+                        "mass": float(right_support.get("mass", 1.0) or 1.0),
+                        "mass_excess": float(right_support.get("mass", 1.0) or 1.0),
+                    }
+                )
+        left_support = _support_span(ScribbleKind.LEFT)
+        if left_support is not None:
+            _lss = left_support.get("start")
+            support_s = int(_lss if _lss is not None else span_s)
+            _lse = left_support.get("end")
+            support_e = int(_lse if _lse is not None else support_s)
+            tail_distance = min(
+                abs(int(support_s) - int(span_s)),
+                abs(int(support_e) - int(span_s)),
+            )
+            boundary_i = max(int(span_s) + 1, min(int(span_e), int(support_e) + 1))
+            if int(tail_distance) <= int(refined_tail_max) and int(span_s) < int(boundary_i) <= int(span_e):
+                candidates.append(
+                    {
+                        "merge_direction": "right",
+                        "boundary_frame": int(boundary_i),
+                        "tail_distance": int(tail_distance),
+                        "mass": float(left_support.get("mass", 1.0) or 1.0),
+                        "mass_excess": float(left_support.get("mass", 1.0) or 1.0),
+                    }
+                )
+        for boundary_i in boundary_frames:
+            candidate = _tail_revisit_candidate(int(boundary_i))
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda item: (
+                -float(item.get("mass_excess", 0.0) or 0.0),
+                -float(item.get("mass", 1.0) or 1.0),
+                int(item.get("tail_distance", refined_tail_max) or refined_tail_max),
+            )
+        )
+        chosen = dict(candidates[0] or {})
+        _v = chosen.get("boundary_frame")
+        boundary_i = int(_v if _v is not None else span_mid)
+        merge_direction = str(chosen.get("merge_direction", "") or "")
+        left_label, right_label = self._resolve_merge_split_labels(
+            proposal,
+            start=int(span_s),
+            boundary_frame=int(boundary_i),
+            end=int(span_e),
+            segment_hints=list(removal_span_ctx.get("segments") or []),
+        )
+        if not left_label or not right_label:
+            return None
+        if self._normalized_label_key(left_label) == self._normalized_label_key(
+            right_label
+        ):
+            return None
+        removed_frames = [int(frame_i) for frame_i in boundary_frames]
+        if not removed_frames:
+            return None
+        return {
+            "start": int(span_s),
+            "end": int(span_e),
+            "boundary_frame": int(boundary_i),
+            "merge_direction": str(merge_direction),
+            "left_label": str(left_label),
+            "right_label": str(right_label),
+            "removed_boundary_frames": list(removed_frames),
+            "removed_boundary_count": int(len(removed_frames)),
+        }
+
     def _resolve_remove_boundary_label(
         self, proposal: Dict[str, Any], context: Dict[str, Any]
     ) -> str:
-        merged = str(proposal.get("merged_label", "") or "").strip()
-        if merged:
-            return merged
+        ordered: List[str] = [str(proposal.get("merged_label", "") or "").strip()]
         left_label = str(context.get("left_label", "") or "").strip()
         right_label = str(context.get("right_label", "") or "").strip()
         if (
@@ -17241,42 +19933,52 @@ class ActionWindow(FrameControlMixin, QWidget):
             and self._normalized_label_key(left_label)
             == self._normalized_label_key(right_label)
         ):
-            return left_label
+            ordered.append(left_label)
         left_seg = dict(context.get("left_segment") or {})
         right_seg = dict(context.get("right_segment") or {})
         try:
-            merge_s = int(left_seg.get("start", 0) or 0)
-            merge_e = int(right_seg.get("end", merge_s) or merge_s)
+            _ls = left_seg.get("start")
+            merge_s = int(_ls if _ls is not None else 0)
+            _re = right_seg.get("end")
+            merge_e = int(_re if _re is not None else merge_s)
         except Exception:
             merge_s = merge_e = 0
         combined_candidates = self._bootstrap_label_candidates_for_span(
             int(merge_s), int(merge_e)
         )
-        if combined_candidates:
-            name = str(combined_candidates[0][0] or "").strip()
-            if name:
-                return name
+        for item in combined_candidates:
+            try:
+                ordered.append(str(item[0] or "").strip())
+            except Exception:
+                continue
+        _le = left_seg.get("end")
+        _ls2 = left_seg.get("start")
         left_len = max(
             1,
-            int(left_seg.get("end", merge_s) or merge_s)
-            - int(left_seg.get("start", merge_s) or merge_s)
+            int(_le if _le is not None else merge_s)
+            - int(_ls2 if _ls2 is not None else merge_s)
             + 1,
         )
+        _re2 = right_seg.get("end")
+        _rs2 = right_seg.get("start")
         right_len = max(
             1,
-            int(right_seg.get("end", merge_e) or merge_e)
-            - int(right_seg.get("start", merge_e) or merge_e)
+            int(_re2 if _re2 is not None else merge_e)
+            - int(_rs2 if _rs2 is not None else merge_e)
             + 1,
         )
         if left_label and right_label:
-            return str(left_label if left_len >= right_len else right_label)
-        return str(
-            left_label
-            or right_label
-            or proposal.get("left_label", "")
-            or proposal.get("right_label", "")
-            or ""
-        ).strip()
+            ordered.append(str(left_label if left_len >= right_len else right_label))
+            ordered.append(str(right_label if left_len >= right_len else left_label))
+        ordered.extend(
+            [
+                str(left_label),
+                str(right_label),
+                str(proposal.get("left_label", "") or "").strip(),
+                str(proposal.get("right_label", "") or "").strip(),
+            ]
+        )
+        return self._preferred_action_label(ordered)
 
     def _annotate_scribble_proposal(
         self,
@@ -17290,24 +19992,221 @@ class ActionWindow(FrameControlMixin, QWidget):
         annotated = dict(proposal)
         descriptor = dict(descriptor or {"kind": "store"})
         geom = self._scribble_session_geometry(list(scribbles or []))
-        frame_hint = annotated.get("boundary_frame", geom.get("mid_frame", 0))
+        explicit_remove_hint = bool(geom.get("explicit_remove_gesture", False))
+        horizontal_sweep_like = bool(
+            int(geom.get("width", 1) or 1) >= 12
+            and float(geom.get("max_x_span_px", 0.0) or 0.0)
+            >= max(24.0, float(geom.get("max_y_span_px", 0.0) or 0.0) * 1.15)
+        )
+        frame_hint = (
+            geom.get("mid_frame", 0)
+            if explicit_remove_hint
+            else annotated.get("boundary_frame", geom.get("mid_frame", 0))
+        )
         try:
             frame_hint_i = int(frame_hint)
         except Exception:
-            frame_hint_i = int(geom.get("mid_frame", 0) or 0)
+            _gm = geom.get("mid_frame")
+            frame_hint_i = int(_gm if _gm is not None else 0)
+        _gs = geom.get("start")
+        _ge = geom.get("end")
+        removal_span_ctx = self._boundary_removal_span_context(
+            descriptor,
+            start_frame=int(_gs if _gs is not None else frame_hint_i),
+            end_frame=int(_ge if _ge is not None else frame_hint_i),
+        )
+        removal_span_count = int(
+            (removal_span_ctx or {}).get("boundary_count", 0) or 0
+        )
+        if removal_span_ctx is not None:
+            if removal_span_count == 1:
+                boundary_frames = list(removal_span_ctx.get("boundary_frames") or [])
+                try:
+                    boundary_i = int(boundary_frames[0])
+                except Exception:
+                    boundary_i = frame_hint_i
+                explicit_remove = bool(geom.get("explicit_remove_gesture", False))
+                centered_tol = max(
+                    2 if explicit_remove else 1,
+                    min(3, int(round(float(geom.get("width", 1) or 1) * 0.35))),
+                )
+                centered = abs(
+                    int(geom.get("mid_frame", frame_hint_i)) - int(boundary_i)
+                ) <= int(centered_tol)
+                crosses = int(geom.get("start", frame_hint_i)) <= int(boundary_i) <= int(
+                    geom.get("end", frame_hint_i)
+                )
+                revisit_high = float(geom.get("revisit_ratio", 1.0) or 1.0) >= 1.6
+                close_enough = abs(
+                    int(geom.get("mid_frame", frame_hint_i)) - int(boundary_i)
+                ) <= max(
+                    2, int(round(float(geom.get("width", 1) or 1) * 0.5))
+                )
+                compact_delete = (
+                    close_enough
+                    and int(geom.get("width", 1) or 1) <= 8
+                    and float(geom.get("revisit_ratio", 1.0) or 1.0) <= 1.55
+                )
+                if (
+                    (
+                        not bool(geom.get("has_side_support", False))
+                        or explicit_remove
+                        or compact_delete
+                    )
+                    and (
+                        not revisit_high
+                        or explicit_remove
+                        or compact_delete
+                    )
+                    and (
+                        (bool(crosses))
+                        or (
+                            explicit_remove
+                            and centered
+                            and close_enough
+                        )
+                        or bool(compact_delete)
+                    )
+                ):
+                    annotated["proposal_action"] = "remove_boundary"
+                    annotated["boundary_frame"] = int(boundary_i)
+                    annotated["target_boundary_frame"] = int(boundary_i)
+                    annotated["revisit_score"] = float(
+                        geom.get("revisit_ratio", 1.0) or 1.0
+                    )
+                    annotated["stroke_span"] = int(geom.get("width", 1) or 1)
+                    single_boundary_ctx = self._boundary_context_near_frame(
+                        descriptor,
+                        frame_i=int(boundary_i),
+                        search_radius=2,
+                    )
+                    if single_boundary_ctx is not None:
+                        merged_label = self._resolve_remove_boundary_label(
+                            annotated, single_boundary_ctx
+                        )
+                        if merged_label:
+                            annotated["merged_label"] = str(merged_label)
+                            annotated["left_label"] = str(merged_label)
+                            annotated["right_label"] = str(merged_label)
+                    return annotated
+            merge_split_ctx = self._merge_then_split_context_from_proposal(
+                annotated,
+                geom=geom,
+                removal_span_ctx=removal_span_ctx,
+                scribbles=list(scribbles or []),
+            )
+            if merge_split_ctx is not None:
+                annotated["proposal_action"] = "merge_then_split"
+                _mss = merge_split_ctx.get("start")
+                annotated["window_start"] = int(
+                    _mss if _mss is not None else frame_hint_i
+                )
+                _mse = merge_split_ctx.get("end")
+                annotated["window_end"] = int(
+                    _mse if _mse is not None else frame_hint_i
+                )
+                _msb = merge_split_ctx.get("boundary_frame")
+                annotated["boundary_frame"] = int(
+                    _msb if _msb is not None else frame_hint_i
+                )
+                annotated["target_boundary_frame"] = int(
+                    _msb if _msb is not None else frame_hint_i
+                )
+                annotated["revisit_score"] = float(geom.get("revisit_ratio", 1.0) or 1.0)
+                annotated["stroke_span"] = int(geom.get("width", 1) or 1)
+                annotated["merge_direction"] = str(
+                    merge_split_ctx.get("merge_direction", "") or ""
+                )
+                annotated["removed_boundary_frames"] = list(
+                    merge_split_ctx.get("removed_boundary_frames") or []
+                )
+                annotated["removed_boundary_count"] = int(
+                    merge_split_ctx.get("removed_boundary_count", 0) or 0
+                )
+                annotated["left_label"] = str(
+                    merge_split_ctx.get("left_label", "") or ""
+                )
+                annotated["right_label"] = str(
+                    merge_split_ctx.get("right_label", "") or ""
+                )
+                return annotated
+            multi_boundary_merge = bool(
+                int(removal_span_count) >= 2
+                and int(geom.get("width", 1) or 1)
+                >= max(6, int(removal_span_count) * 2)
+            )
+            if multi_boundary_merge:
+                _rbs = removal_span_ctx.get("start")
+                merge_s = int(_rbs if _rbs is not None else frame_hint_i)
+                _rbe = removal_span_ctx.get("end")
+                merge_e = int(_rbe if _rbe is not None else frame_hint_i)
+                merge_mid = int(round((int(merge_s) + int(merge_e)) / 2.0))
+                annotated["proposal_action"] = "remove_boundaries"
+                annotated["window_start"] = int(merge_s)
+                annotated["window_end"] = int(merge_e)
+                annotated["boundary_frame"] = int(merge_mid)
+                annotated["target_boundary_frame"] = int(merge_mid)
+                annotated["revisit_score"] = float(geom.get("revisit_ratio", 1.0) or 1.0)
+                annotated["stroke_span"] = int(geom.get("width", 1) or 1)
+                annotated["removed_boundary_frames"] = list(
+                    removal_span_ctx.get("boundary_frames") or []
+                )
+                annotated["removed_boundary_count"] = int(removal_span_count)
+                merged_label = self._resolve_remove_boundaries_label(
+                    annotated, removal_span_ctx
+                )
+                if merged_label:
+                    annotated["merged_label"] = str(merged_label)
+                    annotated["left_label"] = str(merged_label)
+                    annotated["right_label"] = str(merged_label)
+                return annotated
         search_radius = max(4, min(18, int(geom.get("width", 1) or 1) + 4))
         boundary_ctx = self._boundary_context_near_frame(
             descriptor,
             frame_i=int(frame_hint_i),
             search_radius=int(search_radius),
         )
+        if (
+            boundary_ctx is None
+            and bool(explicit_remove_hint)
+            and not bool(geom.get("has_side_support", False))
+        ):
+            segment_ctx = self._segment_context_at_frame(
+                descriptor,
+                frame_i=int(frame_hint_i),
+            )
+            if segment_ctx is not None:
+                _scs = segment_ctx.get("start")
+                seg_s = int(_scs if _scs is not None else frame_hint_i)
+                _sce = segment_ctx.get("end")
+                seg_e = int(_sce if _sce is not None else frame_hint_i)
+                if seg_e < seg_s:
+                    seg_s, seg_e = seg_e, seg_s
+                annotated["proposal_action"] = "remove_segment"
+                annotated["window_start"] = int(seg_s)
+                annotated["window_end"] = int(seg_e)
+                annotated["boundary_frame"] = int(
+                    round((int(seg_s) + int(seg_e)) / 2.0)
+                )
+                annotated["segment_label"] = str(
+                    segment_ctx.get("label", "") or ""
+                ).strip()
+                annotated["revisit_score"] = float(
+                    geom.get("revisit_ratio", 1.0) or 1.0
+                )
+                annotated["stroke_span"] = int(geom.get("width", 1) or 1)
+                return annotated
         action = "new_boundary"
         target_boundary = None
         if boundary_ctx is not None:
-            boundary_i = int(boundary_ctx.get("boundary_frame", frame_hint_i) or frame_hint_i)
+            _v = boundary_ctx.get("boundary_frame")
+            boundary_i = int(_v if _v is not None else frame_hint_i)
             target_boundary = int(boundary_i)
-            centered_tol = max(1, min(3, int(round(float(geom.get("width", 1) or 1) * 0.35))))
-            narrow_limit = max(3, min(8, int(round(float(geom.get("width", 1) or 1)))))
+            explicit_remove = bool(explicit_remove_hint)
+            centered_tol = max(
+                2 if explicit_remove else 1,
+                min(3, int(round(float(geom.get("width", 1) or 1) * 0.35))),
+            )
             centered = abs(int(geom.get("mid_frame", frame_hint_i)) - int(boundary_i)) <= int(centered_tol)
             crosses = int(geom.get("start", frame_hint_i)) <= int(boundary_i) <= int(
                 geom.get("end", frame_hint_i)
@@ -17316,13 +20215,32 @@ class ActionWindow(FrameControlMixin, QWidget):
             close_enough = abs(int(geom.get("mid_frame", frame_hint_i)) - int(boundary_i)) <= max(
                 2, int(round(float(geom.get("width", 1) or 1) * 0.5))
             )
+            compact_delete = (
+                close_enough
+                and int(geom.get("width", 1) or 1) <= 8
+                and float(geom.get("revisit_ratio", 1.0) or 1.0) <= 1.55
+            )
             if crosses or close_enough:
                 if (
-                    not bool(geom.get("has_side_support", False))
-                    and centered
-                    and crosses
-                    and int(geom.get("width", 1) or 1) <= int(narrow_limit)
-                    and not revisit_high
+                    (
+                        not bool(geom.get("has_side_support", False))
+                        or explicit_remove
+                        or compact_delete
+                    )
+                    and (
+                        not revisit_high
+                        or explicit_remove
+                        or compact_delete
+                    )
+                    and (
+                        bool(crosses)
+                        or (
+                            explicit_remove
+                            and centered
+                            and close_enough
+                        )
+                        or bool(compact_delete)
+                    )
                 ):
                     action = "remove_boundary"
                 else:
@@ -17373,6 +20291,18 @@ class ActionWindow(FrameControlMixin, QWidget):
                 if right_seg is not None
                 else []
             )
+            provisional_mid = int(round((int(focus_start) + int(focus_end)) / 2.0))
+            provisional_mid = max(int(window_start), min(int(window_end), provisional_mid))
+            if not left_candidates and int(window_start) <= int(provisional_mid) - 1:
+                left_candidates = self._bootstrap_label_candidates_for_span(
+                    int(window_start),
+                    int(provisional_mid) - 1,
+                )
+            if not right_candidates and int(provisional_mid) <= int(window_end):
+                right_candidates = self._bootstrap_label_candidates_for_span(
+                    int(provisional_mid),
+                    int(window_end),
+                )
             if not left_candidates and not right_candidates:
                 fallback_candidates = self._fallback_label_candidates_for_blank_region(
                     window_start=int(window_start),
@@ -17380,6 +20310,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                 )
                 left_candidates = list(fallback_candidates)
                 right_candidates = list(fallback_candidates)
+            elif not left_candidates:
+                left_candidates = list(right_candidates)
+            elif not right_candidates:
+                right_candidates = list(left_candidates)
             result = self._scribble_local_refiner.refine(
                 LocalRefinerInput(
                     window_start=window_start,
@@ -17412,8 +20346,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                 ),
                 "raw_confidence": float(raw_confidence),
                 "confidence": float(calibrated_confidence),
-                "left_label": str(result.left_label or ""),
-                "right_label": str(result.right_label or ""),
+                "left_label": self._resolve_action_label_name(result.left_label or ""),
+                "right_label": self._resolve_action_label_name(result.right_label or ""),
                 "extras": dict(result.extras or {}),
                 "scribble_count": int(len(scribbles)),
                 "kinds": sorted({str(item.kind.value) for item in scribbles}),
@@ -17512,8 +20446,14 @@ class ActionWindow(FrameControlMixin, QWidget):
             if str(repair.get("kind") or "") != "state_patch":
                 continue
             try:
-                cs = int(repair.get("start", conflict.get("start", 0)) or 0)
-                ce = int(repair.get("end", conflict.get("end", cs)) or cs)
+                _v = repair.get("start")
+                if _v is None:
+                    _v = conflict.get("start")
+                cs = int(_v if _v is not None else 0)
+                _v = repair.get("end")
+                if _v is None:
+                    _v = conflict.get("end")
+                ce = int(_v if _v is not None else cs)
             except Exception:
                 continue
             if ce < cs:
@@ -17576,11 +20516,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         view_end: int,
     ) -> Tuple[int, int]:
         try:
-            start = int(proposal.get("window_start", frame_i) or frame_i)
+            _v = proposal.get("window_start")
+            start = int(_v if _v is not None else frame_i)
         except Exception:
             start = int(frame_i)
         try:
-            end = int(proposal.get("window_end", frame_i) or frame_i)
+            _v = proposal.get("window_end")
+            end = int(_v if _v is not None else frame_i)
         except Exception:
             end = int(frame_i)
         if end < start:
@@ -17637,6 +20579,76 @@ class ActionWindow(FrameControlMixin, QWidget):
             right_label = left_label
         return str(left_label), str(right_label)
 
+    @staticmethod
+    def _patch_frame_labels_for_boundary_accept(
+        frame_labels: Dict[int, str],
+        *,
+        start: int,
+        end: int,
+        boundary_frame: int,
+        left_label: str,
+        right_label: str,
+    ) -> Dict[int, str]:
+        patched = {
+            int(frame): str(label)
+            for frame, label in dict(frame_labels or {}).items()
+            if str(label or "").strip()
+        }
+        try:
+            span_s = int(start)
+            span_e = int(end)
+            boundary_i = int(boundary_frame)
+        except Exception:
+            return dict(patched)
+        if span_e < span_s:
+            span_s, span_e = span_e, span_s
+        boundary_i = max(int(span_s), min(int(span_e), int(boundary_i)))
+        left_name = str(left_label or "").strip()
+        right_name = str(right_label or "").strip()
+        if left_name:
+            for frame_i in range(int(span_s), int(boundary_i)):
+                patched[int(frame_i)] = str(left_name)
+        if right_name:
+            for frame_i in range(int(boundary_i), int(span_e) + 1):
+                patched[int(frame_i)] = str(right_name)
+        return patched
+
+    @staticmethod
+    def _changed_label_spans_in_range(
+        before: Dict[int, str],
+        after: Dict[int, str],
+        *,
+        start: int,
+        end: int,
+    ) -> List[Tuple[int, int]]:
+        try:
+            span_s = int(start)
+            span_e = int(end)
+        except Exception:
+            return []
+        if span_e < span_s:
+            span_s, span_e = span_e, span_s
+        spans: List[Tuple[int, int]] = []
+        run_start: Optional[int] = None
+        prev_frame: Optional[int] = None
+        for frame_i in range(int(span_s), int(span_e) + 1):
+            old = str(dict(before or {}).get(int(frame_i), "") or "")
+            new = str(dict(after or {}).get(int(frame_i), "") or "")
+            changed = old != new
+            if changed:
+                if run_start is None:
+                    run_start = int(frame_i)
+                elif prev_frame is not None and int(frame_i) != int(prev_frame) + 1:
+                    spans.append((int(run_start), int(prev_frame)))
+                    run_start = int(frame_i)
+            elif run_start is not None and prev_frame is not None:
+                spans.append((int(run_start), int(prev_frame)))
+                run_start = None
+            prev_frame = int(frame_i)
+        if run_start is not None and prev_frame is not None:
+            spans.append((int(run_start), int(prev_frame)))
+        return spans
+
     def _build_soft_constraints_for_decode(
         self,
         view: Dict[str, Any],
@@ -17655,8 +20667,14 @@ class ActionWindow(FrameControlMixin, QWidget):
             if str(repair.get("kind") or "") != "state_patch":
                 continue
             try:
-                cs = int(repair.get("start", conflict.get("start", 0)) or 0)
-                ce = int(repair.get("end", conflict.get("end", cs)) or cs)
+                _v = repair.get("start")
+                if _v is None:
+                    _v = conflict.get("start")
+                cs = int(_v if _v is not None else 0)
+                _v = repair.get("end")
+                if _v is None:
+                    _v = conflict.get("end")
+                ce = int(_v if _v is not None else cs)
             except Exception:
                 continue
             if ce < cs:
@@ -17708,8 +20726,8 @@ class ActionWindow(FrameControlMixin, QWidget):
                     constraints.append(
                         SoftConstraint(
                             kind="multiview_preferred_label",
-                            start_frame=int(seg.get("start", s) or s),
-                            end_frame=int(seg.get("end", e) or e),
+                            start_frame=int(seg.get("start") if seg.get("start") is not None else s),
+                            end_frame=int(seg.get("end") if seg.get("end") is not None else e),
                             weight=0.35,
                             payload={
                                 "preferred_label": label,
@@ -17720,6 +20738,125 @@ class ActionWindow(FrameControlMixin, QWidget):
                     )
         return constraints
 
+    def _confirmed_label_lock_windows_for_decode(
+        self,
+        *,
+        exclude_start: Optional[int] = None,
+        exclude_end: Optional[int] = None,
+    ) -> List[ConfirmedWindow]:
+        windows: List[ConfirmedWindow] = []
+        try:
+            ex_s = None if exclude_start is None else int(exclude_start)
+            ex_e = None if exclude_end is None else int(exclude_end)
+        except Exception:
+            ex_s = ex_e = None
+        if ex_s is not None and ex_e is not None and ex_e < ex_s:
+            ex_s, ex_e = ex_e, ex_s
+        for rec in self._segment_lock_records_for_active_view():
+            if not isinstance(rec, dict):
+                continue
+            label = str(rec.get("label", "") or "").strip()
+            if not label:
+                continue
+            try:
+                _v = rec.get("feedback_start")
+                seg_s = int(_v if _v is not None else 0)
+                _v = rec.get("feedback_end")
+                seg_e = int(_v if _v is not None else seg_s)
+            except Exception:
+                continue
+            if seg_e < seg_s:
+                seg_s, seg_e = seg_e, seg_s
+            if ex_s is not None and ex_e is not None and not (
+                seg_e < int(ex_s) or seg_s > int(ex_e)
+            ):
+                continue
+            windows.append(
+                ConfirmedWindow(
+                    start_frame=int(seg_s),
+                    end_frame=int(seg_e),
+                    boundary_frame=None,
+                    left_label=str(label),
+                    right_label=str(label),
+                    hard=True,
+                    meta={"kind": "segment_lock"},
+                )
+            )
+        return windows
+
+    def _confirmed_boundary_lock_windows_for_decode(self) -> List[ConfirmedWindow]:
+        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
+            return []
+        view = self.views[self.active_view_idx]
+        current_store = view.get("store") or self.store
+        if current_store is None:
+            return []
+        view_start = int(view.get("start", 0))
+        view_end = int(view.get("end", view_start))
+        if view_end < view_start:
+            view_start, view_end = view_end, view_start
+        records = list(self._rebuild_confirmed_correction_records_for_active_view())
+        confirmed_frames = set(self._confirmed_boundary_frames_for_export(records))
+        if not confirmed_frames:
+            return []
+        segments = self._segments_for_correction_store(
+            current_store,
+            start=int(view_start),
+            end=int(view_end),
+            cut_frames=self._active_trim_cuts_for_descriptor({"kind": "store"}),
+        )
+        if len(segments) < 2:
+            return []
+        windows: List[ConfirmedWindow] = []
+        seen: Set[Tuple[int, int, int, str, str]] = set()
+        for idx in range(len(segments) - 1):
+            left = dict(segments[idx] or {})
+            right = dict(segments[idx + 1] or {})
+            try:
+                _rb = right.get("start")
+                _lb = left.get("end")
+                boundary = int(_rb if _rb is not None else (_lb if _lb is not None else 0))
+                _ls = left.get("start")
+                left_start = int(_ls if _ls is not None else boundary)
+                _le = left.get("end")
+                left_end = int(_le if _le is not None else boundary - 1)
+                _rs = right.get("start")
+                right_start = int(_rs if _rs is not None else boundary)
+                _re = right.get("end")
+                right_end = int(_re if _re is not None else boundary)
+            except Exception:
+                continue
+            if int(boundary) not in confirmed_frames:
+                continue
+            left_label = str(left.get("label", "") or "").strip()
+            right_label = str(right.get("label", "") or "").strip()
+            if not left_label and not right_label:
+                continue
+            left_len = max(1, int(left_end) - int(left_start) + 1)
+            right_len = max(1, int(right_end) - int(right_start) + 1)
+            left_radius = max(1, min(6, left_len))
+            right_radius = max(1, min(6, right_len))
+            win_s = max(int(view_start), int(left_start), int(boundary) - int(left_radius))
+            win_e = min(int(view_end), int(right_end), int(boundary) + int(right_radius) - 1)
+            if win_e < win_s or not (int(win_s) <= int(boundary) <= int(win_e)):
+                continue
+            key = (int(win_s), int(win_e), int(boundary), left_label, right_label)
+            if key in seen:
+                continue
+            seen.add(key)
+            windows.append(
+                ConfirmedWindow(
+                    start_frame=int(win_s),
+                    end_frame=int(win_e),
+                    boundary_frame=int(boundary),
+                    left_label=str(left_label),
+                    right_label=str(right_label),
+                    hard=True,
+                    meta={"kind": "boundary_lock"},
+                )
+            )
+        return windows
+
     def _apply_decoded_labels_to_store(
         self,
         store: AnnotationStore,
@@ -17729,20 +20866,53 @@ class ActionWindow(FrameControlMixin, QWidget):
         changed_spans: List[Tuple[int, int]],
         *,
         protected_boundary: Optional[int] = None,
-    ) -> None:
+        preserve_existing_cuts: bool = False,
+    ) -> Tuple[List[Tuple], List[Dict[str, Any]]]:
         if store is None:
-            return
-        if changed_spans:
-            self._patch_store_frames_in_spans(store, changed_spans, decoded)
+            return [], []
+        deltas: List[Tuple] = []
+        cut_ops: List[Dict[str, Any]] = []
+        merged_spans = self._merge_spans(changed_spans or [])
+        if merged_spans:
+            try:
+                store.begin_txn()
+            except Exception:
+                pass
+            try:
+                for s, e in merged_spans:
+                    for frame_i in range(int(s), int(e) + 1):
+                        target_label = str(decoded.get(int(frame_i), "") or "").strip()
+                        current_label = store.label_at(int(frame_i))
+                        if current_label and current_label != target_label:
+                            store.remove_at(int(frame_i))
+                        current_label = store.label_at(int(frame_i))
+                        if target_label:
+                            if current_label != target_label:
+                                if current_label:
+                                    store.remove_at(int(frame_i))
+                                store.add(str(target_label), int(frame_i))
+                        elif current_label:
+                            store.remove_at(int(frame_i))
+            finally:
+                try:
+                    store.end_txn()
+                except Exception:
+                    pass
+            consume = getattr(store, "consume_last_deltas", None)
+            if callable(consume):
+                try:
+                    deltas = list(consume() or [])
+                except Exception:
+                    deltas = []
         cuts = self._trim_cut_set_for_view(view, descriptor, create=True)
         if cuts is None:
-            return
-        spans = list(changed_spans or [])
+            return deltas, cut_ops
+        spans = list(merged_spans or [])
         if protected_boundary is not None:
             spans.append((int(protected_boundary) - 1, int(protected_boundary)))
         merged = self._merge_spans(spans)
         if not merged:
-            return
+            return deltas, cut_ops
         start = min(int(item[0]) for item in merged)
         end = max(int(item[1]) for item in merged)
         protected = (
@@ -17750,21 +20920,54 @@ class ActionWindow(FrameControlMixin, QWidget):
             if protected_boundary is not None and int(protected_boundary) >= 0
             else set()
         )
+        protected.update(
+            self._confirmed_accept_boundary_cut_positions(
+                view_idx=int(self.active_view_idx),
+                descriptor=descriptor,
+            )
+        )
         existing = {int(c) for c in (cuts or set()) if int(start) <= int(c) <= int(end)}
         candidate_cuts = set(existing) | set(protected)
         new_cuts = set()
         for cut in sorted(candidate_cuts):
+            if bool(preserve_existing_cuts) and int(cut) in existing:
+                new_cuts.add(int(cut))
+                continue
             left_label = str(decoded.get(int(cut) - 1, store.label_at(int(cut) - 1) or "") or "")
             right_label = str(decoded.get(int(cut), store.label_at(int(cut)) or "") or "")
             if int(cut) in protected or left_label != right_label:
                 new_cuts.add(int(cut))
-        self._replace_cut_set_excluding_positions(
+        before_cuts = set(existing)
+        self._replace_cut_set_in_span(
             cuts,
             int(start),
             int(end),
-            protected_positions=protected,
             new_cuts=new_cuts,
         )
+        after_cuts = {
+            int(c)
+            for c in (cuts or set())
+            if int(start) <= int(c) <= int(end)
+        }
+        for cut in sorted(before_cuts - after_cuts):
+            cut_ops.append(
+                {
+                    "view_idx": int(self.active_view_idx),
+                    "descriptor": dict(descriptor or {}),
+                    "frame": int(cut),
+                    "op": "remove",
+                }
+            )
+        for cut in sorted(after_cuts - before_cuts):
+            cut_ops.append(
+                {
+                    "view_idx": int(self.active_view_idx),
+                    "descriptor": dict(descriptor or {}),
+                    "frame": int(cut),
+                    "op": "add",
+                }
+            )
+        return deltas, cut_ops
 
     def _remove_boundary_context_for_proposal(
         self, descriptor: Dict[str, Any], proposal: Dict[str, Any]
@@ -17774,6 +20977,20 @@ class ActionWindow(FrameControlMixin, QWidget):
             boundary_i = int(target_frame)
         except Exception:
             return None
+        if proposal.get("target_boundary_frame") is not None:
+            exact_ctx = self._boundary_context_near_frame(
+                descriptor,
+                frame_i=int(boundary_i),
+                search_radius=0,
+            )
+            if not isinstance(exact_ctx, dict):
+                return None
+            _v = exact_ctx.get("boundary_frame")
+            if int(_v if _v is not None else boundary_i) != int(
+                boundary_i
+            ):
+                return None
+            return exact_ctx
         radius = max(
             2,
             min(
@@ -17810,8 +21027,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._update_scribble_proposal_ui()
             return False
         frame_i = int(boundary_frame)
-        view_start = int(view.get("start", 0) or 0)
-        view_end = int(view.get("end", self._get_frame_count() - 1) or (self._get_frame_count() - 1))
+        _vs = view.get("start")
+        view_start = int(_vs if _vs is not None else 0)
+        _ve = view.get("end")
+        view_end = int(_ve if _ve is not None else self._get_frame_count() - 1)
         cuts = self._trim_cut_set_for_view(view, descriptor, create=True)
         seg_s, seg_e, seg_label = self._segment_bounds_with_cuts(st, frame_i, cuts)
         bootstrap_blank = seg_label is None
@@ -17830,7 +21049,549 @@ class ActionWindow(FrameControlMixin, QWidget):
             view_idx=int(self.active_view_idx),
         )
         proposal_action = str(proposal.get("proposal_action") or "").strip()
+        if proposal_action == "merge_then_split":
+            _ws = proposal.get("window_start")
+            edit_s = int(_ws if _ws is not None else frame_i)
+            _we = proposal.get("window_end")
+            edit_e = int(_we if _we is not None else frame_i)
+            if edit_e < edit_s:
+                edit_s, edit_e = edit_e, edit_s
+            _v = proposal.get("boundary_frame")
+            split_frame = int(_v if _v is not None else frame_i)
+            if not (int(edit_s) < int(split_frame) <= int(edit_e)):
+                self._discard_correction_session("scribble_merge_split_invalid_boundary")
+                self._set_status(
+                    "This merge-and-split proposal does not contain a valid final split yet. Redraw the local refinement near the intended boundary."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            left_label, right_label = self._resolve_merge_split_labels(
+                proposal,
+                start=int(edit_s),
+                boundary_frame=int(split_frame),
+                end=int(edit_e),
+            )
+            if not left_label or not right_label:
+                self._discard_correction_session("scribble_merge_split_missing_labels")
+                self._set_status(
+                    "The combined merge-and-split proposal still needs distinct labels on both sides. Refine the final local boundary a bit more."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            if self._normalized_label_key(left_label) == self._normalized_label_key(
+                right_label
+            ):
+                self._discard_correction_session("scribble_merge_split_same_label")
+                self._set_status(
+                    "The current mixed scribble still resolves to the same label on both sides, so it cannot create a final split yet."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            needs_new_cut = self._boundary_would_add_new_cut(
+                int(edit_s),
+                int(edit_e),
+                int(split_frame),
+                cuts,
+            )
+            if needs_new_cut and not self._split_respects_min_action_segment_frames(
+                int(edit_s), int(edit_e), int(split_frame)
+            ):
+                self._discard_correction_session(
+                    "scribble_merge_split_below_min_segment_len"
+                )
+                self._set_status(
+                    self._split_too_short_message(
+                        int(edit_s), int(edit_e), int(split_frame)
+                    )
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            self._ensure_label_defs_for_names([left_label, right_label])
+            state_before = self._count_state_conflicts_in_span(view_start, view_end)
+            cut_ops: List[Dict[str, Any]] = []
+            label_deltas: List[Tuple] = []
+            if needs_new_cut:
+                cuts.add(int(split_frame))
+                self._set_auto_preserved_cut(view, descriptor, int(split_frame), True)
+                cut_ops.append(
+                    {
+                        "view_idx": int(self.active_view_idx),
+                        "descriptor": dict(descriptor),
+                        "frame": int(split_frame),
+                        "op": "add",
+                    }
+                )
+            if int(edit_s) <= int(split_frame) - 1:
+                label_deltas.extend(
+                    self._apply_label_range(
+                        st,
+                        int(edit_s),
+                        int(split_frame) - 1,
+                        str(left_label),
+                    )
+                )
+            if int(split_frame) <= int(edit_e):
+                label_deltas.extend(
+                    self._apply_label_range(
+                        st,
+                        int(split_frame),
+                        int(edit_e),
+                        str(right_label),
+                    )
+                )
+            boundary_guard_ops = self._ensure_trim_cuts_for_span_bounds(
+                int(self.active_view_idx),
+                descriptor,
+                cuts,
+                int(edit_s),
+                int(edit_e),
+            )
+            if boundary_guard_ops:
+                cut_ops.extend(list(boundary_guard_ops))
+            cleanup_ops = self._remove_trim_cuts_in_spans(
+                int(self.active_view_idx),
+                descriptor,
+                [(int(edit_s), int(edit_e))],
+                protected_cuts=[int(edit_s), int(split_frame), int(edit_e) + 1],
+                respect_confirmed_boundary_locks=False,
+            )
+            if cleanup_ops:
+                cut_ops.extend(list(cleanup_ops))
+            # User explicitly accepted merge+split — clear stale lock
+            # records for boundaries that were just removed.
+            self._clear_boundary_lock_records_in_span(
+                int(edit_s) + 1, int(edit_e),
+                keep={int(edit_s), int(split_frame), int(edit_e) + 1},
+            )
+            if label_deltas and cut_ops:
+                self._push_undo_composite([(st, list(label_deltas))], list(cut_ops))
+                self._redo_stack.clear()
+            elif label_deltas:
+                self._push_undo_entry(st, list(label_deltas))
+                self._redo_stack.clear()
+            elif cut_ops:
+                self._push_undo_item({"kind": "trim_cuts", "ops": list(cut_ops)})
+                self._redo_stack.clear()
+            self._psr_mark_dirty()
+            try:
+                self._psr_recompute_cache()
+            except Exception:
+                pass
+            state_after = self._count_state_conflicts_in_span(view_start, view_end)
+            self._dirty = True
+            try:
+                view["dirty"] = True
+            except Exception:
+                pass
+            self._note_correction_step()
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
+                point_type="boundary_merge_split_accept",
+                feedback_start=int(edit_s),
+                feedback_end=int(edit_e),
+                boundary_frame=int(split_frame),
+                left_label=str(left_label),
+                right_label=str(right_label),
+                mode="merge_then_split",
+                raw_confidence=float(
+                    self._cfg_float(
+                        proposal.get("raw_confidence", proposal.get("confidence", 0.0)),
+                        0.0,
+                        lo=0.0,
+                        hi=1.0,
+                    )
+                ),
+                calibrated_confidence=float(
+                    self._cfg_float(
+                        proposal.get("confidence", 0.0), 0.0, lo=0.0, hi=1.0
+                    )
+                ),
+                state_conflicts_before=int(state_before),
+                state_conflicts_after=int(state_after),
+                changed_frame_count=int(max(1, edit_e - edit_s + 1)),
+                changed_span_count=2,
+                removed_boundary_count=int(
+                    proposal.get("removed_boundary_count", 0) or 0
+                ),
+            )
+            self._rebuild_timeline_sources()
+            try:
+                self._log(
+                    "scribble_accept_merge_split",
+                    start_frame=int(edit_s),
+                    end_frame=int(edit_e),
+                    boundary_frame=int(split_frame),
+                    left_label=str(left_label),
+                    right_label=str(right_label),
+                    removed_boundary_count=int(
+                        proposal.get("removed_boundary_count", 0) or 0
+                    ),
+                    descriptor=str(descriptor.get("kind") or "store"),
+                )
+            except Exception:
+                pass
+            query_utility = observed_query_utility_from_summary(summary)
+            accepted = self._finalize_accepted_boundary_suggestion(
+                proposal,
+                frame_i=int(split_frame),
+                left_label=str(left_label),
+                right_label=str(right_label),
+                changed=True,
+                status_text=(
+                    f"Merged F{edit_s}-F{edit_e} into two segments with a final split at F{split_frame}: {left_label} | {right_label}."
+                ),
+                interaction_status=f"Boundary merge+split accepted at F{split_frame}",
+                record_feedback=True,
+            )
+            self._queue_adaptation_sample_from_boundary_accept(
+                proposal,
+                frame_i=int(split_frame),
+                left_label=str(left_label),
+                right_label=str(right_label),
+                query_utility=float(query_utility),
+            )
+            if descriptor:
+                accept_rec = self._build_accept_record_for_point(
+                    {
+                        "type": "boundary",
+                        "frame": int(split_frame),
+                        "left": {"label": str(left_label)},
+                        "right": {"label": str(right_label)},
+                        "segment_start": int(edit_s),
+                        "segment_end": int(edit_e),
+                    },
+                    boundary_frame=int(split_frame),
+                )
+                if accept_rec is not None:
+                    self._store_explicit_confirm_record(accept_rec)
+            self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
+            return accepted
+        if proposal_action == "remove_segment":
+            _ds = proposal.get("window_start")
+            delete_s = int(_ds if _ds is not None else frame_i)
+            _de = proposal.get("window_end")
+            delete_e = int(_de if _de is not None else frame_i)
+            if delete_e < delete_s:
+                delete_s, delete_e = delete_e, delete_s
+            mid_frame = int(round((int(delete_s) + int(delete_e)) / 2.0))
+            segment_label = str(proposal.get("segment_label", "") or "").strip()
+            segment_ctx = self._segment_context_at_frame(
+                descriptor,
+                frame_i=int(mid_frame),
+            )
+            if segment_ctx is not None:
+                ctx_label = str(segment_ctx.get("label", "") or "").strip()
+                if ctx_label:
+                    segment_label = str(segment_label or ctx_label)
+                _cs = segment_ctx.get("start")
+                _ce = segment_ctx.get("end")
+                ctx_s = int(_cs if _cs is not None else delete_s)
+                ctx_e = int(_ce if _ce is not None else delete_e)
+                if ctx_s <= int(mid_frame) <= ctx_e:
+                    delete_s = ctx_s
+                    delete_e = ctx_e
+            if not segment_label or not self._store_range_matches_label(
+                st, segment_label, int(delete_s), int(delete_e)
+            ):
+                self._discard_correction_session("scribble_remove_segment_missing_match")
+                self._set_status(
+                    "The current delete gesture no longer matches a single action segment. Redraw directly on the segment you want to delete."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            state_before = self._count_state_conflicts_in_span(view_start, view_end)
+            deltas = self._remove_segment_with_deltas(
+                st, str(segment_label), int(delete_s), int(delete_e)
+            )
+            if not deltas:
+                self._discard_correction_session("scribble_remove_segment_no_change")
+                self._set_status(
+                    "Deleting this segment produced no change. Redraw the delete gesture directly on top of the target segment."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            cut_ops: List[Dict[str, Any]] = []
+            for cut in sorted(
+                int(c)
+                for c in (cuts or set())
+                if c is not None and int(delete_s) <= int(c) <= int(delete_e) + 1
+            ):
+                cuts.discard(int(cut))
+                cut_ops.append(
+                    {
+                        "view_idx": int(self.active_view_idx),
+                        "descriptor": dict(descriptor),
+                        "frame": int(cut),
+                        "op": "remove",
+                    }
+                )
+            # User explicitly accepted segment deletion — clear stale
+            # lock records for boundaries inside the deleted span.
+            self._clear_boundary_lock_records_in_span(
+                int(delete_s), int(delete_e) + 1,
+            )
+            try:
+                self._purge_accept_artifacts_in_span(
+                    start=int(delete_s), end=int(delete_e)
+                )
+            except Exception:
+                pass
+            history_meta = {
+                "action": "scribble_remove_segment",
+                "start": int(delete_s),
+                "end": int(delete_e),
+                "label": str(segment_label),
+            }
+            if cut_ops:
+                self._push_undo_composite(
+                    [(st, list(deltas))],
+                    cut_ops,
+                    meta=history_meta,
+                )
+            else:
+                self._push_undo_entry(st, list(deltas))
+            self._redo_stack.clear()
+            self._psr_mark_dirty()
+            try:
+                self._psr_recompute_cache()
+            except Exception:
+                pass
+            state_after = self._count_state_conflicts_in_span(view_start, view_end)
+            self._dirty = True
+            try:
+                view["dirty"] = True
+            except Exception:
+                pass
+            self._note_correction_step()
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
+                point_type="boundary_remove_segment_accept",
+                feedback_start=int(delete_s),
+                feedback_end=int(delete_e),
+                boundary_frame=int(mid_frame),
+                label=str(segment_label),
+                mode="remove_segment",
+                raw_confidence=float(
+                    self._cfg_float(
+                        proposal.get("raw_confidence", proposal.get("confidence", 0.0)),
+                        0.0,
+                        lo=0.0,
+                        hi=1.0,
+                    )
+                ),
+                calibrated_confidence=float(
+                    self._cfg_float(proposal.get("confidence", 0.0), 0.0, lo=0.0, hi=1.0)
+                ),
+                state_conflicts_before=int(state_before),
+                state_conflicts_after=int(state_after),
+                changed_frame_count=int(max(1, delete_e - delete_s + 1)),
+                changed_span_count=1,
+            )
+            self._rebuild_timeline_sources()
+            try:
+                self._log(
+                    "scribble_accept_remove_segment",
+                    start_frame=int(delete_s),
+                    end_frame=int(delete_e),
+                    label=str(segment_label),
+                    removed_cut_count=int(len(cut_ops)),
+                    descriptor=str(descriptor.get("kind") or "store"),
+                )
+            except Exception:
+                pass
+            query_utility = observed_query_utility_from_summary(summary)
+            accepted = self._finalize_accepted_boundary_suggestion(
+                proposal,
+                frame_i=int(mid_frame),
+                left_label="",
+                right_label="",
+                changed=True,
+                status_text=(
+                    f"Deleted segment F{delete_s}-F{delete_e} ({segment_label})."
+                ),
+                interaction_status=f"Boundary Scribble: segment deleted F{delete_s}-F{delete_e}",
+                record_feedback=True,
+                archive_marker=False,
+            )
+            self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
+            return accepted
+        if proposal_action == "remove_boundaries":
+            _rws = proposal.get("window_start")
+            _rwe = proposal.get("window_end")
+            merge_ctx = self._boundary_removal_span_context(
+                descriptor,
+                start_frame=int(_rws if _rws is not None else frame_i),
+                end_frame=int(_rwe if _rwe is not None else frame_i),
+            )
+            if not merge_ctx:
+                self._discard_correction_session("scribble_remove_span_missing_boundaries")
+                self._set_status(
+                    "No removable boundary span is covered by this scribble. Draw across the existing segments you want to merge."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            _ms = merge_ctx.get("start")
+            merge_s = int(_ms if _ms is not None else frame_i)
+            _me = merge_ctx.get("end")
+            merge_e = int(_me if _me is not None else frame_i)
+            if merge_e < merge_s:
+                merge_s, merge_e = merge_e, merge_s
+            merge_label = self._resolve_remove_boundaries_label(proposal, merge_ctx)
+            if not merge_label:
+                self._discard_correction_session("scribble_remove_span_missing_label")
+                self._set_status(
+                    "No reliable merged label is available for this span yet. Click the merged span and choose a label on the left panel first."
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            self._ensure_label_defs_for_names([merge_label])
+            target_frame = int(round((int(merge_s) + int(merge_e)) / 2.0))
+            state_before = self._count_state_conflicts_in_span(view_start, view_end)
+            label_deltas = self._apply_label_range(
+                st, int(merge_s), int(merge_e), str(merge_label)
+            )
+            cut_ops = self._ensure_trim_cuts_for_span_bounds(
+                int(self.active_view_idx),
+                descriptor,
+                cuts,
+                int(merge_s),
+                int(merge_e),
+            )
+            # Cascade guard (remove_boundaries path): if the merged span now has
+            # the same label as its outside neighbors, register protective
+            # confirmed-accept records so _sweep_stale_trim_cuts cannot silently
+            # purge the span-edge cuts on the next read.
+            try:
+                _merge_key_plural = self._normalized_label_key(str(merge_label))
+                if int(merge_s) > 0:
+                    _ol = st.label_at(int(merge_s) - 1)
+                    _oln = (
+                        self._resolve_action_label_name(_ol)
+                        if _ol is not None else ""
+                    )
+                    if (
+                        _oln
+                        and self._normalized_label_key(str(_oln))
+                        == _merge_key_plural
+                    ):
+                        self._set_auto_preserved_cut(view, descriptor, int(merge_s), True)
+                _re = int(merge_e) + 1
+                _fc = max(1, self._get_frame_count())
+                if 0 < _re < int(_fc):
+                    _or = st.label_at(int(_re))
+                    _orn = (
+                        self._resolve_action_label_name(_or)
+                        if _or is not None else ""
+                    )
+                    if (
+                        _orn
+                        and self._normalized_label_key(str(_orn))
+                        == _merge_key_plural
+                    ):
+                        self._set_auto_preserved_cut(view, descriptor, int(_re), True)
+            except Exception:
+                pass
+            cleanup_ops = self._remove_trim_cuts_in_spans(
+                int(self.active_view_idx),
+                descriptor,
+                [(int(merge_s), int(merge_e))],
+                protected_cuts=[int(merge_s), int(merge_e) + 1],
+                respect_confirmed_boundary_locks=True,
+            )
+            if cleanup_ops:
+                cut_ops.extend(list(cleanup_ops))
+            # User explicitly accepted multi-boundary merge — clear stale
+            # lock records for boundaries inside the merged span.
+            self._clear_boundary_lock_records_in_span(
+                int(merge_s) + 1, int(merge_e),
+                keep={int(merge_s), int(merge_e) + 1},
+            )
+            try:
+                self._purge_accept_artifacts_in_span(
+                    start=int(merge_s) + 1, end=int(merge_e) - 1
+                )
+            except Exception:
+                pass
+            if label_deltas and cut_ops:
+                self._push_undo_composite([(st, list(label_deltas))], list(cut_ops))
+                self._redo_stack.clear()
+            elif label_deltas:
+                self._push_undo_entry(st, list(label_deltas))
+                self._redo_stack.clear()
+            elif cut_ops:
+                self._push_undo_item({"kind": "trim_cuts", "ops": list(cut_ops)})
+                self._redo_stack.clear()
+            self._psr_mark_dirty()
+            try:
+                self._psr_recompute_cache()
+            except Exception:
+                pass
+            state_after = self._count_state_conflicts_in_span(view_start, view_end)
+            self._dirty = True
+            try:
+                view["dirty"] = True
+            except Exception:
+                pass
+            self._note_correction_step()
+            summary = self._commit_correction_session(
+                query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
+                point_type="boundary_remove_span_accept",
+                feedback_start=int(merge_s),
+                feedback_end=int(merge_e),
+                boundary_frame=int(target_frame),
+                merged_label=str(merge_label),
+                mode="remove_boundaries",
+                raw_confidence=float(
+                    self._cfg_float(
+                        proposal.get("raw_confidence", proposal.get("confidence", 0.0)),
+                        0.0,
+                        lo=0.0,
+                        hi=1.0,
+                    )
+                ),
+                calibrated_confidence=float(
+                    self._cfg_float(proposal.get("confidence", 0.0), 0.0, lo=0.0, hi=1.0)
+                ),
+                state_conflicts_before=int(state_before),
+                state_conflicts_after=int(state_after),
+                changed_frame_count=int(max(1, merge_e - merge_s + 1)),
+                changed_span_count=1,
+                removed_boundary_count=int(merge_ctx.get("boundary_count", 0) or 0),
+            )
+            self._rebuild_timeline_sources()
+            try:
+                self._log(
+                    "scribble_accept_remove_span",
+                    merge_start=int(merge_s),
+                    merge_end=int(merge_e),
+                    merged_label=str(merge_label),
+                    removed_boundary_count=int(merge_ctx.get("boundary_count", 0) or 0),
+                    descriptor=str(descriptor.get("kind") or "store"),
+                )
+            except Exception:
+                pass
+            accepted = self._finalize_accepted_boundary_suggestion(
+                proposal,
+                frame_i=int(target_frame),
+                left_label=str(merge_label),
+                right_label=str(merge_label),
+                changed=True,
+                status_text=(
+                    f"Removed crossed boundaries in F{merge_s}-F{merge_e} and merged the span as {merge_label}."
+                ),
+                interaction_status=f"Boundary span merged at F{target_frame}",
+                record_feedback=True,
+            )
+            emb = self._segment_embedding_for_span(int(merge_s), int(merge_e))
+            if emb is not None:
+                self._update_label_prototype(str(merge_label), emb)
+            self._save_scribble_sidecar_if_possible()
+            self._maybe_start_background_refiner_training()
+            return accepted
         if proposal_action == "remove_boundary":
+            _boundary_trace("remove_boundary.entry", descriptor=descriptor, cuts_before=sorted(int(c) for c in (cuts or set())))
             remove_ctx = self._remove_boundary_context_for_proposal(descriptor, proposal)
             if not remove_ctx:
                 self._discard_correction_session("scribble_remove_missing_boundary")
@@ -17839,8 +21600,12 @@ class ActionWindow(FrameControlMixin, QWidget):
                 )
                 self._update_scribble_proposal_ui()
                 return False
-            merge_s = int((remove_ctx.get("left_segment") or {}).get("start", frame_i) or frame_i)
-            merge_e = int((remove_ctx.get("right_segment") or {}).get("end", frame_i) or frame_i)
+            _left_seg = remove_ctx.get("left_segment") or {}
+            _right_seg = remove_ctx.get("right_segment") or {}
+            _rms = _left_seg.get("start")
+            merge_s = int(_rms if _rms is not None else frame_i)
+            _rme = _right_seg.get("end")
+            merge_e = int(_rme if _rme is not None else frame_i)
             if merge_e < merge_s:
                 merge_s, merge_e = merge_e, merge_s
             merge_label = self._resolve_remove_boundary_label(proposal, remove_ctx)
@@ -17852,18 +21617,145 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._update_scribble_proposal_ui()
                 return False
             self._ensure_label_defs_for_names([merge_label])
-            target_boundary = int(remove_ctx.get("boundary_frame", frame_i) or frame_i)
+            _tb = remove_ctx.get("boundary_frame")
+            target_boundary = int(_tb if _tb is not None else frame_i)
+            # Only preserve boundaries that are REAL pre-merge transitions
+            # (label change at f, or an existing trim_cut at f). Stale ACC
+            # records from prior sessions may sit at positions where both
+            # sides are now the same label — treating those as frozen would
+            # resurrect ghost boundaries after a same-label merge.
+            def _is_real_pre_merge_boundary(f: int) -> bool:
+                fi = int(f)
+                if fi in (cuts or set()):
+                    return True
+                if fi <= 0:
+                    return False
+                try:
+                    lbl_l = st.label_at(fi - 1)
+                    lbl_r = st.label_at(fi)
+                except Exception:
+                    return False
+                nm_l = self._resolve_action_label_name(lbl_l) if lbl_l is not None else ""
+                nm_r = self._resolve_action_label_name(lbl_r) if lbl_r is not None else ""
+                if not nm_l or not nm_r:
+                    return False
+                return self._normalized_label_key(str(nm_l)) != self._normalized_label_key(str(nm_r))
+            frozen_boundaries = {
+                int(cut)
+                for cut in (remove_ctx.get("preserved_boundaries") or [])
+                if cut is not None
+                and int(cut) != int(target_boundary)
+                and _is_real_pre_merge_boundary(int(cut))
+            }
             state_before = self._count_state_conflicts_in_span(view_start, view_end)
             had_cut = bool(target_boundary in (cuts or set()))
+            # Snapshot pre-merge state so cascade guard can tell whether
+            # merge_s / merge_e+1 were real boundaries before the overwrite.
+            _cuts_before_merge = {int(c) for c in (cuts or set())}
+            _pre_left_at_ms = None
+            _pre_inside_at_ms = None
+            _pre_inside_at_me = None
+            _pre_right_at_me_plus1 = None
+            try:
+                if int(merge_s) > 0:
+                    _pre_left_at_ms = st.label_at(int(merge_s) - 1)
+                    _pre_inside_at_ms = st.label_at(int(merge_s))
+                _pme = int(merge_e) + 1
+                if 0 < _pme < int(self._get_frame_count() or 1):
+                    _pre_inside_at_me = st.label_at(int(merge_e))
+                    _pre_right_at_me_plus1 = st.label_at(_pme)
+            except Exception:
+                pass
             if had_cut:
                 cuts.discard(int(target_boundary))
-            self._apply_label_range(st, int(merge_s), int(merge_e), str(merge_label))
-            cleanup_ops = self._cleanup_trim_cuts_for_spans(
-                int(self.active_view_idx),
-                descriptor,
-                [(int(merge_s), int(merge_e))],
+            label_deltas = self._apply_label_range(
+                st, int(merge_s), int(merge_e), str(merge_label)
             )
             cut_ops: List[Dict[str, Any]] = []
+            frame_count = max(1, self._get_frame_count())
+            # Cascade guard: if the merge makes merge_s or merge_e+1 same-label
+            # with the outside neighbor, upgrade that previously label-only
+            # boundary to an explicit trim_cut so removing target_boundary does
+            # not silently collapse a non-target boundary.
+            try:
+                merge_key = self._normalized_label_key(str(merge_label))
+                def _pre_key(lbl):
+                    nm = self._resolve_action_label_name(lbl) if lbl is not None else ""
+                    return self._normalized_label_key(str(nm)) if nm else ""
+                _ms_was_real_boundary = (
+                    int(merge_s) in _cuts_before_merge
+                    or (
+                        _pre_left_at_ms is not None
+                        and _pre_inside_at_ms is not None
+                        and _pre_key(_pre_left_at_ms) != _pre_key(_pre_inside_at_ms)
+                    )
+                )
+                if int(merge_s) > 0 and _ms_was_real_boundary:
+                    _outside_left = st.label_at(int(merge_s) - 1)
+                    _outside_left_name = (
+                        self._resolve_action_label_name(_outside_left)
+                        if _outside_left is not None
+                        else ""
+                    )
+                    if (
+                        _outside_left_name
+                        and self._normalized_label_key(str(_outside_left_name))
+                        == merge_key
+                    ):
+                        frozen_boundaries.add(int(merge_s))
+                        self._set_auto_preserved_cut(view, descriptor, int(merge_s), True)
+                _me_was_real_boundary = (
+                    int(merge_e) + 1 in _cuts_before_merge
+                    or (
+                        _pre_inside_at_me is not None
+                        and _pre_right_at_me_plus1 is not None
+                        and _pre_key(_pre_inside_at_me) != _pre_key(_pre_right_at_me_plus1)
+                    )
+                )
+                _right_edge = int(merge_e) + 1
+                if 0 < _right_edge < int(frame_count) and _me_was_real_boundary:
+                    _outside_right = st.label_at(int(_right_edge))
+                    _outside_right_name = (
+                        self._resolve_action_label_name(_outside_right)
+                        if _outside_right is not None
+                        else ""
+                    )
+                    if (
+                        _outside_right_name
+                        and self._normalized_label_key(str(_outside_right_name))
+                        == merge_key
+                    ):
+                        frozen_boundaries.add(int(_right_edge))
+                        self._set_auto_preserved_cut(view, descriptor, int(_right_edge), True)
+            except Exception:
+                pass
+            for cut in sorted(int(c) for c in frozen_boundaries):
+                if int(cut) <= 0 or int(cut) >= int(frame_count):
+                    continue
+                if int(cut) in (cuts or set()):
+                    continue
+                cuts.add(int(cut))
+                cut_ops.append(
+                    {
+                        "view_idx": int(self.active_view_idx),
+                        "descriptor": dict(descriptor),
+                        "frame": int(cut),
+                        "op": "add",
+                    }
+                )
+            _boundary_trace("remove_boundary.post_guard", target=int(target_boundary), merge_s=int(merge_s), merge_e=int(merge_e), merge_label=str(merge_label), frozen=sorted(int(c) for c in frozen_boundaries), cuts_after_guard=sorted(int(c) for c in (cuts or set())))
+            cleanup_ops = self._coalesce_same_label_internal_cuts_in_span(
+                int(self.active_view_idx),
+                descriptor,
+                int(merge_s),
+                int(merge_e),
+                preferred_label=str(merge_label),
+                keep_cuts=frozen_boundaries,
+                respect_confirmed_boundary_locks=True,
+            )
+            if cleanup_ops:
+                cut_ops.extend(list(cleanup_ops))
+            _boundary_trace("remove_boundary.post_cleanup", cleanup_ops=cleanup_ops, cuts_after_cleanup=sorted(int(c) for c in (cuts or set())))
             if had_cut:
                 cut_ops.append(
                     {
@@ -17873,9 +21765,48 @@ class ActionWindow(FrameControlMixin, QWidget):
                         "op": "remove",
                     }
                 )
-            if cleanup_ops:
-                cut_ops.extend(list(cleanup_ops))
-            if cut_ops:
+            # User explicitly removed this boundary — clear the old lock
+            # record so it no longer blocks future automatic operations.
+            removed_lock_frames = {
+                int(target_boundary),
+                *(
+                    int(op.get("frame"))
+                    for op in (cleanup_ops or [])
+                    if isinstance(op, dict)
+                    and str(op.get("op") or "") == "remove"
+                    and op.get("frame") is not None
+                ),
+            }
+            for frame in sorted(removed_lock_frames):
+                self._clear_boundary_lock_records_in_span(
+                    int(frame), int(frame),
+                )
+            # Also drop any ACC marker anchored on the boundaries we just
+            # removed so the timeline doesn't keep ghost pills.
+            try:
+                for frame in sorted(removed_lock_frames):
+                    self._purge_accept_artifacts_in_span(
+                        start=int(frame), end=int(frame)
+                    )
+            except Exception:
+                pass
+            residual_ops = self._cleanup_trim_cuts_for_spans(
+                int(self.active_view_idx),
+                descriptor,
+                [(int(merge_s), int(merge_e))],
+                protected_cuts=frozen_boundaries,
+                respect_confirmed_boundary_locks=True,
+                allow_same_label_auto_merge=True,
+            )
+            if residual_ops:
+                cut_ops.extend(list(residual_ops))
+            if label_deltas and cut_ops:
+                self._push_undo_composite([(st, list(label_deltas))], list(cut_ops))
+                self._redo_stack.clear()
+            elif label_deltas:
+                self._push_undo_entry(st, list(label_deltas))
+                self._redo_stack.clear()
+            elif cut_ops:
                 self._push_undo_item({"kind": "trim_cuts", "ops": cut_ops})
                 self._redo_stack.clear()
             self._psr_mark_dirty()
@@ -17964,34 +21895,56 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._update_scribble_proposal_ui()
             return False
         self._ensure_label_defs_for_names([left_label, right_label])
+        cut_ops: List[Dict[str, Any]] = []
+        label_deltas: List[Tuple] = []
 
         if bootstrap_blank:
             fill_label = str(left_label or right_label or "").strip()
             state_before = self._count_state_conflicts_in_span(view_start, view_end)
             if frame_i not in cuts and frame_i > int(seg_s) and frame_i <= int(seg_e):
+                if not self._split_respects_min_action_segment_frames(
+                    int(seg_s), int(seg_e), int(frame_i)
+                ):
+                    self._discard_correction_session(
+                        "scribble_blank_split_below_min_segment_len"
+                    )
+                    self._set_status(
+                        self._split_too_short_message(
+                            int(seg_s), int(seg_e), int(frame_i)
+                        )
+                    )
+                    self._update_scribble_proposal_ui()
+                    return False
                 cuts.add(frame_i)
-                self._push_undo_item(
+                self._set_auto_preserved_cut(view, descriptor, int(frame_i), True)
+                cut_ops.append(
                     {
-                        "kind": "trim_cuts",
-                        "ops": [
-                            {
-                                "view_idx": int(self.active_view_idx),
-                                "descriptor": dict(descriptor),
-                                "frame": int(frame_i),
-                                "op": "add",
-                            }
-                        ],
+                        "view_idx": int(self.active_view_idx),
+                        "descriptor": dict(descriptor),
+                        "frame": int(frame_i),
+                        "op": "add",
                     }
                 )
-                self._redo_stack.clear()
                 changed = True
                 trim_mode = "split_blank"
             else:
                 trim_mode = "label_blank"
             changed_spans: List[Tuple[int, int]] = []
+            right_fill_label = str(right_label or left_label or "").strip()
             if int(seg_s) <= int(frame_i) - 1 and fill_label:
-                self._apply_label_range(st, int(seg_s), int(frame_i) - 1, str(fill_label))
+                label_deltas.extend(
+                    self._apply_label_range(
+                        st, int(seg_s), int(frame_i) - 1, str(fill_label)
+                    )
+                )
                 changed_spans.append((int(seg_s), int(frame_i) - 1))
+            if int(frame_i) <= int(seg_e) and right_fill_label:
+                label_deltas.extend(
+                    self._apply_label_range(
+                        st, int(frame_i), int(seg_e), str(right_fill_label)
+                    )
+                )
+                changed_spans.append((int(frame_i), int(seg_e)))
             changed_spans = self._merge_spans(changed_spans)
             changed_frame_count = int(
                 sum(max(0, int(e) - int(s) + 1) for s, e in changed_spans)
@@ -18006,49 +21959,73 @@ class ActionWindow(FrameControlMixin, QWidget):
                 pass
             state_after = self._count_state_conflicts_in_span(view_start, view_end)
             applied_left = str(fill_label) if int(seg_s) <= int(frame_i) - 1 else ""
-            applied_right = ""
+            applied_right = str(right_fill_label) if int(frame_i) <= int(seg_e) else ""
             changed = bool(changed or changed_spans)
         else:
-            if frame_i not in cuts and frame_i > int(seg_s) and frame_i <= int(seg_e):
+            needs_new_cut = self._boundary_would_add_new_cut(
+                int(seg_s),
+                int(seg_e),
+                int(frame_i),
+                cuts,
+            )
+            if needs_new_cut and not self._split_respects_min_action_segment_frames(
+                int(seg_s), int(seg_e), int(frame_i)
+            ):
+                self._discard_correction_session(
+                    "scribble_split_below_min_segment_len"
+                )
+                self._set_status(
+                    self._split_too_short_message(
+                        int(seg_s), int(seg_e), int(frame_i)
+                    )
+                )
+                self._update_scribble_proposal_ui()
+                return False
+            effective_left_label = str(left_label)
+            effective_right_label = str(right_label)
+            if needs_new_cut:
                 cuts.add(frame_i)
-                self._push_undo_item(
+                self._set_auto_preserved_cut(view, descriptor, int(frame_i), True)
+                cut_ops.append(
                     {
-                        "kind": "trim_cuts",
-                        "ops": [
-                            {
-                                "view_idx": int(self.active_view_idx),
-                                "descriptor": dict(descriptor),
-                                "frame": int(frame_i),
-                                "op": "add",
-                            }
-                        ],
+                        "view_idx": int(self.active_view_idx),
+                        "descriptor": dict(descriptor),
+                        "frame": int(frame_i),
+                        "op": "add",
                     }
                 )
-                self._redo_stack.clear()
                 try:
                     view["dirty"] = True
                 except Exception:
                     pass
                 changed = True
                 trim_mode = "split"
+            current_labels = {
+                int(frame): str(label)
+                for frame, label in dict(getattr(st, "frame_to_label", {}) or {}).items()
+                if int(view_start) <= int(frame) <= int(view_end) and str(label or "").strip()
+            }
             confirmed = ConfirmedWindow(
                 start_frame=int(seg_s),
                 end_frame=int(seg_e),
                 boundary_frame=int(frame_i),
-                left_label=str(left_label),
-                right_label=str(right_label),
+                left_label=str(effective_left_label),
+                right_label=str(effective_right_label),
                 hard=True,
                 meta={
                     "descriptor": str(descriptor.get("kind") or "store"),
                     "view_idx": int(self.active_view_idx),
                 },
             )
-            current_labels = {
-                int(frame): str(label)
-                for frame, label in dict(getattr(st, "frame_to_label", {}) or {}).items()
-                if int(view_start) <= int(frame) <= int(view_end) and str(label or "").strip()
-            }
-            anchor_before = count_anchor_violations(current_labels, [confirmed])
+            decode_windows = list(self._confirmed_boundary_lock_windows_for_decode())
+            decode_windows.extend(
+                self._confirmed_label_lock_windows_for_decode(
+                    exclude_start=int(seg_s),
+                    exclude_end=int(seg_e),
+                )
+            )
+            decode_windows.append(confirmed)
+            anchor_before = count_anchor_violations(current_labels, decode_windows)
             state_before = self._count_state_conflicts_in_span(view_start, view_end)
             decode_cfg = self._structured_decode_cfg()
             soft_constraints = self._build_soft_constraints_for_decode(
@@ -18056,39 +22033,54 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
             decoded, decode_diag = decode_frame_labels_with_constraints(
                 current_labels,
-                [confirmed],
+                decode_windows,
                 soft_constraints,
                 label_vocabulary=self._decode_label_vocabulary(
                     view,
                     descriptor,
                     view_start,
                     view_end,
-                    left_label,
-                    right_label,
+                    effective_left_label,
+                    effective_right_label,
                 ),
                 frame_start=int(view_start),
                 frame_end=int(view_end),
                 transition_penalty=self._cfg_float(
-                    decode_cfg.get("transition_penalty", 0.55), 0.55, lo=0.0, hi=3.0
+                    decode_cfg.get("transition_penalty", 0.55),
+                    0.55,
+                    lo=0.0,
+                    hi=3.0,
                 ),
                 stay_bonus=self._cfg_float(
-                    decode_cfg.get("stay_bonus", 0.05), 0.05, lo=0.0, hi=1.0
+                    decode_cfg.get("stay_bonus", 0.05),
+                    0.05,
+                    lo=0.0,
+                    hi=1.0,
                 ),
                 current_label_score=self._cfg_float(
-                    decode_cfg.get("current_label_score", 1.0), 1.0, lo=0.1, hi=4.0
+                    decode_cfg.get("current_label_score", 1.0),
+                    1.0,
+                    lo=0.1,
+                    hi=4.0,
                 ),
                 alternate_label_score=self._cfg_float(
-                    decode_cfg.get("alternate_label_score", 0.16), 0.16, lo=0.0, hi=2.0
+                    decode_cfg.get("alternate_label_score", 0.16),
+                    0.16,
+                    lo=0.0,
+                    hi=2.0,
                 ),
                 anchor_boost=self._cfg_float(
-                    decode_cfg.get("anchor_boost", 0.55), 0.55, lo=0.0, hi=2.0
+                    decode_cfg.get("anchor_boost", 0.55),
+                    0.55,
+                    lo=0.0,
+                    hi=2.0,
                 ),
             )
             anchor_after = int(decode_diag.get("hard_violations_after", 0) or 0)
             changed_spans = list(decode_diag.get("changed_spans") or [])
             changed_frame_count = int(decode_diag.get("changed_frame_count", 0) or 0)
             if changed_spans:
-                self._apply_decoded_labels_to_store(
+                decoded_label_deltas, decoded_cut_ops = self._apply_decoded_labels_to_store(
                     st,
                     view,
                     descriptor,
@@ -18096,7 +22088,12 @@ class ActionWindow(FrameControlMixin, QWidget):
                     changed_spans,
                     protected_boundary=int(frame_i),
                 )
-                changed = True
+                if decoded_label_deltas:
+                    label_deltas.extend(list(decoded_label_deltas))
+                if decoded_cut_ops:
+                    cut_ops.extend(list(decoded_cut_ops))
+                if decoded_label_deltas or decoded_cut_ops:
+                    changed = True
 
             self._psr_mark_dirty()
             try:
@@ -18106,12 +22103,18 @@ class ActionWindow(FrameControlMixin, QWidget):
             state_after = self._count_state_conflicts_in_span(view_start, view_end)
 
             applied_left = (
-                str(decoded.get(int(frame_i - 1), left_label) or left_label)
+                str(
+                    decoded.get(int(frame_i - 1), effective_left_label)
+                    or effective_left_label
+                )
                 if int(seg_s) <= int(frame_i - 1)
                 else ""
             )
             applied_right = (
-                str(decoded.get(int(max(seg_s, frame_i)), right_label) or right_label)
+                str(
+                    decoded.get(int(max(seg_s, frame_i)), effective_right_label)
+                    or effective_right_label
+                )
                 if int(frame_i) <= int(seg_e)
                 else ""
             )
@@ -18143,13 +22146,15 @@ class ActionWindow(FrameControlMixin, QWidget):
                     right_label=str(right_txt),
                     query_utility=float(query_utility),
                 )
-                if str(descriptor.get("kind") or "store") == "store":
+                if descriptor:
                     accept_rec = self._build_accept_record_for_point(
                         {
                             "type": "boundary",
                             "frame": int(frame_i),
                             "left": {"label": str(left_txt)},
                             "right": {"label": str(right_txt)},
+                            "segment_start": int(seg_s),
+                            "segment_end": int(seg_e),
                         },
                         boundary_frame=int(frame_i),
                     )
@@ -18186,6 +22191,33 @@ class ActionWindow(FrameControlMixin, QWidget):
             return False
 
         self._dirty = True
+        _scribble_session_for_undo = str(
+            proposal.get("session_id")
+            or getattr(self, "_active_scribble_session_id", "")
+            or ""
+        ).strip()
+        _undo_meta = (
+            {"scribble_session_id": _scribble_session_for_undo}
+            if _scribble_session_for_undo
+            else None
+        )
+        if label_deltas and cut_ops:
+            self._push_undo_composite(
+                [(st, list(label_deltas))], list(cut_ops), meta=_undo_meta
+            )
+            self._redo_stack.clear()
+        elif label_deltas:
+            if _undo_meta:
+                self._push_undo_batch([(st, list(label_deltas))], meta=_undo_meta)
+            else:
+                self._push_undo_entry(st, list(label_deltas))
+            self._redo_stack.clear()
+        elif cut_ops:
+            trim_item: Dict[str, Any] = {"kind": "trim_cuts", "ops": list(cut_ops)}
+            if _undo_meta:
+                trim_item["meta"] = dict(_undo_meta)
+            self._push_undo_item(trim_item)
+            self._redo_stack.clear()
         try:
             view["dirty"] = True
         except Exception:
@@ -18197,6 +22229,30 @@ class ActionWindow(FrameControlMixin, QWidget):
             reason="accepted",
             changed=True,
         )
+        # Store the accept record BEFORE committing — the commit triggers a
+        # timeline rebuild that sweeps "orphan" trim cuts (same label on both
+        # sides with no protecting record). Without the record in place first,
+        # an Accept Boundary between same-label segments gets its cut erased.
+        if descriptor:
+            _pre_left_txt = applied_left or str(left_label or seg_label or "?")
+            _pre_right_txt = (
+                ""
+                if bootstrap_blank
+                else (applied_right or str(right_label or seg_label or "?"))
+            )
+            _pre_accept_rec = self._build_accept_record_for_point(
+                {
+                    "type": "boundary",
+                    "frame": int(frame_i),
+                    "left": {"label": str(_pre_left_txt)},
+                    "right": {"label": str(_pre_right_txt)},
+                    "segment_start": int(seg_s),
+                    "segment_end": int(seg_e),
+                },
+                boundary_frame=int(frame_i),
+            )
+            if _pre_accept_rec is not None:
+                self._store_explicit_confirm_record(_pre_accept_rec)
         summary = self._commit_correction_session(
             query_type=str(QueryType.BOUNDARY_SCRIBBLE.value),
             point_type="boundary_scribble_accept",
@@ -18266,18 +22322,6 @@ class ActionWindow(FrameControlMixin, QWidget):
             right_label=str(right_txt),
             query_utility=query_utility,
         )
-        if str(descriptor.get("kind") or "store") == "store":
-            accept_rec = self._build_accept_record_for_point(
-                {
-                    "type": "boundary",
-                    "frame": int(frame_i),
-                    "left": {"label": str(left_txt)},
-                    "right": {"label": str(right_txt)},
-                },
-                boundary_frame=int(frame_i),
-            )
-            if accept_rec is not None:
-                self._store_explicit_confirm_record(accept_rec)
         accepted = self._finalize_accepted_boundary_suggestion(
             proposal,
             frame_i=int(frame_i),
@@ -18349,9 +22393,11 @@ class ActionWindow(FrameControlMixin, QWidget):
         data = dict(payload) if isinstance(payload, dict) else {}
         meta = dict(data.get("meta") or {})
         kind = resolve_scribble_kind(data.get("kind", fallback_kind))
+        raw_start = data.get("start_frame")
+        raw_end = data.get("end_frame")
         return TemporalScribble(
-            start_frame=int(data.get("start_frame", fallback_start) or fallback_start),
-            end_frame=int(data.get("end_frame", fallback_end) or fallback_end),
+            start_frame=int(raw_start if raw_start is not None else fallback_start),
+            end_frame=int(raw_end if raw_end is not None else fallback_end),
             kind=kind,
             view_id=str(
                 self.views[self.active_view_idx].get("name", "")
@@ -18447,6 +22493,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 value = str(proposal.get(key, "") or "").strip()
                 if value:
                     marker_meta[key] = value
+            segment_label = str(proposal.get("segment_label", "") or "").strip()
+            if segment_label:
+                marker_meta["segment_label"] = segment_label
             try:
                 marker_meta["confidence"] = float(proposal.get("confidence", 0.0) or 0.0)
             except Exception:
@@ -18460,6 +22509,64 @@ class ActionWindow(FrameControlMixin, QWidget):
             view_id=str(primary.view_id or ""),
             meta=marker_meta,
         )
+
+    def _rollback_undo_items_for_session(self, session_id: str) -> bool:
+        session_key = str(session_id or "").strip()
+        if not session_key:
+            return False
+        stack = getattr(self, "_undo_stack", None) or []
+        matched_indices: List[int] = []
+        for idx, item in enumerate(stack):
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else None
+            if not meta:
+                continue
+            if str(meta.get("scribble_session_id") or "").strip() == session_key:
+                matched_indices.append(idx)
+        if not matched_indices:
+            return False
+        removed_any = False
+        for idx in reversed(matched_indices):
+            item = stack.pop(idx)
+            try:
+                self._apply_history_item(item, reverse=True)
+                removed_any = True
+            except Exception:
+                pass
+        if removed_any:
+            self._dirty = True
+            try:
+                self._rebuild_timeline_sources()
+            except Exception:
+                pass
+            try:
+                self._apply_sync_edit_masks()
+            except Exception:
+                pass
+        return removed_any
+
+    def _remove_scribble_marker_by_session(self, session_id: str) -> bool:
+        session_key = str(session_id or "").strip()
+        if not session_key:
+            return False
+        items = list(getattr(self._scribble_items, "items", []) or [])
+        kept: List[TemporalScribble] = []
+        removed = False
+        for item in items:
+            meta = dict(getattr(item, "meta", {}) or {})
+            if str(meta.get("session_id") or "").strip() == session_key:
+                removed = True
+                continue
+            kept.append(item)
+        if removed:
+            self._scribble_items.items = kept
+            self._store_active_view_scribble_state()
+            try:
+                self._sync_timeline_scribble_items()
+            except Exception:
+                pass
+        return removed
 
     def _replace_scribble_session_with_marker(
         self,
@@ -18486,6 +22593,66 @@ class ActionWindow(FrameControlMixin, QWidget):
             kept.append(marker)
         self._scribble_items.items = kept
         return marker
+
+    def _proposal_from_reopened_marker(
+        self,
+        marker_item: TemporalScribble,
+        marker_meta: Dict[str, Any],
+        *,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            start_i = int(getattr(marker_item, "start_frame", 0))
+            end_i = int(getattr(marker_item, "end_frame", start_i))
+        except Exception:
+            return None
+        if end_i < start_i:
+            start_i, end_i = end_i, start_i
+        boundary_hint = marker_meta.get("boundary_frame")
+        try:
+            boundary_i = (
+                int(boundary_hint)
+                if boundary_hint is not None
+                else int(round((int(start_i) + int(end_i)) / 2.0))
+            )
+        except Exception:
+            boundary_i = int(round((int(start_i) + int(end_i)) / 2.0))
+        proposal: Dict[str, Any] = {
+            "session_id": str(session_id or ""),
+            "boundary_frame": int(boundary_i),
+            "window_start": int(start_i),
+            "window_end": int(end_i),
+            "scribble_count": 1,
+            "stroke_span": max(1, int(end_i) - int(start_i) + 1),
+            "reopened_from_marker": True,
+        }
+        try:
+            conf = marker_meta.get("confidence", 0.0)
+            proposal["confidence"] = float(conf or 0.0)
+            proposal["raw_confidence"] = float(conf or 0.0)
+        except Exception:
+            proposal["confidence"] = 0.0
+            proposal["raw_confidence"] = 0.0
+        for key in (
+            "proposal_action",
+            "merged_label",
+            "segment_label",
+            "left_label",
+            "right_label",
+        ):
+            value = str(marker_meta.get(key, "") or "").strip()
+            if value:
+                proposal[key] = value
+        if not str(proposal.get("proposal_action", "") or "").strip():
+            proposal["proposal_action"] = (
+                "refine_boundary"
+                if bool(marker_meta.get("accepted", False))
+                else "new_boundary"
+            )
+        # Do not restore the old exact target lock here. After reopen, the user
+        # should be able to drag the proposal onto a nearby boundary instead of
+        # being pinned to the original accepted/rejected frame.
+        return proposal
 
     def _on_timeline_scribble_edited_payload(self, payload: object) -> None:
         if not self._scribble_interaction_active() or self._is_psr_task():
@@ -18618,7 +22785,40 @@ class ActionWindow(FrameControlMixin, QWidget):
             left_label = str(result.get("left_label", "") or "") or "?"
             right_label = str(result.get("right_label", "") or "") or "?"
             episode_size = int(result.get("scribble_count", len(active_items)) or 0)
-            if str(result.get("proposal_action") or "") == "remove_boundary":
+            proposal_action = str(result.get("proposal_action") or "").strip()
+            if proposal_action == "merge_then_split":
+                _v = result.get("window_start")
+                merge_s = int(_v if _v is not None else boundary_frame)
+                _v = result.get("window_end")
+                merge_e = int(_v if _v is not None else boundary_frame)
+                if merge_e < merge_s:
+                    merge_s, merge_e = merge_e, merge_s
+                self._set_status(
+                    f"Scribble episode x{episode_size} -> merge F{merge_s}-F{merge_e} and keep split at {boundary_frame} (conf {conf:.2f}), {left_label} | {right_label}"
+                )
+            elif proposal_action == "remove_segment":
+                _v = result.get("window_start")
+                seg_s = int(_v if _v is not None else boundary_frame)
+                _v = result.get("window_end")
+                seg_e = int(_v if _v is not None else boundary_frame)
+                if seg_e < seg_s:
+                    seg_s, seg_e = seg_e, seg_s
+                seg_label = str(result.get("segment_label", "") or "?")
+                self._set_status(
+                    f"Scribble episode x{episode_size} -> delete segment F{seg_s}-F{seg_e} ({seg_label}) (conf {conf:.2f})"
+                )
+            elif proposal_action == "remove_boundaries":
+                _v = result.get("window_start")
+                merge_s = int(_v if _v is not None else boundary_frame)
+                _v = result.get("window_end")
+                merge_e = int(_v if _v is not None else boundary_frame)
+                if merge_e < merge_s:
+                    merge_s, merge_e = merge_e, merge_s
+                merged_label = str(result.get("merged_label", "") or left_label or "?")
+                self._set_status(
+                    f"Scribble episode x{episode_size} -> remove crossed boundaries in F{merge_s}-F{merge_e} (conf {conf:.2f}), merge as {merged_label}"
+                )
+            elif proposal_action == "remove_boundary":
                 merged_label = str(result.get("merged_label", "") or left_label or "?")
                 self._set_status(
                     f"Scribble episode x{episode_size} -> remove boundary {boundary_frame} (conf {conf:.2f}), merge as {merged_label}"
@@ -18627,9 +22827,22 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._set_status(
                     f"Scribble episode x{episode_size} -> boundary {boundary_frame} (conf {conf:.2f}), {left_label} | {right_label}"
                 )
-            self._set_interaction_status(
-                f"Boundary Scribble: refine -> F{boundary_frame}"
-            )
+            if proposal_action == "merge_then_split":
+                self._set_interaction_status(
+                    f"Boundary Scribble: merge + split near F{boundary_frame}"
+                )
+            elif proposal_action == "remove_segment":
+                self._set_interaction_status(
+                    f"Boundary Scribble: delete segment near F{boundary_frame}"
+                )
+            elif proposal_action == "remove_boundaries":
+                self._set_interaction_status(
+                    f"Boundary Scribble: merge span near F{boundary_frame}"
+                )
+            else:
+                self._set_interaction_status(
+                    f"Boundary Scribble: refine -> F{boundary_frame}"
+                )
         else:
             self._set_status(
                 f"Scribble episode x{len(active_items)} recorded."
@@ -18639,7 +22852,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
 
     def _on_timeline_scribble_activated(self, payload: object) -> None:
-        if not self._scribble_interaction_active() or self._is_psr_task():
+        if self._is_psr_task():
             return
         data = dict(payload) if isinstance(payload, dict) else {}
         target_meta = dict(data.get("meta") or {})
@@ -18710,6 +22923,12 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         self._scribble_items.items = kept
         marker_meta = dict(getattr(marker_item, "meta", {}) or {})
+        if bool(marker_meta.get("accepted", False)):
+            reopen_session = str(
+                marker_meta.get("session_id") or target_session_id or ""
+            ).strip()
+            if reopen_session:
+                self._rollback_undo_items_for_session(reopen_session)
         session_id = str(marker_meta.get("session_id") or target_session_id or "").strip()
         if not session_id:
             session_id = self._next_scribble_session_id()
@@ -18746,57 +22965,64 @@ class ActionWindow(FrameControlMixin, QWidget):
             meta=reopen_meta,
         )
         self._scribble_items.add(reopened)
-        active_items = self._active_scribble_session_items()
-        result = self._run_scribble_local_refiner(list(active_items))
-        result = self._resolve_scribble_proposal_with_fallback(
-            result,
-            list(active_items),
+        result = self._proposal_from_reopened_marker(
+            reopened,
+            marker_meta,
             session_id=str(session_id or ""),
-            reason="reopen_marker",
         )
         if not isinstance(result, dict):
-            boundary_hint = marker_meta.get("boundary_frame")
-            try:
-                boundary_frame = (
-                    int(boundary_hint)
-                    if boundary_hint is not None
-                    else int(
-                        round(
-                            (
-                                int(reopened.start_frame)
-                                + int(reopened.end_frame)
+            active_items = self._active_scribble_session_items()
+            result = self._run_scribble_local_refiner(list(active_items))
+            result = self._resolve_scribble_proposal_with_fallback(
+                result,
+                list(active_items),
+                session_id=str(session_id or ""),
+                reason="reopen_marker",
+            )
+            if not isinstance(result, dict):
+                boundary_hint = marker_meta.get("boundary_frame")
+                try:
+                    boundary_frame = (
+                        int(boundary_hint)
+                        if boundary_hint is not None
+                        else int(
+                            round(
+                                (
+                                    int(reopened.start_frame)
+                                    + int(reopened.end_frame)
+                                )
+                                / 2.0
                             )
-                            / 2.0
                         )
                     )
-                )
-            except Exception:
-                boundary_frame = int(reopened.start_frame)
-            result = {
-                "boundary_frame": int(boundary_frame),
-                "left_label": str(marker_meta.get("left_label", "") or ""),
-                "right_label": str(marker_meta.get("right_label", "") or ""),
-                "confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
-                "raw_confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
-                "scribble_count": int(len(active_items)),
-                "session_id": session_id,
-                "proposal_action": str(marker_meta.get("proposal_action", "") or ""),
-                "merged_label": str(marker_meta.get("merged_label", "") or ""),
-            }
+                except Exception:
+                    boundary_frame = int(reopened.start_frame)
+                result = {
+                    "boundary_frame": int(boundary_frame),
+                    "left_label": str(marker_meta.get("left_label", "") or ""),
+                    "right_label": str(marker_meta.get("right_label", "") or ""),
+                    "confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
+                    "raw_confidence": float(marker_meta.get("confidence", 0.0) or 0.0),
+                    "scribble_count": int(len(active_items)),
+                    "session_id": session_id,
+                    "proposal_action": str(marker_meta.get("proposal_action", "") or ""),
+                    "merged_label": str(marker_meta.get("merged_label", "") or ""),
+                    "segment_label": str(marker_meta.get("segment_label", "") or ""),
+                }
         self._last_scribble_result = result
         self._store_active_view_scribble_state()
         try:
             self._sync_timeline_scribble_items()
         except Exception:
             pass
+        try:
+            if self.interaction_mode != "scribble" and not self.extra_mode:
+                self.enter_scribble_mode()
+        except Exception:
+            pass
         boundary_frame = result.get("boundary_frame") if isinstance(result, dict) else None
-        if boundary_frame is not None:
-            try:
-                self.timeline.set_current_frame(int(boundary_frame), follow=True)
-            except Exception:
-                pass
         self._update_scribble_proposal_ui()
-        self._refresh_query_planner_hint()
+        self._after_manual_query_relevant_edit()
         try:
             self._log(
                 "timeline_scribble_activate",
@@ -18819,14 +23045,14 @@ class ActionWindow(FrameControlMixin, QWidget):
             pass
         if boundary_frame is not None:
             self._set_status(
-                f"Reopened boundary at F{int(boundary_frame)} for local refinement."
+                f"Reopened boundary at F{int(boundary_frame)}. Drag the proposal or use Start Scribble to modify it again."
             )
             self._set_interaction_status(
-                f"Boundary Scribble: reopened F{int(boundary_frame)}"
+                f"Boundary Scribble: reopened for edit F{int(boundary_frame)}"
             )
         else:
-            self._set_status("Reopened archived boundary marker.")
-            self._set_interaction_status("Boundary Scribble: reopened marker")
+            self._set_status("Reopened boundary marker for editing.")
+            self._set_interaction_status("Boundary Scribble: reopened for edit")
 
     def _on_timeline_scribble_removed(self, payload: object) -> None:
         if not self._scribble_interaction_active() or self._is_psr_task():
@@ -18840,14 +23066,16 @@ class ActionWindow(FrameControlMixin, QWidget):
         for item in list(self._scribble_items.items):
             item_meta = dict(getattr(item, "meta", {}) or {})
             item_id = str(item_meta.get("stroke_id") or "").strip()
+            item_session_id = str(item_meta.get("session_id") or "").strip()
             same_id = bool(target_id) and item_id == target_id
+            same_session = bool(target_session_id) and item_session_id == target_session_id
             same_span = (
                 int(getattr(item, "start_frame", -1)) == int(data.get("start_frame", -2))
                 and int(getattr(item, "end_frame", -1)) == int(data.get("end_frame", -2))
                 and str(getattr(getattr(item, "kind", ""), "value", getattr(item, "kind", "")))
                 == str(data.get("kind") or ScribbleKind.UNCERTAIN.value)
             )
-            if removed is None and (same_id or same_span):
+            if removed is None and (same_id or (same_session and same_span)):
                 removed = item
                 continue
             kept.append(item)
@@ -18901,7 +23129,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._update_scribble_proposal_ui()
-        self._refresh_query_planner_hint()
+        self._after_manual_query_relevant_edit()
         try:
             self._log(
                 "timeline_scribble_remove",
@@ -19199,18 +23427,37 @@ class ActionWindow(FrameControlMixin, QWidget):
         self._dirty = True
         return extra
 
-    def _extra_sidecar_path(self) -> Optional[str]:
-        if not self.current_annotation_path:
-            return None
-        base, ext = os.path.splitext(self.current_annotation_path)
-        return f"{base}_extra{ext or '.json'}"
-
-    def _scribble_sidecar_path(self, annotation_path: str = "") -> Optional[str]:
+    def _extra_sidecar_candidates(self, annotation_path: str = "") -> List[str]:
         target = str(annotation_path or self.current_annotation_path or "").strip()
         if not target:
-            return None
+            return []
         base, ext = os.path.splitext(target)
-        return f"{base}_scribble{ext or '.json'}"
+        preferred = f"{base}_extra.json"
+        legacy = f"{base}_extra{ext or '.json'}"
+        out = [preferred]
+        if legacy not in out:
+            out.append(legacy)
+        return out
+
+    def _extra_sidecar_path(self) -> Optional[str]:
+        candidates = self._extra_sidecar_candidates()
+        return candidates[0] if candidates else None
+
+    def _scribble_sidecar_candidates(self, annotation_path: str = "") -> List[str]:
+        target = str(annotation_path or self.current_annotation_path or "").strip()
+        if not target:
+            return []
+        base, ext = os.path.splitext(target)
+        preferred = f"{base}_scribble.json"
+        legacy = f"{base}_scribble{ext or '.json'}"
+        out = [preferred]
+        if legacy not in out:
+            out.append(legacy)
+        return out
+
+    def _scribble_sidecar_path(self, annotation_path: str = "") -> Optional[str]:
+        candidates = self._scribble_sidecar_candidates(annotation_path)
+        return candidates[0] if candidates else None
 
     def _jsonify_data(self, value: Any) -> Any:
         if isinstance(value, dict):
@@ -19266,9 +23513,11 @@ class ActionWindow(FrameControlMixin, QWidget):
             return None
         kind = resolve_scribble_kind(payload.get("kind"))
         try:
+            _sf = payload.get("start_frame")
+            _ef = payload.get("end_frame")
             return TemporalScribble(
-                start_frame=int(payload.get("start_frame", 0) or 0),
-                end_frame=int(payload.get("end_frame", 0) or 0),
+                start_frame=int(_sf if _sf is not None else 0),
+                end_frame=int(_ef if _ef is not None else 0),
                 kind=kind,
                 view_id=str(payload.get("view_id", "") or ""),
                 meta=dict(payload.get("meta") or {}),
@@ -19318,8 +23567,8 @@ class ActionWindow(FrameControlMixin, QWidget):
             candidate = QueryCandidate(
                 query_id=str(cand_payload.get("query_id") or ""),
                 query_type=qtype,
-                start_frame=int(cand_payload.get("start_frame", 0) or 0),
-                end_frame=int(cand_payload.get("end_frame", 0) or 0),
+                start_frame=int(cand_payload.get("start_frame") if cand_payload.get("start_frame") is not None else 0),
+                end_frame=int(cand_payload.get("end_frame") if cand_payload.get("end_frame") is not None else 0),
                 score_terms=dict(cand_payload.get("score_terms") or {}),
                 estimated_cost=float(cand_payload.get("estimated_cost", 1.0) or 1.0),
                 payload=dict(cand_payload.get("payload") or {}),
@@ -19340,30 +23589,28 @@ class ActionWindow(FrameControlMixin, QWidget):
         for item in list(getattr(self._correction_buffer, "history", []) or []):
             if not isinstance(item, dict):
                 continue
-            meta = item.get("meta") or {}
-            meta_view = str(meta.get("view") or "").strip()
-            meta_idx = meta.get("view_idx")
-            if meta_view and meta_view == view_name:
-                correction_history.append(item)
-                continue
-            try:
-                if meta_idx is not None and int(meta_idx) == int(idx):
-                    correction_history.append(item)
-                    continue
-            except Exception:
-                pass
-            if not meta:
-                correction_history.append(item)
+            if self._query_summary_matches_context(
+                item,
+                view_idx=int(idx),
+                view_name=view_name,
+                video_id=str(self.current_video_id or ""),
+                dataset_key=str(self._current_study_planner_dataset_key() or ""),
+            ):
+                correction_history.append(copy.deepcopy(item))
         return {
             "version": 1,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "video_id": str(self.current_video_id or ""),
+            "dataset_key": str(self._current_study_planner_dataset_key() or ""),
             "study_condition": self._current_study_condition(),
+            "participant": self._sanitize_participant_id(
+                getattr(self, "_study_participant_id", "") or ""
+            ),
             "view": {
                 "index": int(idx),
                 "name": view_name,
-                "start": int(view.get("start", 0) or 0),
-                "end": int(view.get("end", view.get("start", 0)) or 0),
+                "start": int(view.get("start") if view.get("start") is not None else 0),
+                "end": int(view.get("end") if view.get("end") is not None else (view.get("start") if view.get("start") is not None else 0)),
                 "path": str(view.get("path", "") or ""),
             },
             "scribble_items": [
@@ -19415,7 +23662,10 @@ class ActionWindow(FrameControlMixin, QWidget):
                 print(f"[SCRIBBLE] Failed to save sidecar: {sidecar} ({ex})")
 
     def _load_scribble_sidecar(self, main_path: str) -> None:
-        path = self._scribble_sidecar_path(main_path)
+        path = next(
+            (cand for cand in self._scribble_sidecar_candidates(main_path) if os.path.isfile(cand)),
+            "",
+        )
         if not path or not os.path.isfile(path):
             return
         try:
@@ -19462,8 +23712,41 @@ class ActionWindow(FrameControlMixin, QWidget):
             ]
         history = data.get("correction_history")
         if isinstance(history, list):
-            self._correction_buffer.history = [dict(item) for item in history if isinstance(item, dict)]
+            sidecar_video_id = str(
+                data.get("video_id", self.current_video_id or "") or ""
+            ).strip()
+            sidecar_dataset_key = str(
+                data.get("dataset_key", self._current_study_planner_dataset_key() or "")
+                or ""
+            ).strip()
+            loaded_history = []
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                row = dict(item)
+                meta = row.get("meta") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                else:
+                    meta = dict(meta)
+                if sidecar_video_id:
+                    meta.setdefault("video_id", sidecar_video_id)
+                if sidecar_dataset_key:
+                    meta.setdefault("dataset_key", sidecar_dataset_key)
+                meta.setdefault("view_idx", int(target_idx))
+                if target_name:
+                    meta.setdefault("view", target_name)
+                row["meta"] = meta
+                loaded_history.append(row)
+            if self._study_planner_cache_enabled():
+                self._correction_buffer.history = self._merge_correction_histories(
+                    getattr(self._correction_buffer, "history", []),
+                    loaded_history,
+                )
+            else:
+                self._correction_buffer.history = loaded_history
             self._rebuild_query_learning_models_from_history()
+            self._refresh_study_planner_history_cache()
         adaptation_payload = data.get("adaptation_buffer")
         if isinstance(adaptation_payload, dict):
             self._sync_adaptation_buffer_limit()
@@ -19518,8 +23801,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             print(f"[EXTRA] Failed to save sidecar: {ex}")
 
     def _load_extra_sidecar(self, main_path: str):
-        base, ext = os.path.splitext(main_path)
-        path = f"{base}_extra{ext or '.json'}"
+        path = next(
+            (cand for cand in self._extra_sidecar_candidates(main_path) if os.path.isfile(cand)),
+            "",
+        )
         if not os.path.isfile(path):
             return
         try:
@@ -19575,15 +23860,33 @@ class ActionWindow(FrameControlMixin, QWidget):
             return EXTRA_LABEL_NAME
         exact = {}
         folded = {}
+        null_base = ""
         for lb in self.labels:
             name = str(getattr(lb, "name", "") or "").strip()
             if not name:
                 continue
             exact.setdefault(name, name)
             folded.setdefault(name.casefold(), name)
+            key = name.casefold()
+            if not null_base and key in ("null", "null 0"):
+                null_base = name
         if text in exact:
             return exact[text]
-        return folded.get(text.casefold(), text)
+        resolved = folded.get(text.casefold())
+        if resolved is not None:
+            return resolved
+        # Canonicalize null variants (Null(Hesitation), Null(Object_Misplacement))
+        # and legacy escape names (Unknown/Other/Background) into the NULL base
+        # so stored segments match a registered LabelDef and render properly.
+        if null_base:
+            lowered = text.casefold()
+            if re.match(r"^\s*null\s*\(", text, re.IGNORECASE) or lowered in {
+                "unknown",
+                "other",
+                "background",
+            }:
+                return null_base
+        return text
 
     def _ensure_label_defs_for_names(self, names: Iterable[Any]) -> None:
         existing = {
@@ -19591,6 +23894,9 @@ class ActionWindow(FrameControlMixin, QWidget):
             for lb in self.labels
             if str(getattr(lb, "name", "") or "").strip()
         }
+        has_null_base = any(
+            key in existing for key in ("null", "null 0", "background")
+        )
         next_id = -1
         for idx, lb in enumerate(self.labels):
             try:
@@ -19604,6 +23910,11 @@ class ActionWindow(FrameControlMixin, QWidget):
                 continue
             key = name.casefold()
             if key in existing:
+                continue
+            if has_null_base and (
+                re.match(r"^\s*null\s*\(", name, re.IGNORECASE)
+                or key in {"unknown", "other", "background"}
+            ):
                 continue
             next_id += 1
             self.labels.append(
@@ -19624,6 +23935,54 @@ class ActionWindow(FrameControlMixin, QWidget):
     @staticmethod
     def _normalized_label_key(name: Any) -> str:
         return str(name or "").strip().casefold()
+
+    @staticmethod
+    def _is_placeholder_action_label(name: Any) -> bool:
+        txt = str(name or "").strip()
+        if not txt:
+            return False
+        key = txt.casefold()
+        if key in {"null", "none", "nil", "n/a", "na", "placeholder"}:
+            return True
+        return bool(re.fullmatch(r"cls[_-]?\d+", key))
+
+    def _preferred_action_label(self, names: Iterable[Any]) -> str:
+        fallback = ""
+        for raw_name in list(names or []):
+            label = str(raw_name or "").strip()
+            if not label or is_escape_label(label):
+                continue
+            if not fallback:
+                fallback = label
+            if not self._is_placeholder_action_label(label):
+                return label
+        return fallback
+
+    @staticmethod
+    def _apply_boundary_label_override_choice(
+        proposal: Optional[Dict[str, Any]],
+        mode: str,
+        chosen: str,
+    ) -> bool:
+        if not isinstance(proposal, dict):
+            return False
+        label = str(chosen or "").strip()
+        action_mode = str(mode or "").strip()
+        if not label:
+            return False
+        if action_mode in ("remove_boundary", "remove_boundaries"):
+            proposal["merged_label"] = str(label)
+            proposal["left_label"] = str(label)
+            proposal["right_label"] = str(label)
+            return True
+        if action_mode == "blank_fill":
+            proposal["left_label"] = str(label)
+            proposal["right_label"] = ""
+            return True
+        if action_mode == "new_boundary":
+            proposal["left_label"] = str(label)
+            return True
+        return False
 
     def _proposal_boundary_already_satisfied(
         self,
@@ -19728,30 +24087,22 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             pass
         self._update_scribble_proposal_ui()
-        self._refresh_query_planner_hint()
+        self._after_manual_query_relevant_edit()
         auto_advanced = False
-        if self._auto_advance_with_planner_for_current_study():
-            next_decision = self._boundary_query_decision()
-            if isinstance(next_decision, QueryDecision):
-                next_cand = next_decision.candidate
-                next_focus = int(
-                    next_cand.payload.get(
-                        "boundary_frame",
-                        (int(next_cand.start_frame) + int(next_cand.end_frame)) // 2,
-                    )
-                    or 0
-                )
-                if abs(int(next_focus) - int(frame_i)) > 2:
-                    auto_advanced = self._focus_query_decision(
-                        next_decision, status_prefix="Next boundary"
-                    )
+        if bool(proposal.get("query_hint")) or str(proposal.get("query_id", "") or "").strip():
+            auto_advanced = self._maybe_auto_focus_next_query(
+                current_focus_frame=int(frame_i),
+                status_prefix="Next suggestion",
+            )
         if not auto_advanced:
             self._set_status(status_text)
             self._set_interaction_status(interaction_status)
         # Update label prototypes for both sides of the confirmed boundary
         try:
-            win_s = int(proposal.get("window_start", 0) or 0)
-            win_e = int(proposal.get("window_end", 0) or 0)
+            _v = proposal.get("window_start")
+            win_s = int(_v if _v is not None else 0)
+            _v = proposal.get("window_end")
+            win_e = int(_v if _v is not None else 0)
             bf = int(frame_i)
             if left_label and bf > win_s:
                 left_emb = self._segment_embedding_for_span(win_s, bf - 1)
@@ -20283,7 +24634,7 @@ class ActionWindow(FrameControlMixin, QWidget):
 
             # rebuild labels from classes list (keep interaction if present)
             keep_extra = any(is_extra_label(lb.name) for lb in self.labels)
-            self.labels = []
+            self.labels.clear()
             if keep_extra:
                 self.labels.append(
                     LabelDef(
@@ -20324,6 +24675,11 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.timeline.update()
         self._dirty = True
         self._has_auto_segments = True
+        self._update_gap_indicator()
+        try:
+            QTimer.singleShot(0, self._update_gap_indicator)
+        except Exception:
+            pass
 
     def _patch_assisted_candidates_in_spans(
         self,
@@ -20397,7 +24753,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             return
         self._apply_autolabel_predictions(txt_path, json_path, model_name=model_name)
 
-    def on_click_auto_label_asot(self):
+    def on_click_auto_label_asot(self, manual_checkpoint: Optional[bool] = None):
         if not self._ensure_python_modules_available(
             ("torch",),
             feature_name="optional external pre-labeling",
@@ -20432,24 +24788,25 @@ class ActionWindow(FrameControlMixin, QWidget):
                 return
             self.currentFeatureDir = features_dir
 
-        default_ckpt = self._default_asot_ckpt()
-        init_dir = (
-            os.path.dirname(default_ckpt)
-            if default_ckpt
-            else os.path.join(self._root_dir, "external", "action_seg_ot")
-        )
-        ckpt, _ = QFileDialog.getOpenFileName(
-            self,
-            (
-                "Choose ASOT checkpoint "
-                f"(default: {os.path.basename(default_ckpt) if default_ckpt else 'none'})"
+        if manual_checkpoint is None:
+            try:
+                manual_checkpoint = bool(
+                    QApplication.keyboardModifiers() & Qt.ShiftModifier
+                )
+            except Exception:
+                manual_checkpoint = False
+        ckpt = self._resolve_asot_checkpoint_path(
+            force_prompt=bool(manual_checkpoint),
+            dialog_title=(
+                "Choose ASOT checkpoint"
+                if bool(manual_checkpoint)
+                else None
             ),
-            init_dir,
-            "PyTorch Models (*.pth *.pt *.ckpt)",
         )
         if not ckpt:
-            ckpt = default_ckpt
-        if not ckpt or not os.path.isfile(ckpt):
+            if bool(manual_checkpoint):
+                self._set_status("Optional external pre-labeling cancelled.")
+                return
             QMessageBox.warning(
                 self, "Missing checkpoint", "No ASOT checkpoint selected or found."
             )
@@ -20497,7 +24854,10 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         log_path = os.path.join(features_dir, "pred_asot_infer.log")
         self._last_autolabel_log_path = log_path
-        self._set_status("Starting optional external pre-labeling...")
+        self._set_status(
+            "Starting optional external pre-labeling"
+            f" with {os.path.basename(str(ckpt))}..."
+        )
         try:
             if getattr(self, "btn_auto_label_asot", None) is not None:
                 self.btn_auto_label_asot.setEnabled(False)
@@ -20647,6 +25007,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             fd = QFileDialog(self)
             fd.setFileMode(QFileDialog.ExistingFile)
             fd.setNameFilter("Video Files (*.mp4 *.avi *.mov *.mkv)")
+            try:
+                if self._study_mode_active():
+                    study_root = os.path.join(self._root_dir, "user_study")
+                    if os.path.isdir(study_root):
+                        fd.setDirectory(study_root)
+            except Exception:
+                pass
             if fd.exec_():
                 path = fd.selectedFiles()[0]
                 self._load_primary_video(path)
@@ -20686,7 +25053,9 @@ class ActionWindow(FrameControlMixin, QWidget):
             self.spin_jump.setValue(self.player.crop_start)
             self._log("crop_set", start=s, end=e)
 
-        elif text.startswith("Import JSON (selected views)"):
+        elif text.startswith("Import annotations (selected views)") or text.startswith(
+            "Import JSON (selected views)"
+        ):
             self._import_json_for_selected_views()
 
         elif text.startswith("Export JSON (selected views to folders)"):
@@ -20816,6 +25185,22 @@ class ActionWindow(FrameControlMixin, QWidget):
         if not self._prompt_save_if_dirty(context="quitting", force_prompt=had_gaps):
             event.ignore()
             return
+        # Extra confirmation for user-study conditions to guard against misclicks.
+        if self._study_mode_active() and not getattr(self, "_dirty", False):
+            cond_label = self._study_condition_display()
+            ret = QMessageBox.question(
+                self,
+                "Quit user study",
+                (
+                    f"You are currently in '{cond_label}'.\n\n"
+                    "Are you sure you want to quit this session?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                event.ignore()
+                return
         event.accept()
 
     # ----- labels -----
@@ -21412,6 +25797,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         ops = []
         added_views = []
         removed_views = []
+        cleared_lock_views: Set[int] = set()
         for idx in target_indices:
             if not (0 <= idx < len(self.views)):
                 continue
@@ -21422,6 +25808,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             cuts = self._trim_cut_set_for_view(view, descriptor, create=True)
             if frame in cuts:
                 cuts.discard(frame)
+                self._set_auto_preserved_cut(view, descriptor, int(frame), False)
+                self._clear_boundary_lock_records_in_span(
+                    int(frame),
+                    int(frame),
+                    view_idx=int(idx),
+                )
+                cleared_lock_views.add(int(idx))
                 ops.append(
                     {
                         "view_idx": int(idx),
@@ -21437,7 +25830,18 @@ class ActionWindow(FrameControlMixin, QWidget):
                 continue
             if frame <= int(seg_s) or frame > int(seg_e):
                 continue
+            if not self._split_respects_min_action_segment_frames(
+                int(seg_s), int(seg_e), int(frame)
+            ):
+                self._discard_correction_session("trim_cut_below_min_segment_len")
+                self._set_status(
+                    self._split_too_short_message(int(seg_s), int(seg_e), int(frame))
+                )
+                return False
             cuts.add(int(frame))
+            # User explicitly split a segment here; protect from sweep so
+            # same-label-both-sides manual cuts survive.
+            self._set_auto_preserved_cut(view, descriptor, int(frame), True)
             ops.append(
                 {
                     "view_idx": int(idx),
@@ -21459,6 +25863,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 vi = -1
             if 0 <= vi < len(self.views):
                 self.views[vi]["dirty"] = True
+        for vi in cleared_lock_views:
+            if 0 <= int(vi) < len(self.views):
+                self.views[int(vi)]["dirty"] = True
         self._dirty = True
         self._rebuild_timeline_sources()
         mode = "toggle"
@@ -21502,6 +25909,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             end=int(end),
             label=str(label or ""),
         )
+        # Clear any ACC markers / protected-accept cuts that live inside the
+        # span being deleted, so the deleted segment doesn't leave ghost
+        # boundaries or orphan ACC pills on the timeline.
+        try:
+            self._purge_accept_artifacts_in_span(start=int(start), end=int(end))
+        except Exception:
+            pass
 
         # Multi-view sync delete: when views are ctrl-selected, apply deletion
         # directly to all selected views whose span currently matches the label.
@@ -21572,6 +25986,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
             self._redo_stack.clear()
             self._dirty = True
+            for _v_idx in sorted(touched_views):
+                try:
+                    self._purge_accept_artifacts_in_span(
+                        view_idx=int(_v_idx), start=int(start), end=int(end)
+                    )
+                except Exception:
+                    pass
             self._refresh_after_manual_store_change()
             if self.validation_enabled:
                 self._append_validation_entries_with_optional_comment(mod_entries)
@@ -21658,6 +26079,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         self._redo_stack.clear()
         self._dirty = True
+        for _v_idx in sorted(touched_views):
+            try:
+                self._purge_accept_artifacts_in_span(
+                    view_idx=int(_v_idx), start=int(start), end=int(end)
+                )
+            except Exception:
+                pass
         self._refresh_after_manual_store_change()
         self._append_validation_entries_with_optional_comment(mod_entries)
 
@@ -21941,6 +26369,14 @@ class ActionWindow(FrameControlMixin, QWidget):
                 # self.timeline.update()
                 self.timeline.refresh_all_rows()
             self._apply_sync_edit_masks()
+            meta = item.get("meta") if isinstance(item, dict) else None
+            session_id = (
+                str((meta or {}).get("scribble_session_id") or "").strip()
+                if isinstance(meta, dict)
+                else ""
+            )
+            if session_id:
+                self._remove_scribble_marker_by_session(session_id)
             self._log("undo", count=self._history_item_frame_count(item))
 
     def _redo(self):
@@ -22016,6 +26452,7 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         # clear labels / entities / display
         self.labels.clear()
+        self._action_label_bank_source = ""
         self.label_entity_map.clear()
         self.entities.clear()
         self.entity_stores.clear()
@@ -22329,13 +26766,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                 chosen = str(getattr(lb, "name", "") or "").strip()
                 mode = str(self._pending_boundary_label_override.get("mode", "") or "").strip()
                 if chosen:
-                    if mode == "remove_boundary":
-                        proposal["merged_label"] = str(chosen)
-                        proposal["left_label"] = str(chosen)
-                        proposal["right_label"] = str(chosen)
-                    elif mode == "blank_fill":
-                        proposal["left_label"] = str(chosen)
-                        proposal["right_label"] = ""
+                    self._apply_boundary_label_override_choice(
+                        proposal, mode, chosen
+                    )
                     self._last_scribble_result = proposal
                     self._store_active_view_scribble_state()
                     self._update_scribble_proposal_ui()
@@ -22347,9 +26780,9 @@ class ActionWindow(FrameControlMixin, QWidget):
                         "boundary_proposal_label_override",
                         label=str(chosen),
                         mode=str(mode),
-                        boundary_frame=int(proposal.get("boundary_frame", 0) or 0),
-                        start=int(self._pending_boundary_label_override.get("start", 0) or 0),
-                        end=int(self._pending_boundary_label_override.get("end", 0) or 0),
+                        boundary_frame=int(proposal.get("boundary_frame") if proposal.get("boundary_frame") is not None else 0),
+                        start=int(self._pending_boundary_label_override.get("start") if self._pending_boundary_label_override.get("start") is not None else 0),
+                        end=int(self._pending_boundary_label_override.get("end") if self._pending_boundary_label_override.get("end") is not None else 0),
                     )
                     if mode == "blank_fill":
                         self._set_status(
@@ -22359,7 +26792,23 @@ class ActionWindow(FrameControlMixin, QWidget):
                         self._set_status(
                             f"Merge label set to {chosen}. Accept Merge will merge the adjacent segments as {chosen}."
                         )
+                    elif mode == "remove_boundaries":
+                        self._set_status(
+                            f"Merge label set to {chosen}. Accept Merge will remove the crossed boundaries and merge the whole span as {chosen}."
+                        )
+                    elif mode == "new_boundary":
+                        self._set_status(
+                            f"Left-side label set to {chosen}. Accept Boundary will split the segment at the proposed frame and label the left side as {chosen}."
+                        )
                     return
+        if isinstance(self._last_scribble_result, dict) and self._last_scribble_result.get("boundary_frame") is not None:
+            if 0 <= idx < len(self.labels):
+                try:
+                    self.timeline.flash_label(self.labels[idx].name)
+                except Exception:
+                    pass
+                self._log("label_select", label=self.labels[idx].name, id=getattr(self.labels[idx], "id", None))
+            return
         handled_forced = False
         forced = getattr(self, "_forced_segment", None)
         if forced and 0 <= idx < len(self.labels):
@@ -22411,18 +26860,26 @@ class ActionWindow(FrameControlMixin, QWidget):
                     pass
                 if pending_label_review:
                     self._update_scribble_proposal_ui()
-                    self._refresh_query_planner_hint()
+                    self._after_manual_query_relevant_edit()
         if 0 <= idx < len(self.labels):
             lb = self.labels[idx]
             checked = self.label_entity_map.get(lb.name, set())
             if getattr(self.entities_panel, "mode", "applicability") == "applicability":
                 self.entities_panel.set_current_label(lb.name, checked)
-            if getattr(self, "timeline", None):
+            if not handled_forced and getattr(self, "timeline", None):
                 try:
                     row = getattr(self.timeline, "_active_combined_row", None)
                     meta = getattr(row, "_group_meta", {}) if row is not None else {}
                     if meta.get("row_type") != "phase":
-                        self.timeline.apply_combined_label(lb.name)
+                        selected = dict(self._timeline_selected_segment or {})
+                        _v = selected.get("start")
+                        sel_start = int(_v if _v is not None else 0)
+                        _v = selected.get("end")
+                        sel_end = int(_v if _v is not None else sel_start)
+                        if self._apply_label_to_segment(sel_start, sel_end, lb.name):
+                            handled_forced = True
+                        else:
+                            self.timeline.apply_combined_label(lb.name)
                 except Exception:
                     pass
             if getattr(self, "timeline", None):
@@ -22453,7 +26910,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         for idx, lb in enumerate(self.labels):
             if lb.name == name:
                 try:
-                    self.panel.select_label_by_name(name)
+                    self.panel.select_label_by_name(name, notify=False)
                 except Exception:
                     pass
                 self._log("timeline_label_click", label=name, frame=frame)
@@ -22885,6 +27342,15 @@ class ActionWindow(FrameControlMixin, QWidget):
         self.current_label_idx = next_idx
 
         if refresh_panel and getattr(self, "panel", None):
+            try:
+                if getattr(self.panel, "labels", None) is not self.labels:
+                    self.panel.labels = self.labels
+            except Exception:
+                pass
+            try:
+                self.panel.clear_candidate_priority()
+            except Exception:
+                pass
             self.panel.refresh()
         if rebuild_timeline and getattr(self, "timeline", None):
             self._rebuild_timeline_sources()
@@ -22996,6 +27462,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         show = (
             self._is_action_task()
             and not self._is_psr_task()
+            and not self._study_mode_active()
             and (self.validation_enabled or review_visible)
         )
         try:
@@ -23120,6 +27587,7 @@ class ActionWindow(FrameControlMixin, QWidget):
     def _rebuild_timeline_sources(self):
         if not getattr(self, "timeline", None):
             return
+        _boundary_trace("rebuild.enter", mode=getattr(self, "mode", None))
         self._apply_timeline_snap_settings(refresh=False)
         if self._is_psr_task():
             try:
@@ -23236,6 +27704,7 @@ class ActionWindow(FrameControlMixin, QWidget):
                 if not is_extra_label(lb.name)
             ]
             coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
+            _boundary_trace("rebuild.coarse_cuts.has_extra", coarse_cuts=sorted(int(c) for c in (coarse_cuts or [])))
             combined_groups = [
                 (
                     "Timeline",
@@ -23259,6 +27728,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             ]
         elif self.mode == "Coarse":
             coarse_cuts = self._active_trim_cuts_for_descriptor({"kind": "store"})
+            _boundary_trace("rebuild.coarse_cuts", mode=self.mode, coarse_cuts=sorted(int(c) for c in (coarse_cuts or [])))
             combined_groups = [
                 (
                     "Timeline",
@@ -23286,8 +27756,11 @@ class ActionWindow(FrameControlMixin, QWidget):
         def _row_cuts_provider(row):
             descriptor = self._mask_descriptor_from_row(row)
             if not self._syncable_descriptor(descriptor):
+                _boundary_trace("row_provider.skip", row_name=getattr(row, "name", None), descriptor=descriptor)
                 return []
-            return self._active_trim_cuts_for_descriptor(descriptor)
+            result = self._active_trim_cuts_for_descriptor(descriptor)
+            _boundary_trace("row_provider.return", row_name=getattr(row, "name", None), descriptor=descriptor, cuts=sorted(int(c) for c in (result or [])))
+            return result
 
         try:
             self.timeline.set_combined_delete_handler(delete_handler)
@@ -23557,6 +28030,17 @@ class ActionWindow(FrameControlMixin, QWidget):
                 self._hover_preview_last_targets[idx] = target
             except Exception:
                 continue
+
+    def _on_timeline_wheel_seek(self, frame: int):
+        if not self.views or not (0 <= self.active_view_idx < len(self.views)):
+            return
+        player = self.views[self.active_view_idx].get("player")
+        if not player or not getattr(player, "cap", None):
+            return
+        try:
+            player.seek(int(frame), preview_only=False)
+        except Exception:
+            pass
 
     def _on_timeline_hover_frame(self, frame: int):
         if not self.views:
@@ -24012,9 +28496,9 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         fp, _ = QFileDialog.getOpenFileName(
             self,
-            "Import JSON (apply to selected views)",
+            "Import annotations (apply to selected views)",
             default_dir,
-            "JSON Files (*.json)",
+            ANNOTATION_FILE_FILTER,
         )
         if not fp:
             return
@@ -24035,10 +28519,12 @@ class ActionWindow(FrameControlMixin, QWidget):
         shown = ",".join(loaded[:4])
         if len(loaded) > 4:
             shown = f"{shown},+{len(loaded)-4}"
-        self._set_status(f"Imported JSON for {len(loaded)} selected view(s)")
+        self._set_status(f"Imported annotations for {len(loaded)} selected view(s)")
         self._log("import_json_selected_views", count=len(loaded), views=shown)
 
     def _import_annotations_from_file(self, fp: str) -> bool:
+        if str(fp or "").lower().endswith(".txt"):
+            return bool(self._load_json_annotations(fp))
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 payload = json.load(f)
@@ -24118,8 +28604,13 @@ class ActionWindow(FrameControlMixin, QWidget):
 
         suggested = f"annotations_{name}.json"
         if getattr(self, "video_path", None):
-            base = (
+            vid_stem = (
                 os.path.splitext(os.path.basename(self.video_path))[0] or "annotations"
+            )
+            base = (
+                self._study_filename_stem(vid_stem)
+                if self._study_mode_active()
+                else vid_stem
             )
             suggested = os.path.join(os.path.dirname(self.video_path), base + ".json")
         fp, _ = QFileDialog.getSaveFileName(
@@ -24135,6 +28626,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             with open(fp, "w", encoding="utf-8") as f:
                 json.dump(out_obj, f, ensure_ascii=False, indent=2)
             self._set_status(f"Exported as {name}: {os.path.basename(fp)}")
+            self._flush_ops_logs_for_paths(
+                primary_base=fp,
+                context=f"export {name}",
+            )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write file: {e}")
 
@@ -24152,8 +28647,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         )
         suggested = ""
         if getattr(self, "video_path", None):
-            base = (
+            vid_stem = (
                 os.path.splitext(os.path.basename(self.video_path))[0] or "annotations"
+            )
+            base = (
+                self._study_filename_stem(vid_stem)
+                if self._study_mode_active()
+                else vid_stem
             )
             suggested = os.path.join(os.path.dirname(self.video_path), base + ".json")
         fp, _ = QFileDialog.getSaveFileName(
@@ -24168,6 +28668,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             self._save_extra_sidecar_if_possible()
             self._save_scribble_sidecar_if_possible([fp])
             self._set_status(f"Exported Native (fine): {os.path.basename(fp)}")
+            self._flush_ops_logs_for_paths(primary_base=fp, context="export native fine")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to write file: {e}")
 
@@ -24182,12 +28683,16 @@ class ActionWindow(FrameControlMixin, QWidget):
         if src_path:
             base = os.path.splitext(os.path.basename(src_path))[0]
             if base:
+                if self._study_mode_active():
+                    return f"{self._study_filename_stem(base)}.json"
                 return f"{base}.json"
         fallback = (
             self.current_video_id
             or self._safe_view_tag(self._effective_view_name(view))
             or "annotations"
         )
+        if self._study_mode_active():
+            fallback = self._study_filename_stem(str(fallback))
         return f"{fallback}.json"
 
     def _video_id_for_view_export(
@@ -24270,9 +28775,13 @@ class ActionWindow(FrameControlMixin, QWidget):
 
     def _default_save_json_path(self) -> str:
         if getattr(self, "video_path", None):
-            base = (
+            vid = (
                 os.path.splitext(os.path.basename(self.video_path))[0] or "annotations"
             )
+            if self._study_mode_active():
+                base = self._study_filename_stem(vid)
+            else:
+                base = vid
             return os.path.join(os.path.dirname(self.video_path), base + ".json")
         return ""
 
@@ -24617,6 +29126,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
             self._set_status(f"Pseudo-labels exported: {labelled}/{total} frames → {os.path.basename(path)}")
+            self._flush_ops_logs_for_paths(primary_base=path, context="export pseudo labels")
         except Exception as ex:
             QMessageBox.warning(self, "Error", f"Export failed:\n{ex}")
 
@@ -24846,14 +29356,20 @@ class ActionWindow(FrameControlMixin, QWidget):
                 f"Seed export saved: {os.path.basename(video_dst)}, {json_name}"
             )
             self._log("seed_export", video=video_name, json=json_name, dir=seed_dir)
+            self._flush_ops_logs_for_paths(primary_base=json_dst, context="export seed dataset")
         except Exception as ex:
             QMessageBox.warning(self, "Error", f"Seed export failed:\n{ex}")
 
     def _save_json_annotations(self, skip_gap_check: bool = False) -> bool:
         # allow saving even if there are no labels
+        if self._study_mode_active():
+            if not self._ensure_study_participant_id():
+                return False
         default_vid = ""
         if getattr(self, "video_path", None):
             default_vid = os.path.splitext(os.path.basename(self.video_path))[0]
+        if self._study_mode_active():
+            default_vid = self._study_filename_stem(default_vid)
         vid, ok = QInputDialog.getText(self, "Video ID", "video_id:", text=default_vid)
         if not ok or not vid.strip():
             return False
@@ -24924,6 +29440,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
             self._save_validation_log_safely(log_anchor, vid.strip(), saved_paths)
             self._log("save_annotations", paths=paths_txt, video_id=vid.strip())
+            try:
+                self._log_task_completed(video_id=vid.strip())
+            except Exception:
+                pass
             log_base = (
                 os.path.join(out_dir, vid.strip() or "annotations")
                 if len(saved_paths) > 1 and out_dir
@@ -25232,7 +29752,7 @@ class ActionWindow(FrameControlMixin, QWidget):
         entries.sort(
             key=lambda x: (
                 str(x.get("view") or ""),
-                int(x.get("start", x.get("frame", 0) or 0)),
+                int(x.get("start") if x.get("start") is not None else (x.get("frame") if x.get("frame") is not None else 0)),
                 str(x.get("component") or x.get("store") or ""),
             )
         )
@@ -25341,8 +29861,10 @@ class ActionWindow(FrameControlMixin, QWidget):
         comp_id = self._psr_component_id_from_value(
             raw_component
         )
-        start = int(item.get("start", frame) or frame)
-        end = int(item.get("end", start) or start)
+        _v = item.get("start")
+        start = int(_v if _v is not None else frame)
+        _v = item.get("end")
+        end = int(_v if _v is not None else start)
         self._psr_refresh_state_timeline(force=True)
         row = self._psr_row_for_component(comp_id)
         label = None
@@ -25962,28 +30484,52 @@ class ActionWindow(FrameControlMixin, QWidget):
         current_view_only: bool = False,
         target_view_idx: Optional[int] = None,
     ):
+        dialog_title = "Load annotations"
         fp = path
         if not fp:
             fp, _ = QFileDialog.getOpenFileName(
-                self, "Load JSON", "", "JSON Files (*.json)"
+                self, dialog_title, "", ANNOTATION_FILE_FILTER
             )
         if not fp:
             return False
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as ex:
-            QMessageBox.warning(self, "Load JSON", f"Failed to read JSON:\n{ex}")
-            return False
+        ext = os.path.splitext(str(fp))[1].lower()
+        if ext == ".txt":
+            try:
+                txt_segments, _ = load_annotation_txt_segments(fp)
+            except Exception as ex:
+                QMessageBox.warning(
+                    self, dialog_title, f"Failed to read TXT annotations:\n{ex}"
+                )
+                return False
+            data = {
+                "segments": [
+                    {
+                        "start_frame": int(seg.get("start", 0)),
+                        "end_frame": int(seg.get("end", seg.get("start", 0))),
+                        "label": str(seg.get("label", "") or "").strip(),
+                    }
+                    for seg in txt_segments
+                    if isinstance(seg, dict)
+                ]
+            }
+        else:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as ex:
+                QMessageBox.warning(self, dialog_title, f"Failed to read JSON:\n{ex}")
+                return False
         if not isinstance(data, dict):
-            QMessageBox.warning(self, "Load JSON", "Invalid JSON: root must be an object.")
+            QMessageBox.warning(
+                self, dialog_title, "Invalid annotation file: root must be an object."
+            )
             return False
 
         labels_data = data.get("labels") or data.get("action_labels")
         if labels_data is not None and not isinstance(labels_data, list):
             QMessageBox.warning(
                 self,
-                "Load JSON",
+                dialog_title,
                 "Invalid JSON: 'labels'/'action_labels' must be a list. Falling back to ids from segments.",
             )
             labels_data = []
@@ -25992,7 +30538,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             segs_raw, labels_data
         )
         if seg_err:
-            QMessageBox.warning(self, "Load JSON", seg_err)
+            QMessageBox.warning(self, dialog_title, seg_err)
             return False
         segs = segs or []
         segs, half_open_fixed, half_open_stats = self._convert_half_open_segments_if_needed(
@@ -26084,10 +30630,10 @@ class ActionWindow(FrameControlMixin, QWidget):
             try:
                 current_idx = int(target_view_idx)
             except Exception:
-                QMessageBox.warning(self, "Load JSON", "Invalid target view index.")
+                QMessageBox.warning(self, dialog_title, "Invalid target view index.")
                 return False
             if not (0 <= current_idx < len(self.views)):
-                QMessageBox.warning(self, "Load JSON", "Target view index out of range.")
+                QMessageBox.warning(self, dialog_title, "Target view index out of range.")
                 return False
         current_view = self.views[current_idx] if self.views else {}
         primary_view_start = (
@@ -26170,7 +30716,7 @@ class ActionWindow(FrameControlMixin, QWidget):
             if bad_label_items:
                 QMessageBox.warning(
                     self,
-                    "Load JSON",
+                    dialog_title,
                     f"Ignored {bad_label_items} invalid label item(s) (missing/invalid id).",
                 )
 
@@ -26432,6 +30978,13 @@ class ActionWindow(FrameControlMixin, QWidget):
         except Exception:
             self.timeline.update()
         self._update_gap_indicator()
+        # Defer once more after Qt finishes pending view/store reflow, so the
+        # indicator reflects the freshly-loaded segments rather than the
+        # empty state observed before the timeline/store finished rebuilding.
+        try:
+            QTimer.singleShot(0, self._update_gap_indicator)
+        except Exception:
+            pass
         self._psr_mark_dirty()
         self._psr_update_component_panel()
         return True
@@ -26445,23 +30998,13 @@ class ActionWindow(FrameControlMixin, QWidget):
             )
         if not fp:
             return
-        mapping = []  # (name, id)
-        with open(fp, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                name = parts[0]
-                try:
-                    lid = int(parts[1])
-                except Exception:
-                    continue
-                mapping.append((name, lid))
+        mapping = self._load_label_mapping_txt(fp)
         if not mapping:
-            QMessageBox.information(self, "Info", "No valid entries found.")
+            self._notify_label_map_load_issue(
+                fp,
+                title="Import label map",
+                reason="empty",
+            )
             return
         if self.labels:
             ret = QMessageBox.question(
@@ -26497,3 +31040,4 @@ class ActionWindow(FrameControlMixin, QWidget):
                 f.write(f"{lb.name} {lb.id}\n")
         self._set_status(f"Exported label map to {os.path.basename(fp)}")
         self._log("export_label_map", path=fp, count=len(self.labels))
+        self._flush_ops_logs_for_paths(primary_base=fp, context="export label map")

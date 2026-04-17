@@ -64,6 +64,9 @@ def _parse_timestamp_seconds(text: str) -> Optional[float]:
     stamp = str(text or "").strip()
     if not stamp:
         return None
+    # Python < 3.11 does not accept trailing 'Z'; normalise to +00:00
+    if stamp.endswith("Z") or stamp.endswith("z"):
+        stamp = stamp[:-1] + "+00:00"
     try:
         return float(datetime.fromisoformat(stamp).timestamp())
     except Exception:
@@ -95,10 +98,20 @@ def _resolve_gt_path(
             base_stem = case.sidecar_path.stem
     if not base_stem:
         return None
-    for suffix in (".json", ".txt", ".npy"):
-        candidate = root / f"{base_stem}{suffix}"
-        if candidate.is_file():
-            return candidate
+
+    import re as _re
+    stems_to_try = [base_stem]
+    stripped_mode = _re.sub(r"_(SO|SP|ST)$", "", base_stem)
+    if stripped_mode != base_stem:
+        stems_to_try.append(stripped_mode)
+    stripped_pn = _re.sub(r"^[A-Za-z0-9]+_", "", stripped_mode, count=1)
+    if stripped_pn and stripped_pn != stripped_mode:
+        stems_to_try.append(stripped_pn)
+    for stem in stems_to_try:
+        for suffix in (".json", ".txt", ".npy"):
+            candidate = root / f"{stem}{suffix}"
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -249,12 +262,12 @@ def _evaluate_case(
         final_pred = ordered_boundaries
         final_ann = list(bundle.get("boundaries_abs", [])) if bundle else []
         for delta in deltas:
-            final_accepted_stats[f"f1@{delta}"] = _boundary_f1(
-                final_pred, gt_boundaries, int(delta)
-            )["f1"]
-            final_annotation_stats[f"f1@{delta}"] = _boundary_f1(
-                final_ann, gt_boundaries, int(delta)
-            )["f1"]
+            accepted_stats = _boundary_f1(final_pred, gt_boundaries, int(delta))
+            annotation_stats = _boundary_f1(final_ann, gt_boundaries, int(delta))
+            for key, value in accepted_stats.items():
+                final_accepted_stats[f"{key}@{delta}"] = value
+            for key, value in annotation_stats.items():
+                final_annotation_stats[f"{key}@{delta}"] = value
 
     accepted_feedback = sum(1 for row in feedback_events if bool(row.get("accepted")))
     rejected_feedback = sum(1 for row in feedback_events if not bool(row.get("accepted")))
@@ -352,13 +365,14 @@ def _aggregate_curve(cases: Sequence[Dict[str, Any]], deltas: Sequence[int]) -> 
             "case_count": int(len(samples)),
         }
         for delta in deltas:
-            row[f"f1@{delta}"] = _mean(
-                [
-                    float(item.get(f"f1@{delta}", 0.0) or 0.0)
-                    for item in samples
-                    if item.get(f"f1@{delta}") is not None
-                ]
-            )
+            for metric_name in ("precision", "recall", "f1"):
+                row[f"{metric_name}@{delta}"] = _mean(
+                    [
+                        float(item.get(f"{metric_name}@{delta}", 0.0) or 0.0)
+                        for item in samples
+                        if item.get(f"{metric_name}@{delta}") is not None
+                    ]
+                )
         rows.append(row)
     return rows
 
@@ -394,13 +408,14 @@ def _macro_budget_curve(
             "case_count": int(len(matched)),
         }
         for delta in deltas:
-            row[f"f1@{delta}"] = _mean(
-                [
-                    float(item.get(f"f1@{delta}", 0.0) or 0.0)
-                    for item in matched
-                    if item.get(f"f1@{delta}") is not None
-                ]
-            )
+            for metric_name in ("precision", "recall", "f1"):
+                row[f"{metric_name}@{delta}"] = _mean(
+                    [
+                        float(item.get(f"{metric_name}@{delta}", 0.0) or 0.0)
+                        for item in matched
+                        if item.get(f"{metric_name}@{delta}") is not None
+                    ]
+                )
         rows.append(row)
     return rows
 
@@ -431,18 +446,25 @@ def _build_summary(cases: Sequence[Dict[str, Any]], deltas: Sequence[int]) -> Di
         ),
     }
     for delta in deltas:
-        summary[f"final_accepted_boundary_f1@{delta}"] = _mean(
-            [
-                (case.get("final_accepted_boundary_metrics") or {}).get(f"f1@{delta}")
-                for case in cases
-            ]
-        )
-        summary[f"final_annotation_boundary_f1@{delta}"] = _mean(
-            [
-                (case.get("final_annotation_boundary_metrics") or {}).get(f"f1@{delta}")
-                for case in cases
-            ]
-        )
+        for metric_name in ("precision", "recall", "f1"):
+            accepted_key = f"final_accepted_boundary_{metric_name}@{delta}"
+            annotation_key = f"final_annotation_boundary_{metric_name}@{delta}"
+            summary[accepted_key] = _mean(
+                [
+                    (case.get("final_accepted_boundary_metrics") or {}).get(
+                        f"{metric_name}@{delta}"
+                    )
+                    for case in cases
+                ]
+            )
+            summary[annotation_key] = _mean(
+                [
+                    (case.get("final_annotation_boundary_metrics") or {}).get(
+                        f"{metric_name}@{delta}"
+                    )
+                    for case in cases
+                ]
+            )
     return summary
 
 

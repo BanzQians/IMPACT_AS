@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QLabel,
     QSplitter,
+    QSizePolicy,
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -64,6 +65,7 @@ class LabelPanel(QWidget):
         on_rename: Callable[[str, str], None],
         on_search_matches: Callable[[List[str]], None] = None,
         on_select_idx: Callable[[int], None] = None,
+        on_import_labels: Callable[[], None] = None,
         parent=None,
         manage_storage: bool = True,
     ):
@@ -74,6 +76,7 @@ class LabelPanel(QWidget):
         self.on_rename = on_rename
         self.on_search_matches = on_search_matches
         self.on_select_idx = on_select_idx
+        self.on_import_labels = on_import_labels
         self.manage_storage = manage_storage
 
         self._candidate_order: List[str] = []
@@ -135,10 +138,12 @@ class LabelPanel(QWidget):
         self.combo.addItem("Custom")
 
         self.btn_add = QPushButton("Add")
+        self.btn_import = QPushButton("Import TXT")
         row.addWidget(self.edit, 2)
         row.addWidget(self.id_spin, 0)
         row.addWidget(self.combo, 1)
         row.addWidget(self.btn_add, 0)
+        row.addWidget(self.btn_import, 0)
         root.addLayout(row)
         self.lbl_browser_section = QLabel("LABEL BROWSER", self)
         self.lbl_browser_section.setObjectName("labelPanelSection")
@@ -154,7 +159,10 @@ class LabelPanel(QWidget):
             "hand_spin",
         }
         self.split = QSplitter(Qt.Horizontal, self)
+        self.split.setChildrenCollapsible(True)
         self.verb_col = QWidget(self)
+        self.verb_col.setMinimumWidth(0)
+        self.verb_col.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         verb_layout = QVBoxLayout(self.verb_col)
         verb_layout.setContentsMargins(0, 0, 0, 0)
         verb_layout.setSpacing(4)
@@ -162,10 +170,13 @@ class LabelPanel(QWidget):
         self.lbl_verb.setObjectName("labelPanelColumn")
         verb_layout.addWidget(self.lbl_verb)
         self.verb_list = QListWidget(self)
+        self.verb_list.setMinimumWidth(0)
         self.verb_list.setSelectionMode(QAbstractItemView.SingleSelection)
         verb_layout.addWidget(self.verb_list, 1)
 
         self.obj_col = QWidget(self)
+        self.obj_col.setMinimumWidth(0)
+        self.obj_col.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         obj_layout = QVBoxLayout(self.obj_col)
         obj_layout.setContentsMargins(0, 0, 0, 0)
         obj_layout.setSpacing(4)
@@ -173,6 +184,7 @@ class LabelPanel(QWidget):
         self.lbl_object.setObjectName("labelPanelColumn")
         obj_layout.addWidget(self.lbl_object)
         self.obj_list = QListWidget(self)
+        self.obj_list.setMinimumWidth(0)
         self.obj_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.obj_list.setItemDelegate(PhraseLabelDelegate(self))
         self.obj_list.setEditTriggers(QAbstractItemView.DoubleClicked)
@@ -188,12 +200,16 @@ class LabelPanel(QWidget):
         root.addWidget(self.btn_del)
 
         self.btn_add.clicked.connect(self._add)
+        self.btn_import.clicked.connect(self._import_labels)
         self.btn_del.clicked.connect(self._del)
         self.combo.activated[int].connect(self._maybe_pick_custom)
         self.search_edit.textChanged.connect(self._on_search_text_changed)
         self.verb_list.currentRowChanged.connect(self._on_verb_selected)
         self.obj_list.currentRowChanged.connect(self._on_object_selected)
 
+        self.setMinimumWidth(0)
+        if not callable(self.on_import_labels):
+            self.btn_import.hide()
         self.refresh()
 
     def set_compound_verbs(self, verbs: List[str], refresh: bool = True):
@@ -231,6 +247,14 @@ class LabelPanel(QWidget):
             self.obj_col.show()
             self.split.setSizes([1, 2])
 
+    def _import_labels(self):
+        if not callable(self.on_import_labels):
+            return
+        try:
+            self.on_import_labels()
+        except Exception as exc:
+            QMessageBox.warning(self, "Import labels", str(exc))
+
     def _is_no_split_label(self, text: str) -> bool:
         if not text:
             return False
@@ -246,6 +270,14 @@ class LabelPanel(QWidget):
             return "", ""
         # Preserve underscore-based compound verbs such as pick_up / hand_tighten.
         raw = re.sub(r"^\s*\d+\s*[:\-_.)]*\s*", "", raw).strip()
+        # EPIC-kitchens style "verb:noun" (e.g. "rinse:glass", "put-down:mug"):
+        # colon takes priority over other separators.
+        if ":" in raw:
+            verb, _, obj = raw.partition(":")
+            verb = verb.strip()
+            obj = obj.strip()
+            if verb:
+                return verb, obj
         if "_" in raw:
             parts = [p.strip() for p in raw.split("_") if p.strip()]
             if parts:
@@ -296,7 +328,7 @@ class LabelPanel(QWidget):
     def current_label_name(self) -> str:
         return self._selected_label_name or ""
 
-    def select_label_by_name(self, name: str) -> bool:
+    def select_label_by_name(self, name: str, *, notify: bool = True) -> bool:
         if not name:
             return False
         if self.index_of_label(name) < 0:
@@ -305,7 +337,8 @@ class LabelPanel(QWidget):
         self._selected_verb = verb
         self._selected_label_name = name
         self.refresh()
-        self._notify_selection()
+        if notify:
+            self._notify_selection()
         return True
 
     def refresh(self):

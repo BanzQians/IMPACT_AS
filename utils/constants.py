@@ -44,9 +44,12 @@ def is_extra_label(name: str) -> bool:
     return txt in EXTRA_ALIASES or txt.lower() == "extra"
 
 
-# Escape labels: always-available labels for ambiguous or unlabelled regions (§21.10)
-RESERVED_ESCAPE_LABELS = ("Unknown", "Other", "Background")
-_ESCAPE_LOWER = frozenset(s.lower() for s in RESERVED_ESCAPE_LABELS)
+# Escape labels: reserved names kept for legacy escape-handling logic. The UI only
+# auto-appends the entries in RESERVED_ESCAPE_LABELS to the label list; `is_escape_label`
+# still recognises the historical names (Unknown/Other/Background) so older annotations
+# round-trip, but NULL is treated as a real label and never flagged as escape.
+RESERVED_ESCAPE_LABELS: tuple = ()
+_ESCAPE_LOWER = frozenset(s.lower() for s in ("Unknown", "Other", "Background"))
 
 
 def is_escape_label(name: str) -> bool:

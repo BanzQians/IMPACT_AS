@@ -30,6 +30,63 @@ unset QT_PLUGIN_PATH
 unset QT_QPA_PLATFORM_PLUGIN_PATH
 unset QT_QPA_FONTDIR
 
+# Normalize locale for Qt/XKB compose handling. Validation and other text
+# input dialogs create compose tables lazily; inherited LC_ALL=C.UTF-8 can
+# trigger noisy "qt.xkb.compose" warnings even when LANG already points to a
+# real UTF-8 locale available on the system.
+if command -v locale >/dev/null 2>&1; then
+  _locale_norm() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/utf-8/utf8/g'
+  }
+  _available_locales="$(locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | sed 's/utf-8/utf8/g')"
+  _gui_locale=""
+  if [ -n "${LANG:-}" ]; then
+    _want_locale="$(_locale_norm "${LANG}")"
+    if printf '%s\n' "$_available_locales" | grep -Fxq "$_want_locale"; then
+      _gui_locale="${LANG}"
+    fi
+  fi
+  if [ -z "$_gui_locale" ]; then
+    if printf '%s\n' "$_available_locales" | grep -Fxq "zh_cn.utf8"; then
+      _gui_locale="zh_CN.UTF-8"
+    elif printf '%s\n' "$_available_locales" | grep -Fxq "c.utf8"; then
+      _gui_locale="C.UTF-8"
+    fi
+  fi
+  if [ -n "$_gui_locale" ]; then
+    export LANG="$_gui_locale"
+    export LC_CTYPE="$_gui_locale"
+    export LC_ALL="$_gui_locale"
+  fi
+  _compose_file=""
+  if [ -n "${LC_CTYPE:-}" ]; then
+    _compose_file="/usr/share/X11/locale/${LC_CTYPE}/Compose"
+  fi
+  if [ ! -f "$_compose_file" ] && [ -n "${LANG:-}" ]; then
+    _compose_file="/usr/share/X11/locale/${LANG}/Compose"
+  fi
+  if [ ! -f "$_compose_file" ] && [ -f "/usr/share/X11/locale/C/Compose" ]; then
+    _compose_file="/usr/share/X11/locale/C/Compose"
+  fi
+  if [ -f "$_compose_file" ]; then
+    export XCOMPOSEFILE="$_compose_file"
+  fi
+  unset _available_locales _gui_locale _want_locale
+  unset _compose_file
+  unset -f _locale_norm 2>/dev/null || true
+fi
+
+# Silence the known harmless Qt/XKB compose-table warning without muting other
+# Qt diagnostics.
+if [ -n "${QT_LOGGING_RULES:-}" ]; then
+  case ";${QT_LOGGING_RULES};" in
+    *";qt.xkb.compose.warning=false;"*) ;;
+    *) export QT_LOGGING_RULES="${QT_LOGGING_RULES};qt.xkb.compose.warning=false" ;;
+  esac
+else
+  export QT_LOGGING_RULES="qt.xkb.compose.warning=false"
+fi
+
 # Preflight the GUI display unless the caller explicitly wants offscreen mode.
 if [ "${QT_QPA_PLATFORM:-}" != "offscreen" ]; then
   if [ -z "${DISPLAY:-}" ]; then

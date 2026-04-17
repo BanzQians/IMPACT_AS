@@ -16,7 +16,24 @@ class OperationLogger:
         self.enabled = enabled
         self.max_rows = max(1, int(max_rows))
         self._rows: List[Dict[str, Any]] = []
+        self._defaults: Dict[str, Any] = {}
         self.started_at = datetime.now().isoformat(timespec="seconds")
+
+    def set_default_fields(self, **fields):
+        """Update the default-field dict. Keys with empty/None values are removed
+        so a blank participant/condition does not overwrite a real one."""
+        for k, v in fields.items():
+            if v in (None, ""):
+                self._defaults.pop(k, None)
+            else:
+                self._defaults[k] = v
+
+    def clear_default_fields(self, *keys):
+        if not keys:
+            self._defaults.clear()
+        else:
+            for k in keys:
+                self._defaults.pop(k, None)
 
     def log(self, event: str, **fields):
         if not self.enabled:
@@ -25,6 +42,10 @@ class OperationLogger:
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "event": event,
         }
+        # Defaults first, then per-call fields win on conflict.
+        for k, v in self._defaults.items():
+            if v not in (None, ""):
+                row[k] = v
         row.update(fields)
         self._rows.append(row)
         if len(self._rows) > self.max_rows:

@@ -130,7 +130,7 @@ class QuickStartDialog(QWidget):
             image_filename="step_01_load_baseline.png",
             summary="Start from the top action bar. Open a session, load a video, or import an existing segmentation before review begins.",
             notes=(
-                "Use the action menu for Open Session, Load Video, or Import JSON.",
+                "Use the action menu for Open Session, Load Video, or Import annotations.",
             ),
         ),
         QuickStartStep(

@@ -26,6 +26,17 @@ __pycache__/
 # ===== Local data / outputs =====
 .cvhci_local/
 test_data/
+IMPACT_dataset/
+EPIC_dataset/
+data/
+reports/
+runs/
+appendix_try/
+final_eval_package/
+offline/
+configs/ablations/
+configs/splits/
+.claude/
 e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002/
 e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002.tar.gz
 *.npy
@@ -41,10 +52,31 @@ e2e_actionformer_videomaev2_g_768x1_160_adapter3_fps6_sde1_p0.5-002.tar.gz
 
 # Exception: starter checkpoint for local refiner cold start
 !configs/models/starter_local_refiner.pt
+configs/models/trained_*.json
+configs/models/*manifest*.json
 *.avi
 *.mp4
 *.log
 *.jsonl
+
+# ===== Human-study/private exports =====
+user_study/
+*.xlsx
+*.docx
+~$*
+.~lock.*
+user_study/**/*.json
+user_study/**/*.csv
+user_study/**/*.log
+user_study/**/*.xlsx
+user_study/**/*.docx
+user_study/**/*.pdf
+user_study/**/groundTruth/
+user_study/**/*_features
+user_study/**/label.txt
+selected_gt_clips*_shortlist.csv
+*.pre_final_bak
+*.bak
 
 # ===== IDE =====
 *.code-workspace

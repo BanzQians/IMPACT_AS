@@ -89,6 +89,8 @@ def _infer_feat_layout(feat: np.ndarray, meta: Optional[Dict[str, Any]] = None) 
 
 
 def _load_meta(features_dir: str) -> Dict[str, Any]:
+    if os.path.isfile(features_dir):
+        return {}
     meta_path = os.path.join(features_dir, "meta.json")
     if not os.path.isfile(meta_path):
         return {}
@@ -98,6 +100,12 @@ def _load_meta(features_dir: str) -> Dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
+
+
+def _resolve_feature_array_path(features_dir: str) -> str:
+    if os.path.isfile(features_dir):
+        return str(features_dir)
+    return os.path.join(features_dir, "features.npy")
 
 
 def _build_frame_map(seq_len: int, meta: Optional[Dict[str, Any]] = None) -> List[int]:
@@ -127,9 +135,9 @@ class FeatureBundle:
 
 
 def _load_feature_bundle(features_dir: str) -> FeatureBundle:
-    feat_path = os.path.join(features_dir, "features.npy")
+    feat_path = _resolve_feature_array_path(features_dir)
     if not os.path.isfile(feat_path):
-        raise FileNotFoundError(f"features.npy not found in {features_dir}")
+        raise FileNotFoundError(f"features array not found for {features_dir}")
     meta = _load_meta(features_dir)
     feat = np.load(feat_path, mmap_mode="r")
     feat = _infer_feat_layout(np.asarray(feat), meta)
@@ -489,14 +497,27 @@ class ScribbleTrainingDataset(Dataset):
                     bundle = _load_feature_bundle(resolved)
                     self._feature_cache[resolved] = bundle
                 boundary_frame = int(example.get("boundary_frame", 0) or 0)
-                win_s = int(boundary_frame - self.window_radius)
-                win_e = int(boundary_frame + self.window_radius)
+                use_explicit_window = (
+                    example.get("window_center_frame") not in (None, "")
+                    or example.get("proposal_boundary_frame") not in (None, "")
+                )
+                if use_explicit_window:
+                    win_s = int(example.get("window_start", boundary_frame - self.window_radius) or 0)
+                    win_e = int(example.get("window_end", boundary_frame + self.window_radius) or 0)
+                    if win_e < win_s:
+                        win_s, win_e = win_e, win_s
+                else:
+                    win_s = int(boundary_frame - self.window_radius)
+                    win_e = int(boundary_frame + self.window_radius)
                 frames = np.arange(win_s, win_e + 1, dtype=np.int64)
                 nearest = _nearest_feature_indices(bundle.frame_map, frames)
                 win_feat = np.asarray(bundle.features[nearest], dtype=np.float32)
                 energy = _boundary_energy_from_features(win_feat)
                 channels = build_scribble_channels(win_s, win_e, _example_scribbles(example))
-                bi = int(self.window_radius)
+                if use_explicit_window:
+                    bi = int(np.clip(boundary_frame - win_s, 0, len(frames) - 1))
+                else:
+                    bi = int(self.window_radius)
                 feature_dim = int(bundle.feature_dim)
             if expected_dim is None:
                 expected_dim = int(feature_dim)
@@ -611,37 +632,50 @@ class TinyLocalBoundaryModel(nn.Module):
         num_states: int = 0,
         dense_action_head: bool = False,
         query_head: bool = False,
+        temporal_kernel_size: int = 3,
     ) -> None:
         super().__init__()
+        kernel = max(1, int(temporal_kernel_size))
+        if kernel % 2 == 0:
+            kernel += 1
         self.input_proj = nn.Linear(int(input_dim), int(hidden_dim))
+        self.temporal_conv = nn.Conv1d(
+            int(hidden_dim),
+            int(hidden_dim),
+            kernel_size=int(kernel),
+            padding=int(kernel // 2),
+            groups=int(hidden_dim),
+            bias=False,
+        )
+        nn.init.zeros_(self.temporal_conv.weight)
         self.encoder = nn.Sequential(
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(int(hidden_dim), int(hidden_dim)),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Dropout(float(dropout)),
         )
         self.boundary_head = nn.Linear(int(hidden_dim), 1)
         ctx_dim = int(hidden_dim) * 4
         self.left_head = nn.Sequential(
             nn.Linear(ctx_dim, int(hidden_dim)),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(int(hidden_dim), int(num_classes)),
         )
         self.right_head = nn.Sequential(
             nn.Linear(ctx_dim, int(hidden_dim)),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(int(hidden_dim), int(num_classes)),
         )
         self.num_states = int(num_states)
         if self.num_states > 0:
             self.left_state_head = nn.Sequential(
                 nn.Linear(ctx_dim, int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), int(num_states)),
             )
             self.right_state_head = nn.Sequential(
                 nn.Linear(ctx_dim, int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), int(num_states)),
             )
         self.has_action_head = bool(dense_action_head)
@@ -651,7 +685,7 @@ class TinyLocalBoundaryModel(nn.Module):
         if self.has_query_head:
             self.query_head = nn.Sequential(
                 nn.Linear(ctx_dim, int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), 1),
             )
 
@@ -674,7 +708,9 @@ class TinyLocalBoundaryModel(nn.Module):
         left: torch.Tensor,
         right: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        hidden = self.encoder(self.input_proj(x))
+        hidden = self.input_proj(x)
+        conv = self.temporal_conv(hidden.transpose(1, 2)).transpose(1, 2)
+        hidden = self.encoder(torch.relu(hidden + conv))
         boundary_logits = self.boundary_head(hidden).squeeze(-1)
         boundary_probs = torch.softmax(boundary_logits, dim=1)
         cdf = torch.cumsum(boundary_probs, dim=1)
@@ -1258,6 +1294,7 @@ def main() -> None:
     ap.add_argument("--window_radius", type=int, default=24)
     ap.add_argument("--hidden_dim", type=int, default=128)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--temporal_kernel_size", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -1373,6 +1410,17 @@ def main() -> None:
         device = torch.device(str(args.device))
 
     num_states = len(state_to_idx)
+    temporal_kernel_size = max(1, int(args.temporal_kernel_size))
+    base_ckpt = None
+    if args.base_checkpoint and os.path.isfile(args.base_checkpoint):
+        base_ckpt = torch.load(args.base_checkpoint, map_location="cpu")
+        temporal_kernel_size = max(
+            1,
+            int(
+                base_ckpt.get("temporal_kernel_size", temporal_kernel_size)
+                or temporal_kernel_size
+            ),
+        )
     model = TinyLocalBoundaryModel(
         input_dim=int(dataset.input_dim),
         num_classes=len(label_to_idx),
@@ -1384,12 +1432,12 @@ def main() -> None:
             or float(args.struct_loss_weight) > 0.0
         ),
         query_head=float(args.query_loss_weight) > 0.0,
+        temporal_kernel_size=int(temporal_kernel_size),
     ).to(device)
 
     # Load base checkpoint for fine-tuning (LoRA or full)
     lora_rank = max(0, int(args.lora_rank))
-    if args.base_checkpoint and os.path.isfile(args.base_checkpoint):
-        base_ckpt = torch.load(args.base_checkpoint, map_location="cpu")
+    if base_ckpt is not None:
         model.load_state_dict(base_ckpt["state_dict"], strict=False)
         print(f"[train_local_refiner] loaded base checkpoint from {args.base_checkpoint}")
 
@@ -1518,6 +1566,7 @@ def main() -> None:
         "input_dim": int(dataset.input_dim),
         "hidden_dim": int(args.hidden_dim),
         "dropout": float(args.dropout),
+        "temporal_kernel_size": int(max(1, int(temporal_kernel_size))),
         "best_metric": float(best_metric),
         "num_examples": int(len(dataset)),
         "dataset_path": str(dataset_path),

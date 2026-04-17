@@ -190,6 +190,7 @@ class BackgroundRefinerTrainer(QThread):
         input_dim = 0
         hidden_dim = int(self.hidden_dim)
         dropout = float(self.dropout)
+        temporal_kernel_size = 3
         boundary_weight = float(self.boundary_loss_weight)
         label_weight = float(self.label_loss_weight)
         action_weight = float(self.action_loss_weight)
@@ -203,6 +204,10 @@ class BackgroundRefinerTrainer(QThread):
             input_dim = int(ckpt.get("input_dim", 0))
             hidden_dim = int(ckpt.get("hidden_dim", hidden_dim) or hidden_dim)
             dropout = float(ckpt.get("dropout", dropout) or dropout)
+            temporal_kernel_size = int(
+                ckpt.get("temporal_kernel_size", temporal_kernel_size)
+                or temporal_kernel_size
+            )
             boundary_weight = float(ckpt.get("boundary_loss_weight", boundary_weight) or boundary_weight)
             label_weight = float(ckpt.get("label_loss_weight", label_weight) or label_weight)
             action_weight = float(ckpt.get("action_loss_weight", action_weight) or 0.0)
@@ -345,6 +350,7 @@ class BackgroundRefinerTrainer(QThread):
             num_states=num_states,
             dense_action_head=(action_weight > 0.0 or struct_weight > 0.0),
             query_head=(query_weight > 0.0),
+            temporal_kernel_size=int(max(1, int(temporal_kernel_size))),
         )
         if has_base_checkpoint:
             model.load_state_dict(ckpt["state_dict"], strict=False)
@@ -523,6 +529,8 @@ class BackgroundRefinerTrainer(QThread):
         new_ckpt["input_dim"] = int(input_dim)
         new_ckpt["hidden_dim"] = int(hidden_dim)
         new_ckpt["dropout"] = float(dropout)
+        new_ckpt["temporal_kernel_size"] = int(max(1, int(temporal_kernel_size)))
+        new_ckpt["boundary_supervision"] = "interval_mass_with_exact_fallback"
         new_ckpt["boundary_loss_weight"] = float(boundary_weight)
         new_ckpt["label_loss_weight"] = float(label_weight)
         new_ckpt["action_loss_weight"] = float(action_weight)

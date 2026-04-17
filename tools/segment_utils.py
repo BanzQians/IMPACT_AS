@@ -35,6 +35,90 @@ def segments_from_labels(labels: np.ndarray) -> List[Tuple[int, int, int]]:
     return segs
 
 
+def segments_from_label_names(labels: Sequence[str]) -> List[Dict[str, int | str]]:
+    """Convert per-frame string labels into contiguous (start, end, label) runs."""
+    normalized = [str(label or "").strip() for label in labels if str(label or "").strip()]
+    if not normalized:
+        return []
+
+    segs: List[Dict[str, int | str]] = []
+    start = 0
+    cur = normalized[0]
+    for idx, label in enumerate(normalized[1:], start=1):
+        if label != cur:
+            segs.append({"start": int(start), "end": int(idx - 1), "label": cur})
+            start = idx
+            cur = label
+    segs.append({"start": int(start), "end": int(len(normalized) - 1), "label": cur})
+    return segs
+
+
+def _looks_like_int(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value[0] in "+-":
+        return value[1:].isdigit()
+    return value.isdigit()
+
+
+def _parse_segment_triplets(lines: Sequence[str]) -> Optional[List[Dict[str, int | str]]]:
+    groups: List[List[str]] = []
+    buf: List[str] = []
+    saw_separator = False
+
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            if buf:
+                groups.append(buf)
+                buf = []
+                saw_separator = True
+            continue
+        buf.append(line)
+    if buf:
+        groups.append(buf)
+
+    if not groups:
+        return []
+
+    if not saw_separator:
+        if len(groups) != 1 or len(groups[0]) != 3:
+            return None
+
+    segs: List[Dict[str, int | str]] = []
+    for group in groups:
+        if len(group) != 3:
+            return None
+        start_txt, end_txt, label = group
+        if not _looks_like_int(start_txt) or not _looks_like_int(end_txt):
+            return None
+        start = int(start_txt)
+        end = int(end_txt)
+        if end < start:
+            start, end = end, start
+        segs.append({"start": int(start), "end": int(end), "label": str(label).strip()})
+    return segs
+
+
+def load_annotation_txt_segments(path: str) -> Tuple[List[Dict[str, int | str]], str]:
+    """
+    Load TXT annotations and auto-detect one of two formats:
+
+    1. blank-line separated triplets: start / end / label
+    2. frame-wise labels: one label per non-empty line
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [line.rstrip("\n") for line in f]
+
+    triplets = _parse_segment_triplets(lines)
+    if triplets is not None:
+        return triplets, "segment_ranges"
+
+    labels = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    return segments_from_label_names(labels), "framewise_labels"
+
+
 def apply_min_seg_len(
     labels: np.ndarray, probs: np.ndarray, min_len: int
 ) -> np.ndarray:

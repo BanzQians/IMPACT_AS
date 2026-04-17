@@ -110,22 +110,30 @@ def infer_verb_noun(
     label_name: str,
     verb_candidates: Optional[Sequence[str]] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    name = str(label_name or "").strip().lower()
-    name = name.replace(" ", "_")
-    name = "_".join(part for part in name.split("_") if part)
-    if not name or name == "null":
+    raw = str(label_name or "").strip().lower()
+    raw = raw.replace(" ", "_")
+    raw = "_".join(part for part in raw.split("_") if part)
+    if not raw or raw == "null":
         return None, None
+    # EPIC-kitchens style labels use ':' between verb and noun, e.g.
+    # "rinse:glass", "put-down:mug". Handle that before falling back to '_'.
+    if ":" in raw:
+        verb, _, noun = raw.partition(":")
+        verb = verb.strip() or None
+        noun = noun.strip() or None
+        return verb, noun
     verbs = [str(v or "").strip().lower() for v in (verb_candidates or DEFAULT_VERB_PREFIXES)]
     verbs = [v for v in verbs if v]
     for verb in sorted(set(verbs), key=len, reverse=True):
-        prefix = verb + "_"
-        if name.startswith(prefix):
-            noun = name[len(prefix) :]
-            return verb, (noun if noun else None)
-    if "_" in name:
-        verb, noun = name.split("_", 1)
+        for sep in ("_", ":"):
+            prefix = verb + sep
+            if raw.startswith(prefix):
+                noun = raw[len(prefix) :]
+                return verb, (noun if noun else None)
+    if "_" in raw:
+        verb, noun = raw.split("_", 1)
         return verb, (noun if noun else None)
-    return name, None
+    return raw, None
 
 
 def candidate_label_paths(

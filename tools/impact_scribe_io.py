@@ -38,6 +38,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _safe_span(row: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    candidates = [
+        ("start_frame", "end_frame"),
+        ("f_start", "f_end"),
+        ("start", "end"),
+    ]
+    for start_key, end_key in candidates:
+        start_raw = row.get(start_key)
+        end_raw = row.get(end_key)
+        if start_raw is None and end_raw is None:
+            continue
+        try:
+            start_val = int(start_raw if start_raw is not None else end_raw)
+            end_val = int(end_raw if end_raw is not None else start_raw)
+        except Exception:
+            continue
+        if end_val < start_val:
+            start_val, end_val = end_val, start_val
+        return int(start_val), int(end_val)
+    return None
+
+
 def load_json(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -139,11 +161,10 @@ def load_annotation_bundle(path: Path) -> Dict[str, Any]:
     for row in segments_raw:
         if not isinstance(row, dict):
             continue
-        try:
-            start_rel = int(row.get("start_frame"))
-            end_rel = int(row.get("end_frame", start_rel))
-        except Exception:
+        span = _safe_span(row)
+        if span is None:
             continue
+        start_rel, end_rel = span
         if end_rel < start_rel:
             start_rel, end_rel = end_rel, start_rel
         start_abs = int(view_start + start_rel)

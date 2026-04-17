@@ -269,6 +269,7 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
             input_dim = int(ckpt.get("input_dim", 0) or 0)
             hidden_dim = int(ckpt.get("hidden_dim", 0) or 0)
             dropout = float(ckpt.get("dropout", 0.1) or 0.0)
+            temporal_kernel_size = int(ckpt.get("temporal_kernel_size", 1) or 1)
             num_states = int(ckpt.get("num_states", 0) or 0)
             if num_states <= 0:
                 state_to_idx = ckpt.get("state_to_idx") or {}
@@ -290,6 +291,7 @@ class CheckpointLocalBoundaryRefiner(BaseLocalBoundaryRefiner):
                 int(hidden_dim),
                 float(dropout),
                 num_states=int(num_states),
+                temporal_kernel_size=int(max(1, int(temporal_kernel_size))),
             )
             model.load_state_dict(state_dict, strict=False)
             # Apply LoRA overlay if present in checkpoint
@@ -570,6 +572,7 @@ def _build_tiny_local_boundary_model(
     hidden_dim: int,
     dropout: float,
     num_states: int = 0,
+    temporal_kernel_size: int = 1,
 ):
     torch = _import_torch()
     nn = torch.nn
@@ -577,35 +580,47 @@ def _build_tiny_local_boundary_model(
     class TinyLocalBoundaryModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
+            kernel = max(1, int(temporal_kernel_size))
+            if kernel % 2 == 0:
+                kernel += 1
             self.input_proj = nn.Linear(int(input_dim), int(hidden_dim))
+            self.temporal_conv = nn.Conv1d(
+                int(hidden_dim),
+                int(hidden_dim),
+                kernel_size=int(kernel),
+                padding=int(kernel // 2),
+                groups=int(hidden_dim),
+                bias=False,
+            )
+            nn.init.zeros_(self.temporal_conv.weight)
             self.encoder = nn.Sequential(
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Dropout(float(dropout)),
             )
             self.boundary_head = nn.Linear(int(hidden_dim), 1)
             ctx_dim = int(hidden_dim) * 4
             self.left_head = nn.Sequential(
                 nn.Linear(ctx_dim, int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), int(num_classes)),
             )
             self.right_head = nn.Sequential(
                 nn.Linear(ctx_dim, int(hidden_dim)),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
                 nn.Linear(int(hidden_dim), int(num_classes)),
             )
             self.num_states = int(num_states)
             if self.num_states > 0:
                 self.left_state_head = nn.Sequential(
                     nn.Linear(ctx_dim, int(hidden_dim)),
-                    nn.ReLU(inplace=True),
+                    nn.ReLU(inplace=False),
                     nn.Linear(int(hidden_dim), int(self.num_states)),
                 )
                 self.right_state_head = nn.Sequential(
                     nn.Linear(ctx_dim, int(hidden_dim)),
-                    nn.ReLU(inplace=True),
+                    nn.ReLU(inplace=False),
                     nn.Linear(int(hidden_dim), int(self.num_states)),
                 )
 
@@ -628,7 +643,9 @@ def _build_tiny_local_boundary_model(
             left: Any,
             right: Any,
         ) -> Dict[str, Any]:
-            hidden = self.encoder(self.input_proj(x))
+            hidden = self.input_proj(x)
+            conv = self.temporal_conv(hidden.transpose(1, 2)).transpose(1, 2)
+            hidden = self.encoder(torch.relu(hidden + conv))
             boundary_logits = self.boundary_head(hidden).squeeze(-1)
             boundary_probs = torch.softmax(boundary_logits, dim=1)
             cdf = torch.cumsum(boundary_probs, dim=1)

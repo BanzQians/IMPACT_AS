@@ -92,3 +92,5 @@ core/*
 core.*
 app.py.bak_*
 =4.8.0.76
+
+submission.pdf

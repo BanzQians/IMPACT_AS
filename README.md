@@ -1,37 +1,41 @@
-# IMPACT-Scribe (IMPACT_AS)
+# IMPACT-Scribe: Interactive Temporal Action Segmentation with Boundary Scribbles and Query Planning
 
-IMPACT-Scribe is a PyQt5 desktop system for interactive temporal action segmentation and assembly-state review. Its main loop is:
+IMPACT-Scribe is a human-in-the-loop framework for dense temporal action annotation. Instead of treating each correction as a one-off edit, it turns boundary scribbles into structured local supervision, plans the next query by expected value per cost, propagates accepted edits into a globally coherent sequence, and reuses correction history to improve later interactions.
 
-1. start from a coarse baseline,
-2. ask the next most valuable query,
-3. refine locally with temporal boundary scribbles,
-4. propagate the correction globally,
-5. learn from the correction history.
+![IMPACT-Scribe teaser showing interactive temporal action segmentation with planner-selected boundary queries and scribble-based boundary refinement.](docs/assets/teaser.png)
 
-The intended paper-facing story is a lightweight human-in-the-loop system that stays responsive online while improving over time through correction-driven adaptation.
+## Table of Contents
 
-## Mainline Contributions
+- [Paper](#paper)
+- [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Dataset Preparation](#dataset-preparation)
+- [Pretrained Checkpoints](#pretrained-checkpoints)
+- [Method-to-Code Map](#method-to-code-map)
+- [Repository Structure](#repository-structure)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
+- [Contact](#contact)
+- [Citation](#citation)
 
-- `Temporal boundary scribble` as the primary local supervision primitive
-- `Query planning` to decide which boundary / label / state query is worth asking next
-- `Structured decode` to propagate accepted local corrections into a coherent global sequence
-- `Correction-driven adaptation` so the local refiner, planner, and confidence estimates improve with use
+## Paper
 
-## Quick Start
+- arXiv: `TODO after public upload`
 
-### Conda environment
+## Installation
 
-Create the dedicated environment in-repo:
+### Core environment
 
 ```bash
 conda env create -f environment.yml -p ./.conda/envs/impact_as
 ```
 
-Then launch with the bundled wrapper:
+### Launch the GUI
 
 ```bash
 ./run.sh
 ```
+
 
 `run.sh` uses `./.conda/envs/impact_as`, prepares local runtime directories, and performs a small GUI preflight check before starting the Qt application.
 
@@ -47,133 +51,320 @@ Optional operation logging:
 ./run.sh --oplog
 ```
 
-If you only need the minimum pip package list, it remains available in `requirements.txt`.
+### Optional SigLIP2 text-bank environment
 
-## Core Capabilities
+The SigLIP2 model snapshot is **not** bundled in this repository.
 
-### Interactive Review
+```bash
+CONDA_ENV_ROOT="$PWD/.conda/envs" \
+SIGLIP2_CONDA_PREFIX="$PWD/.conda/envs/siglip2" \
+bash tools/runners/setup_siglip2_env.sh
+```
 
-- Multi-view video sessions
-- Coarse and fine action timelines
-- Boundary scribble interaction for local refinement
-- Query-driven review via `Suggest Query`
-- Structured decoding with anchor/state consistency
-- Assembly-state conflict analysis integrated into review
+## Quickstart
 
-### Learning Loop
+This repository ships a validated smoke test that does **not** require the private study datasets.
 
-- Immediate: label prototype updates and confidence calibration
-- Periodic: lightweight LoRA-style local-refiner adaptation on accumulated corrections
-- Offline: confirmed-window export and lightweight global-model training
+### One-line smoke test
 
-### Query Learning
+```bash
+python tests/generate_mock_smoke_test.py && python tools/eval_interactive_scribble.py --input data/results/scribble_planner --gt_dir data/gt --out /tmp/impact_eval_mock.json
+```
 
-The planner includes a lightweight `TrainableQueryUtilityModel` that learns from real correction outcomes using the same query signals already exposed by the system: uncertainty, disagreement, multiview conflict, state conflict, propagation gain, history, energy, and human cost.
+Expected console output:
 
-### Escape Labels
+```text
+[EVAL] cases=3 accept_rate=0.333 override_rate=0.667 avg_steps=3.000
+[EVAL] final_accepted_boundary_f1@5=1.000
+[EVAL] final_accepted_boundary_f1@10=1.000
+[EVAL] final_accepted_boundary_f1@25=1.000
+[EVAL] final_accepted_boundary_f1@50=1.000
+```
 
-Three reserved labels, `Unknown`, `Other`, and `Background`, remain available in the label palette. They are excluded from query scoring and handled specially in structured decode so uncertain spans can be marked without destabilizing the learning loop.
+What this does:
 
-## Typical Workflow
+1. creates three synthetic annotation/sidecar pairs under `data/results/`,
+2. creates matching GT frame-label files under `data/gt/`,
+3. runs the offline interaction evaluator,
+4. writes a JSON report to `/tmp/impact_eval_mock.json`.
 
-1. Open a video or session.
-2. Import an existing segment file, or optionally bootstrap a coarse external prelabel.
-3. Use `Suggest Query` to jump to the highest-value review target.
-4. Accept or refine boundary proposals with `Boundary Scribble`.
-5. Resolve label and state suggestions when surfaced by the planner.
-6. Let the system accumulate correction history for periodic local adaptation.
-7. Export confirmed windows and train a lightweight global model offline if needed.
+## Dataset Preparation
 
-## Current Study-Facing GUI Flow
+### Public dataset status
 
-For the current user-study and paper-facing workflow, the intended path is:
+This public tree does **not** currently include download links or released bundles for:
 
-- `Study: Scribble Only`: coarse-only, boundary-only annotation without planner guidance
-- `Study: Scribble + Planner`: the same coarse boundary workflow, but with planner-assisted `Next Boundary`
+- the IMPACT study sessions used in the paper,
+- the EPIC-KITCHENS supplementary human-study sessions,
+- the final public feature archives used for paper-scale training.
 
-In these study modes, the UI is intentionally narrowed:
+Use the layout below when preparing the public release package.
 
-- `Fine` mode is hidden
-- `Interaction` mode switching is hidden
-- the workflow is fixed to coarse-grained boundary scribble annotation
-- the left label browser uses study-friendly titles such as `Recommended Labels` and `Labels`
+### Recommended public-release layout
 
-The detailed operator-facing study protocol is documented in [docs/human_study_protocol_zh.md](docs/human_study_protocol_zh.md) and [docs/human_study_protocol_en.md](docs/human_study_protocol_en.md).
+```text
+data/
+  impact/
+    gt/
+      clip_001.txt
+      clip_002.txt
+    study_logs/
+      scribble_only/
+        clip_001.json
+        clip_001_scribble.json
+        clip_002.json
+        clip_002_scribble.json
+      scribble_planner/
+        clip_001.json
+        clip_001_scribble.json
+        clip_002.json
+        clip_002_scribble.json
+    features/
+      clip_001/
+        features.npy
+        meta.json
+      clip_002/
+        features.npy
+        meta.json
+    features_map.json
+  epic_kitchens/
+    gt/
+    study_logs/
+    features/
+    features_map.json
+```
 
-## Boundary Scribble Semantics
+### Annotation JSON format expected by the offline tools
 
-The current boundary-scribble interaction follows a single-gesture design:
+The parsers accept a native annotation JSON with at least:
 
-- scribble in blank space: propose a new boundary
-- narrow scribble centered on an existing boundary: propose removing that boundary and merging adjacent segments
-- broader scribble crossing an existing boundary: refine that boundary
+```json
+{
+  "video_id": "clip_001",
+  "view": "front",
+  "view_start": 0,
+  "view_end": 199,
+  "labels": [
+    { "id": 0, "name": "cut_tomato" },
+    { "id": 1, "name": "pour_oil" }
+  ],
+  "segments": [
+    { "start_frame": 0, "end_frame": 49, "action_label": 0 },
+    { "start_frame": 50, "end_frame": 99, "action_label": 1 }
+  ]
+}
+```
 
-`Accept Boundary` reuses the same accept path for these cases.
+Accepted segment keys include:
 
-On a blank canvas, the timeline is treated as a dense temporal partition rather than isolated patches:
+- `start_frame` / `end_frame`
+- `start` / `end`
+- `f_start` / `f_end`
 
-- the first accepted boundary fills only the immediately preceding unlabeled span
-- the next accepted boundary fills the next adjacent unlabeled span
-- accepted blank-canvas corrections should not leave temporal gaps behind the current frontier
+The label can be given either through:
 
-Selection is also biased toward editing stability:
+- `action_label` with a matching entry in `labels`, or
+- `label` / `label_name` / `name` directly in the segment entry.
 
-- clicking an existing segment or marker prefers selection
-- dragging past a threshold starts a new scribble
-- right click keeps the delete behavior for existing annotations and markers
+### Sidecar naming and format
 
-## Label Assistance
+For the offline evaluator and exporters, each annotation must be paired with a same-basename sidecar:
 
-Label assistance is part of the correction-driven loop, but it is not a separate headline contribution.
+- annotation: `clip_001.json`
+- sidecar: `clip_001_scribble.json`
 
-- the left label panel shows recommended coarse labels for the current selected segment or gap
-- for blank-fill and merge proposals, recommended labels can be changed before `Accept Boundary`
-- candidate ranking uses prototype memory, imported candidates, optional text priors, and runtime confusion memory
-- calibrated auto-assign is used conservatively; manual override remains available before acceptance
+The sidecar must contain `correction_history`. The export/eval tools also read `confirmed_accept_records` when present.
 
-For the current study workflow, the main path is still boundary-first. Label assistance is there to reduce burden, not to replace the boundary-scribble contribution.
+### GT formats accepted by the evaluator
 
-## Logging And Reproducibility
+`tools/eval_interactive_scribble.py` supports GT files in:
 
-- operation logging is available via `python app.py --oplog` or `./run.sh --oplog`
-- GUI logging can also be enabled from the application settings
-- logs are written as `*.ops.log.csv` next to saved annotations
-- scribble sidecars and accepted-correction exports support later adaptation and evaluation
+- `.json`
+- `.txt`
+- `.npy`
 
-## Project Structure
+Matching is basename-based. For example:
 
-- [app.py](app.py): application entry point
-- [run.sh](run.sh): local launcher for the in-repo Conda environment
-- [ui/](ui): GUI windows, timeline widgets, dialogs
-- [core/](core): planner, local refiner, structured decode, background adaptation, and state helpers
-- [tools/](tools): training, export, evaluation, and optional baseline helpers
-- [tests/](tests): learning-module tests
-- [docs/](docs): design documents and user-study materials
+- annotation: `clip_001.json`
+- sidecar: `clip_001_scribble.json`
+- GT: `clip_001.txt`
 
-## Main Offline Tools
+### Feature layout expected by training / optional inference
 
-- [tools/train_local_refiner.py](tools/train_local_refiner.py): local boundary model training
-- [tools/train_query_model.py](tools/train_query_model.py): offline query-utility fitting from correction history
-- [tools/export_real_correction_adaptation.py](tools/export_real_correction_adaptation.py): export accepted boundary corrections as adaptation data
-- [tools/export_confirmed_windows.py](tools/export_confirmed_windows.py): export accepted local windows
-- [tools/train_global_model_from_windows.py](tools/train_global_model_from_windows.py): train a lightweight global model from confirmed windows
-- [tools/eval_interactive_scribble.py](tools/eval_interactive_scribble.py): interaction-budget, cost-budget, and time-budget evaluation
+Most training paths expect a per-video directory with:
 
-## Optional Components
+```text
+data/impact/features/clip_001/
+  features.npy
+  meta.json
+```
 
-- `ASOT` is retained as an optional external prelabel initializer. It is not required for the main IMPACT-Scribe loop.
-- `SigLIP2` text-bank support is optional. The default text-bank backend now falls back automatically when the external model is unavailable.
-- [tools/distill_global_model.py](tools/distill_global_model.py) remains available as an advanced offline route, but it is not the primary paper-facing offline path.
+Use `features_map.json` when one `--features_dir` is not enough:
 
-## Outputs
+```json
+{
+  "clip_001": "data/impact/features/clip_001",
+  "clip_001.json": "data/impact/features/clip_001"
+}
+```
 
-- Annotation JSON
-- Scribble sidecar JSON
-- Confirmed-window exports
-- Adapted local-refiner checkpoints
-- Query-model snapshots
-- Evaluation JSON reports
+### Feature extraction
+
+A simple ResNet-50 extractor is included:
+
+```bash
+python tools/extract_resnet50_feats.py --src videos --out artifacts
+```
+
+This writes `artifacts/features/<video_name>.npy` in `(2048, T)` layout.
+
+### Synthetic scribble generation for local-refiner pretraining
+
+If you have native annotation JSON files and corresponding features, you can generate synthetic scribble supervision with:
+
+```bash
+python tools/simulate_scribbles.py --input data/impact/study_logs/scribble_only --output artifacts/impact_synthetic_scribbles.jsonl
+```
+
+## Pretrained Checkpoints
+
+### Bundled in this repository
+
+- Starter local refiner:
+  - `configs/models/starter_local_refiner.pt`
+  - auto-discovered by the GUI
+- I3D RGB checkpoint:
+  - `external/pytorch-i3d/models/rgb_imagenet.pt`
+- Optional ASOT checkpoints:
+  - `external/action_seg_ot/weights/epoch034-step1610.ckpt`
+  - `external/action_seg_ot/weights/asot_s8ijjapy_final.pth`
+
+### Not bundled
+
+- SigLIP2 model snapshot:
+  - expected local path by default:
+    - `external/huggingface/google--siglip2-base-patch16-224`
+  - download with `tools/runners/setup_siglip2_env.sh`
+
+### Checkpoint hashes
+
+- `TODO`: add SHA256 hashes for all release checkpoints before publication.
+
+## Method-to-Code Map
+
+### Uncertainty-Aware Scribble Encoding (USE)
+
+- `core/temporal_scribble.py`
+- key objects:
+  - `TemporalScribble`
+  - `TemporalScribbleSet`
+  - `build_scribble_channels`
+
+### Local Proposal Model
+
+- runtime inference:
+  - `core/local_boundary_refiner.py`
+- training:
+  - `tools/train_local_refiner.py`
+- current learnable model:
+  - `TinyLocalBoundaryModel`
+
+### Cost-Aware Query Planning (CQP)
+
+- `core/query_planner.py`
+- key objects:
+  - `QueryCandidate`
+  - `QueryPlannerWeights`
+  - `QueryUtilityModel`
+  - `QueryCostModel`
+- scoring function:
+  - `score_candidate`
+
+### Dense Propagation
+
+- `core/structured_decode.py`
+- key objects:
+  - `ConfirmedWindow`
+  - `SoftConstraint`
+- constrained decode:
+  - `decode_frame_labels_with_constraints`
+
+### Correction-Driven Adaptation (CDA)
+
+- real-correction export:
+  - `tools/export_real_correction_adaptation.py`
+- query-model fitting:
+  - `tools/train_query_model.py`
+- background local-refiner adaptation:
+  - `core/background_trainer.py`
+
+## Repository Structure
+
+```text
+app.py                              # GUI entry point
+run.sh                              # Linux/X11 launcher for the in-repo Conda env
+configs/
+  models/
+    starter_local_refiner.pt        # bundled starter local-refiner checkpoint
+core/
+  temporal_scribble.py              # scribble interval encoding
+  local_boundary_refiner.py         # runtime local proposal model + heuristic fallback
+  query_planner.py                  # candidate scoring, utility model, cost model
+  structured_decode.py              # constrained dense propagation
+  background_trainer.py             # background adaptation loop
+tools/
+  eval_interactive_scribble.py      # offline study-log evaluation
+  export_real_correction_adaptation.py
+  export_confirmed_windows.py
+  simulate_scribbles.py
+  train_local_refiner.py
+  train_query_model.py
+  train_global_model_from_windows.py
+  extract_resnet50_feats.py
+  asot_full_infer_adapter.py
+ui/
+  action_window.py                  # main action-segmentation workflow
+  timeline.py                       # timeline + scribble interaction
+docs/
+  human_study_protocol_en.md        # study protocol
+  assets/quick_start/               # GUI screenshots
+external/
+  action_seg_ot/                    # optional ASOT baseline code + weights
+  pytorch-i3d/                      # optional I3D backbone code + weights
+tests/
+  generate_mock_smoke_test.py       # synthetic quickstart generator
+```
 
 ## License
 
-See `LICENSE`.
+This repository is licensed under **Apache License 2.0**. See [LICENSE](LICENSE).
+
+Third-party code under `external/` keeps its own licenses:
+
+- `external/action_seg_ot/LICENSE`
+- `external/pytorch-i3d/LICENSE.txt`
+
+## Acknowledgments
+
+This repository includes or interfaces with the following upstream components:
+
+- ASOT: `external/action_seg_ot`
+- PyTorch-I3D: `external/pytorch-i3d`
+
+Please cite and respect the licenses of those projects when using the optional baseline code or pretrained weights.
+
+## Contact
+
+- Corresponding author: `kunyu.peng@kit.edu`
+
+## Citation
+
+```bibtex
+@inproceedings{yin2026impact_scribe,
+  title     = {IMPACT-Scribe: Interactive Temporal Action Segmentation with Boundary Scribbles and Query Planning},
+  author    = {Qian Yin and Di Wen and Kunyu Peng and David Schneider and Zeyun Zhong and Alexander Jaus and Zdravko Marinov and Jiale Wei and Ruiping Liu and Junwei Zheng and Yufan Chen and Chen Zhang and Lei Qi and Rainer Stiefelhagen},
+  booktitle = {IEEE International Conference on Systems, Man, and Cybernetics (SMC)},
+  year      = {2026},
+  note      = {Under review}
+}
+```

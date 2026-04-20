@@ -4,9 +4,18 @@ IMPACT-Scribe is a human-in-the-loop framework for dense temporal action annotat
 
 ![IMPACT-Scribe teaser showing interactive temporal action segmentation with planner-selected boundary queries and scribble-based boundary refinement.](docs/assets/teaser.png)
 
+## Demo
+
+![IMPACT-Scribe demo screenshot.](assets/Demo_1.png)
+
+<video src="assets/Demo_2.mp4" controls width="100%" title="IMPACT-Scribe demo video"></video>
+
+[Open the demo video](assets/Demo_2.mp4)
+
 ## Table of Contents
 
 - [Paper](#paper)
+- [Demo](#demo)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
 - [Dataset Preparation](#dataset-preparation)
@@ -241,10 +250,11 @@ python tools/simulate_scribbles.py --input data/impact/study_logs/scribble_only 
 
 ### Not bundled
 
-- SigLIP2 model snapshot:
-  - expected local path by default:
-    - `external/huggingface/google--siglip2-base-patch16-224`
-  - download with `tools/runners/setup_siglip2_env.sh`
+- Optional SigLIP2 text-bank model:
+  - not bundled / not tracked
+  - default local path: `external/huggingface/google--siglip2-base-patch16-224`
+  - setup: `bash tools/runners/setup_siglip2_env.sh`
+  - if unavailable, the app falls back to the hashed lexical text-bank backend
 
 ### Checkpoint hashes
 
@@ -355,7 +365,7 @@ Please cite and respect the licenses of those projects when using the optional b
 
 ## Contact
 
-- Corresponding author: `kunyu.peng@kit.edu`
+- Corresponding author: `di.wen@kit.edu`
 
 ## Citation
 

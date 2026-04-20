@@ -56,6 +56,7 @@ configs/models/trained_*.json
 configs/models/*manifest*.json
 *.avi
 *.mp4
+!assets/Demo_2.mp4
 *.log
 *.jsonl
 

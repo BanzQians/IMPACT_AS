@@ -6,11 +6,9 @@ IMPACT-Scribe is a human-in-the-loop framework for dense temporal action annotat
 
 ## Demo
 
-![IMPACT-Scribe demo screenshot.](assets/Demo_1.png)
+[![IMPACT-Scribe demo screenshot.](assets/Demo_1.png)](https://github.com/BanzQians/IMPACT_AS/blob/main/assets/Demo_2.mp4)
 
-<video src="assets/Demo_2.mp4" controls width="100%" title="IMPACT-Scribe demo video"></video>
-
-[Open the demo video](assets/Demo_2.mp4)
+[Watch the demo video online](https://github.com/BanzQians/IMPACT_AS/blob/main/assets/Demo_2.mp4)
 
 ## Table of Contents
 

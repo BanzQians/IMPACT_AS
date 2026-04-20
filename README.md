@@ -271,7 +271,12 @@ python tools/simulate_scribbles.py --input data/impact/study_logs/scribble_only 
 
 ### Checkpoint hashes
 
-- `TODO`: add SHA256 hashes for all release checkpoints before publication.
+| Checkpoint | Size | SHA256 |
+| --- | ---: | --- |
+| `configs/models/starter_local_refiner.pt` | 1.3 MB | `b76060b2eab6787d47a1eb73f192da0406664bd2d8f82ce57309c0ccc01bdf8c` |
+| `external/pytorch-i3d/models/rgb_imagenet.pt` | 49 MB | `2609088c2e8c868187c9921c50bc225329a9057ed75e76120e0b4a397a2c7538` |
+| `external/action_seg_ot/weights/epoch034-step1610.ckpt` | 1.6 MB | `adadc435e9503f7d86fe81c0ba1a38789546fcbdab14b5cd6321fa8b8a907f75` |
+| `external/action_seg_ot/weights/asot_s8ijjapy_final.pth` | 56 KB | `b549360f4e7f4e48c3779f7b46cd5d8140944e90ab2d647166098dbae04f45ec` |
 
 ## Method-to-Code Map
 

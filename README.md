@@ -12,27 +12,13 @@ IMPACT-Scribe is a human-in-the-loop framework for dense temporal action annotat
 
 [Open the demo video](assets/Demo_2.mp4)
 
-## Results
-
-![Budget curves on IMPACT test cases.](docs/assets/results/budget_curves_set.png)
-
-![Time-budget F1 curve.](docs/assets/results/time_budget_f1at10.png)
-
-![Within-session learning curve.](docs/assets/results/learning_curve_bars_line.png)
-
-![Cross-condition challenge comparison.](docs/assets/results/condition_challenge_comparison_q8.png)
-
-![Qualitative single-accept correction.](docs/assets/results/qualitative_single_accept.png)
-
-![Qualitative repeated-correction case.](docs/assets/results/qualitative_repeated_correction.png)
-
 ## Table of Contents
 
 - [Paper](#paper)
 - [Demo](#demo)
-- [Results](#results)
 - [Installation](#installation)
 - [Quickstart](#quickstart)
+- [Results](#results)
 - [Dataset Preparation](#dataset-preparation)
 - [Pretrained Checkpoints](#pretrained-checkpoints)
 - [Method-to-Code Map](#method-to-code-map)
@@ -111,6 +97,20 @@ What this does:
 2. creates matching GT frame-label files under `data/gt/`,
 3. runs the offline interaction evaluator,
 4. writes a JSON report to `/tmp/impact_eval_mock.json`.
+
+## Results
+
+![Budget curves on IMPACT test cases.](docs/assets/results/budget_curves_set.png)
+
+![Time-budget F1 curve.](docs/assets/results/time_budget_f1at10.png)
+
+![Within-session learning curve.](docs/assets/results/learning_curve_bars_line.png)
+
+![Cross-condition challenge comparison.](docs/assets/results/condition_challenge_comparison_q8.png)
+
+![Qualitative single-accept correction.](docs/assets/results/qualitative_single_accept.png)
+
+![Qualitative repeated-correction case.](docs/assets/results/qualitative_repeated_correction.png)
 
 ## Dataset Preparation
 
